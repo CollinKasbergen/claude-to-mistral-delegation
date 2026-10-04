@@ -52,6 +52,7 @@ Read the report. If the diff wasn't included, read it with the `Review with:` co
 - the change does what the spec asked, and nothing unrelated;
 - tests weren't deleted or weakened, and new tests would actually fail if the feature were broken (right object under test, no duplicated fixtures);
 - nothing is listed under `out_of_scope_changes` (if something is, explain it and recommend `--include-out-of-scope` or `--skip-out-of-scope`, since `--adopt` stops until one is chosen);
+- there is no `test_strength_warning` (Mistral's tests passing on the original code, so they don't test the change); if there is, recommend fixing the tests before adopting;
 - every new file the spec named exists (a `missing_files` line or `status: incomplete` means it doesn't);
 - checks marked "already failing before Mistral" or a `baseline_warning` are reported to the main agent as an environment or pre-existing problem, not as Mistral's failure;
 - there is no `final_message_warning` (a cut-off run); if there is, treat the work as unfinished;

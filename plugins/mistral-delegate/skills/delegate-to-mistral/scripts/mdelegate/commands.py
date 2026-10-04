@@ -86,9 +86,10 @@ def _python_tool(words: list[str]) -> str | None:
 def expand(allowed: list[str], root: str) -> list[str]:
     scripts = package_scripts(root) if any(c.split()[:1] and c.split()[0] in (*PACKAGE_MANAGERS, "npx", "bunx")
                                            for c in allowed) else {}
+    from .guard import normalize_command
     out = list(allowed)
     for command in allowed:
-        words = command.split()
+        words = normalize_command(command.split())  # `npm --prefix frontend test` -> `npm run test`
         script = _script_name(words)
         tool = _tool_of(words)
         if script:

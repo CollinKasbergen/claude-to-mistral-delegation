@@ -400,6 +400,45 @@ def unfinished_reason(turn: list, final_text: str) -> str:
     return ""
 
 
+TEST_FILE = re.compile(r"(^|/)(tests?|__tests__|specs?)/|[._-](test|spec)s?\.[a-z]+$|(^|/)test_[^/]+\.py$|"
+                       r"_test\.(py|go)$|(^|/)conftest\.py$")
+TEST_COMMAND = re.compile(r"\b(test|tests|pytest|vitest|jest|mocha|ava|spec|unittest|phpunit|rspec)\b")
+
+
+def test_strength(wt: dict, run_dir: str, commands: list[str], baseline: dict, deps_mode: str, timeout: int) -> str:
+    """Run Mistral's new and changed tests against the original code, on a clean copy.
+
+    Tests that still pass there don't exercise the change: a guarded assertion, the
+    wrong object under test. A failure is what's expected; its output says whether it's
+    a real assertion failure or just a missing import.
+    """
+    files = gitops.changed_files(wt)
+    tests = [f for f in files if TEST_FILE.search(f)]
+    code = [f for f in files if f not in tests]
+    # Test commands whose baseline passed: a command that already failed tells nothing.
+    test_cmds = [c for c in commands if TEST_COMMAND.search(c) and baseline.get(c, (0, ""))[0] == 0]
+    if not tests or not code or not test_cmds:
+        return ""
+    gitops.stage_changes(wt)
+    try:
+        patch = gitops.git_checked(wt["path"], "diff", "--cached", "--binary", wt["base"], "--", *tests)
+        with gitops.clean_copy(wt, deps_mode) as clean:
+            if patch.strip():
+                gitops.git_checked(clean, "apply", "--whitespace=nowarn", "-", input=patch)
+            results = run_checks(test_cmds, str(clean / os.path.relpath(run_dir, wt["path"])), timeout)
+    except DelegateError as e:
+        return f"test_strength: not checked ({e})"
+    passing = [c for c, (code_, _o) in results.items() if code_ == 0]
+    if passing:
+        return ("test_strength_warning: Mistral's tests still pass on the original code, without its changes to "
+                + ", ".join(code[:5]) + (" …" if len(code) > 5 else "") + f" ({', '.join(passing)}). They don't "
+                "test the change: look for guarded or missing assertions, or the wrong thing under test.")
+    first = next(iter(results.items()))
+    last = [ln.strip() for ln in first[1][1].splitlines() if ln.strip()][-1:] or ["no output"]
+    return (f"test_strength: Mistral's tests fail on the original code, as they should ({first[0]}: {last[0][:200]}). "
+            "If that's an import or setup error rather than an assertion, it proves less.")
+
+
 def measure_baseline(commands: list[str], cwd: str, timeout: int, flaky: list[str]) -> dict:
     """Run checks before Mistral changes anything; a failing check is rerun once (flaky ones pass then)."""
     baseline = run_checks(commands, cwd, timeout)
@@ -640,8 +679,10 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         if failures and autofixes:
             # Formatting-type failures are fixed by a command, not by another Mistral round.
             for command in autofixes:
-                code, _out = run_checks([command], run_dir, args.verify_timeout)[command]
-                autofixed.append(command + ("" if code == 0 else f" (exit {code})"))
+                code, out = run_checks([command], run_dir, args.verify_timeout)[command]
+                tail_lines = [ln.strip() for ln in out.splitlines() if ln.strip()][-2:]
+                autofixed.append(command + ("" if code == 0 else
+                                            f" (exit {code}: {' / '.join(tail_lines)[:240] or 'no output'})"))
             results = run_checks(commands, run_dir, args.verify_timeout)
             failures = new_failures(results, baseline)
 
@@ -688,6 +729,10 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
             verification = "passed_except_preexisting"
         else:
             verification = "passed"
+    strength_line = ""
+    if (settings["test_strength"] and wt and verification in ("passed", "passed_except_preexisting")
+            and run.status in ("ok", "budget_exceeded", "tool_call_limit")):
+        strength_line = test_strength(wt, run_dir, commands, baseline, settings["deps_mode"], args.verify_timeout)
     elapsed = time.monotonic() - started
 
     stats_after = vibe.read_session_stats(run.session_id, run_dir, since=None if run.session_id else started_wall,
@@ -735,6 +780,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append("checks_skipped (limited to paths this run doesn't touch): " + ", ".join(skipped_checks))
     if flaky:
         lines.append("flaky_checks (failed, then passed on a rerun before Mistral started): " + ", ".join(flaky))
+    if strength_line:
+        lines.append(strength_line)
     if summary_note:
         lines.append("note: " + summary_note)
     elif run.unfinished:

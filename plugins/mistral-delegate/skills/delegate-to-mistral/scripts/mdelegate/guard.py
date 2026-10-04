@@ -315,15 +315,31 @@ RUNNER_VALUE_OPTIONS = {"--directory", "--project", "--python", "-p", "--with", 
                         "-F", "--workspace", "-w", "--config", "--package-manager"}
 
 
+PACKAGE_MANAGER_BUILTINS = {"add", "install", "i", "ci", "remove", "rm", "uninstall", "exec", "dlx", "x", "create",
+                            "update", "upgrade", "link", "publish", "init", "run", "run-script", "test", "t", "tst",
+                            "start", "stop", "restart", "audit", "outdated", "why", "pack"}
+
+
 def normalize_command(words: list[str]) -> list[str]:
-    """Drop a runner's own options: ["uv", "run", "--no-sync", "pytest", "-q"] -> ["uv", "run", "pytest", "-q"]."""
+    """Drop a runner's own options and spell package scripts one way:
+    ["uv", "run", "--no-sync", "pytest", "-q"] -> ["uv", "run", "pytest", "-q"];
+    ["npm", "--prefix", "frontend", "test"] and ["npm", "run", "test"] -> ["npm", "run", "test"]."""
     for runner in RUNNERS:
         if tuple(words[:len(runner)]) == runner:
             rest, i = words[len(runner):], 0
             while i < len(rest) and rest[i].startswith("-") and rest[i] != "--":
                 option = rest[i].split("=", 1)[0]
                 i += 2 if option in RUNNER_VALUE_OPTIONS and "=" not in rest[i] else 1
-            return list(runner) + rest[i:]
+            out = list(runner) + rest[i:]
+            if len(runner) == 1 and runner[0] in ("npm", "pnpm", "yarn", "bun") and len(out) >= 2:
+                pm, cmd = out[0], out[1]
+                if cmd in ("test", "t", "tst"):
+                    out = [pm, "run", "test"] + out[2:]
+                elif cmd == "run-script":
+                    out = [pm, "run"] + out[2:]
+                elif pm != "npm" and cmd not in PACKAGE_MANAGER_BUILTINS:
+                    out = [pm, "run"] + out[1:]
+            return out
     return words
 
 
@@ -407,7 +423,11 @@ def analyze_shell(command: str, policy: dict, cwd: str) -> tuple[str | None, dic
             continue
         sed_files = _sed_files(words) if words[0] == "sed" else None
         if sed_files is None and not command_allowed(words, allowed):
-            return f"`{words[0]}` isn't allowed in this run. {hint}", corrections
+            if words[0] == "sed":
+                return ("`sed` is only allowed when it just prints: no -i, no -f script files, and no w/r/e "
+                        f"commands. {hint}"), corrections
+            shown = " ".join(words[:4]) + (" …" if len(words) > 4 else "")
+            return f"`{shown}` isn't allowed in this run. {hint}", corrections
         if words[0] == "find" and FIND_UNSAFE & set(words):
             return "`find` with -exec/-delete isn't allowed in this run. Use plain `find` to list files.", corrections
         args = sed_files if sed_files is not None else words[1:]
@@ -450,6 +470,19 @@ def analyze_shell(command: str, policy: dict, cwd: str) -> tuple[str | None, dic
     return None, corrections
 
 
+def _is_noop_edit(tool_input: dict) -> bool:
+    """A search-and-replace whose old and new text are the same (either argument shape Vibe uses)."""
+    if "old_string" in tool_input and tool_input.get("old_string") == tool_input.get("new_string"):
+        return True
+    blocks = tool_input.get("content")
+    if isinstance(blocks, list) and blocks and all(isinstance(b, dict) and "old_str" in b for b in blocks):
+        return all(b.get("old_str") == b.get("new_str") for b in blocks)
+    changes = tool_input.get("changes")
+    if isinstance(changes, list) and changes and all(isinstance(c, dict) and "old_string" in c for c in changes):
+        return all(c.get("old_string") == c.get("new_string") for c in changes)
+    return False
+
+
 def _is_write(tool: str, tool_input: dict) -> bool:
     name = tool.lower()
     return any(w in name for w in WRITE_WORDS) or any(k in tool_input for k in WRITE_KEYS)
@@ -464,6 +497,9 @@ def check_tool(tool: str, tool_input: dict, policy: dict, cwd: str) -> tuple[str
         return "deny", ("No one can answer questions during this run. Make a reasonable choice, "
                         "and list it in your final summary."), None
 
+    if _is_noop_edit(tool_input):
+        return "deny", ("This edit changes nothing: the old and new text are identical. Check whether the change "
+                        "is already in place, then move on."), None
     root = policy["root"]
     new_input = dict(tool_input)
     rewritten = False

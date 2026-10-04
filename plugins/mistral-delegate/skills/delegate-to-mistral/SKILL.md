@@ -14,7 +14,7 @@ The session context names the active **policy** (`conservative`, `balanced` or `
 1. **Can I write the spec in a few lines?** Goal, files, a pattern to follow, cases to cover.
 2. **Can it be checked automatically?** Tests, type check, lint, or a diff small enough to read.
 
-If both are yes, delegate it, even if you know exactly how you'd write it. Writing the code yourself is the expensive path. Keep design decisions, data-model choices, anything visual, and anything you can't check.
+If both are yes, delegate it, even if you know exactly how you'd write it. Writing the code yourself is the expensive path. Keep design decisions, data-model choices, anything visual, and anything you can't check. Also keep small changes with subtle logic, such as URL or state synchronisation and edge-case handling, where reviewing Mistral's version properly takes about as long as writing it.
 
 **Habit:** after planning a change, label each step "mine" or "Mistral's". Start Mistral's steps in the background first, then do yours, then review and adopt.
 
@@ -45,7 +45,7 @@ python3 <wrapper> --mode write --kind feature \
   - Before Mistral starts, the checks also run once on the untouched worktree (the baseline; `--no-baseline` turns it off). Checks that already fail there are reported as `already failing before Mistral changed anything`. Mistral is told not to work around them, and they never trigger a fix round.
   - When the worktree is on a different disk than the repo, `node_modules` can't be hard-linked and becomes a symlink, which breaks some tools (Vite, vitest mocks). By default the plugin then puts worktrees in `<repo parent>/.mistral-worktrees`. `worktrees_dir` in the config sets the location explicitly.
   - A `baseline_warning` usually means the worktree environment differs from the checkout (dependencies, `.env`), or the checks were already broken. Check that before blaming Mistral's change.
-- `--allow-command CMD` (repeatable): command prefixes Mistral may run itself while working, e.g. the test command, so it can iterate. Equivalent spellings are accepted too: `npm test` also allows `npm run test`, `pnpm test` and, when the test script runs vitest, `npx vitest`; `pytest` also allows `python -m pytest` and `uv run pytest`. Each part of a chained command must match. Anything else stays refused. `--allow-shell` allows every command; use it only with the user's OK.
+- `--allow-command CMD` (repeatable): command prefixes Mistral may run itself while working, e.g. the test command, so it can iterate. Equivalent spellings are accepted too: `npm test` also allows `npm run test`, `npm t`, `pnpm test`, the same with runner options such as `--prefix frontend`, and, when the test script runs vitest, `npx vitest`; `pytest` also allows `python -m pytest` and `uv run pytest`. Each part of a chained command must match. Anything else stays refused. `--allow-shell` allows every command; use it only with the user's OK.
 - **Guard hook.** During a run, a Vibe hook checks every tool call before Vibe would ask for approval:
   - Disallowed commands, paths outside the project, writes outside `--scope`, secrets and network tools are refused with an error message Mistral sees, so it can try another way. Without the hook, Vibe treats a refused approval as the user cancelling and ends the session.
   - A path that points to the right file under the wrong base (`/src/app.ts`, or a worktree path missing its run folder) is corrected to the project, in file tools and in shell commands.
@@ -82,6 +82,7 @@ baseline = true                             # run checks on the untouched worktr
 # monthly_credit = 225                       # subscription credit per month, shown in reports
 # min_savings = 2                            # flag kinds of task whose delegation doesn't pay off
 # autofix = [{ cmd = "ruff format .", paths = ["backend/"] }]  # run before a fix round when checks fail
+# test_strength = true                        # run new tests against the original code (default on)
 [write]
 max_price = 1.50
 ```
@@ -122,6 +123,9 @@ The report starts with `run_id`, `status` and `verification`, then `usage` (cost
 - **status: no_changes.** Mistral finished without changing any file. Read its result to see why (a blocked task, a misunderstanding, or the work already existed) before retrying.
 - **status: stopped_by_refusal.** Vibe ended the session after a refused approval, which the guard normally prevents. Check the `guard:` line, then `--resume` to let Mistral continue.
 - **verification: passed_except_preexisting.** Mistral broke nothing new, but some checks were already failing. Treat it like passed for Mistral's work, and look at the `baseline_warning`.
+- **test_strength / test_strength_warning.** When a run changes both code and tests, the wrapper also runs Mistral's tests against the original code, with only the test changes applied, on a clean copy. They should fail there.
+  - A `test_strength_warning` means they still pass without the change, so they don't test it: a guarded assertion (`if (button) expect(...)`), a missing assertion, or the wrong thing under test. Fix that before adopting, or resume Mistral with the exact problem.
+  - A `test_strength` line means they fail as they should. Its output shows whether that's a real assertion failure or only a missing import, which proves less.
 - **verification: passed.** Passing checks don't prove the tests check the right thing. For tests Mistral wrote, read each assertion and ask whether it would fail if the feature were broken; watch for setups that test the wrong object, or duplicated fixtures. Then review the rest of the diff for scope and fit with the surrounding code, and run `adopt_with`. That applies only Mistral's changes to the checkout, leaves the user's uncommitted work alone, and removes the worktree. Use `--paths` to take part of it.
 - **verification: failed.** Read `failing_check_output`. Either follow up with `--resume … --worktree-name …` and a precise instruction, fix it yourself after adopting, or discard.
 - **status: budget_exceeded / tool_call_limit.** The wrapper stopped Mistral at a cap (`note:` says which, and the `budget:` line shows what was used). The work so far is in the worktree and has been checked, with one fix round. Review it, resume with a higher cap, or discard it.

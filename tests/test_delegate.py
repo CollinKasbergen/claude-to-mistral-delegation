@@ -390,7 +390,7 @@ class WriteModeTest(DelegateTestBase):
         self.assertEqual(out.returncode, 0, out.stdout)
         results = self.last()["hook_results"]
         self.assertEqual(results[0]["decision"], "deny")
-        self.assertIn("`node` isn't allowed", results[0]["reason"])
+        self.assertIn("`node -e 1` isn't allowed", results[0]["reason"])
         self.assertTrue(results[1]["hook_specific_output"]["tool_input"]["path"].endswith("/app.py"))
         self.assertIsNone(results[2])
         self.assertIn("guard: checked 3 tool calls, refused 1", out.stdout)
@@ -634,6 +634,24 @@ class WriteModeTest(DelegateTestBase):
         self.assertEqual(out.returncode, 1)
         self.assertIn("status: incomplete", out.stdout)
         self.assertIn("missing_files (named in --scope but never created", out.stdout)
+
+    def test_failed_autofix_shows_why(self):
+        (self.repo / ".mistral-delegate.toml").write_text(
+            "autofix = [\"echo 'eslint: 2 problems (2 errors)'; exit 1\"]\n")
+        out = self.run_delegate("--mode", "write", "--fix-attempts", "0", "--verify", "test ! -f test_app.py", "Task")
+        self.assertIn("(exit 1: eslint: 2 problems (2 errors))", out.stdout)
+
+    def test_weak_tests_are_flagged(self):
+        out = self.run_delegate("--mode", "write", "--verify", "test ! -f nothing_here", "Task",
+                                FAKE_VIBE_TOUCH_APP="1")
+        self.assertIn("test_strength_warning: Mistral's tests still pass on the original code", out.stdout)
+        self.assertIn("app.py", out.stdout.split("test_strength_warning")[1].split("\n")[0])
+
+    def test_tests_that_need_the_change_pass_the_strength_check(self):
+        out = self.run_delegate("--mode", "write", "--verify", "test ! -f test_app.py || grep -q 'changed by vibe' app.py",
+                                "Task", FAKE_VIBE_TOUCH_APP="1")
+        self.assertIn("verification: passed", out.stdout)
+        self.assertIn("test_strength: Mistral's tests fail on the original code, as they should", out.stdout)
 
     def test_no_changes_is_its_own_status(self):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_NO_WRITE="1")
@@ -963,16 +981,16 @@ class GuardPolicyTest(unittest.TestCase):
 
     def test_refused_commands_explain_why(self):
         cases = {
-            "node -e 'console.log(1)'": "`node` isn't allowed",
-            "sed -i s/a/b/ frontend/src/router/index.ts": "`sed` isn't allowed",
-            "sed -n 'w out.txt' frontend/src/router/index.ts": "`sed` isn't allowed",
-            "sed 's/a/b/w out.txt' frontend/src/router/index.ts": "`sed` isn't allowed",
-            "sed -n -f script.sed frontend/src/router/index.ts": "`sed` isn't allowed",
-            "sed -n '1e rm -rf x' frontend/src/router/index.ts": "`sed` isn't allowed",
-            "sed -ie 's/a/b/' frontend/src/router/index.ts": "`sed` isn't allowed",
-            "sed -n '1r /etc/passwd' frontend/src/router/index.ts": "`sed` isn't allowed",
-            "ls; rm -rf frontend": "`rm` isn't allowed",
-            "ls\nrm -rf frontend": "`rm` isn't allowed",
+            "node -e 'console.log(1)'": "`node -e console.log(1)` isn't allowed",
+            "sed -i s/a/b/ frontend/src/router/index.ts": "`sed` is only allowed when it just prints",
+            "sed -n 'w out.txt' frontend/src/router/index.ts": "`sed` is only allowed when it just prints",
+            "sed 's/a/b/w out.txt' frontend/src/router/index.ts": "`sed` is only allowed when it just prints",
+            "sed -n -f script.sed frontend/src/router/index.ts": "`sed` is only allowed when it just prints",
+            "sed -n '1e rm -rf x' frontend/src/router/index.ts": "`sed` is only allowed when it just prints",
+            "sed -ie 's/a/b/' frontend/src/router/index.ts": "`sed` is only allowed when it just prints",
+            "sed -n '1r /etc/passwd' frontend/src/router/index.ts": "`sed` is only allowed when it just prints",
+            "ls; rm -rf frontend": "`rm -rf frontend` isn't allowed",
+            "ls\nrm -rf frontend": "`rm -rf frontend` isn't allowed",
             "echo $(whoami)": "Command substitution",
             "cat `ls`": "Command substitution",
             "ls > out.txt": "Redirection",
@@ -980,7 +998,7 @@ class GuardPolicyTest(unittest.TestCase):
             "cat /etc/passwd": "outside the project",
             "cat ../../secret": "outside the project",
             "find . -name '*.ts' -delete": "-exec/-delete",
-            "env rm x": "`env` isn't allowed",
+            "env rm x": "`env rm x` isn't allowed",
         }
         for command, expected in cases.items():
             with self.subTest(command=command):
@@ -1006,6 +1024,24 @@ class GuardPolicyTest(unittest.TestCase):
         action, _r, new = guard.check_tool("bash", {"command": f"cat {spaced}/src/a.ts | grep x"}, policy, spaced)
         self.assertEqual(action, "rewrite")
         self.assertIn(shlex.quote(os.path.join(spaced, "src/a.ts")), new["command"])
+
+    def test_package_script_spellings_match(self):
+        policy = dict(self.policy, allow_commands=["cd", "npm --prefix frontend test"])
+        for command in [f"cd {self.root} && npm --prefix frontend run test", "npm --prefix frontend test -- --run",
+                        "npm run test", "npm t"]:
+            with self.subTest(command=command):
+                self.assertIsNone(guard.check_shell(command, policy, self.root))
+        reason = guard.check_shell("npm --prefix frontend run lint", policy, self.root)
+        self.assertIn("`npm --prefix frontend run …` isn't allowed", reason)
+
+    def test_noop_edits_are_refused_with_an_explanation(self):
+        action, reason, _ = guard.check_tool("search_replace", {"file_path": "frontend/x.ts", "old_string": "a",
+                                                                "new_string": "a"}, self.policy, self.root)
+        self.assertEqual(action, "deny")
+        self.assertIn("changes nothing", reason)
+        action, _r, _n = guard.check_tool("search_replace", {"file_path": "frontend/src/x.ts", "content": [
+            {"old_str": "a", "new_str": "b"}]}, self.policy, self.root)
+        self.assertEqual(action, "allow")
 
     def test_allow_shell_allows_everything(self):
         self.assertIsNone(guard.check_shell("node -e 1", dict(self.policy, allow_shell=True), self.root))

@@ -53,7 +53,7 @@ DEFAULT_WEIGHTS = {"input": 1.0, "cached": 0.1, "output": 5.0}
 KEYS = ("policy", "model", "verify", "allow_commands", "fix_attempts", "max_parallel", "deps_mode", "baseline",
         "scope", "vibe_args", "worktrees_dir", "model_prices", "continue_attempts", "token_weights",
         "monthly_credit", "currency", "credit_reset_day", "min_savings", "autofix", "fix_after_cap",
-        "claude_relative_effort")
+        "claude_relative_effort", "test_strength")
 
 DEPS_MODES = ("hardlink", "copy", "symlink", "none")
 
@@ -126,6 +126,8 @@ def load(repo_root: str | None) -> dict:
         "fix_after_cap": True,
         # How much of Mistral's work Claude would need to do the same task itself (an assumption).
         "claude_relative_effort": 0.5,
+        # Run Mistral's new tests against the original code: they should fail there.
+        "test_strength": True,
         "read": {},
         "write": {},
         "sources": {},
@@ -184,6 +186,7 @@ def load(repo_root: str | None) -> dict:
     settings["token_weights"] = weights
     settings["autofix"] = _as_checks(settings["autofix"], settings["warnings"])
     settings["fix_after_cap"] = bool(settings["fix_after_cap"])
+    settings["test_strength"] = bool(settings["test_strength"])
     try:
         settings["monthly_credit"] = float(settings["monthly_credit"]) if settings["monthly_credit"] else None
         settings["min_savings"] = float(settings["min_savings"]) if settings["min_savings"] else None
