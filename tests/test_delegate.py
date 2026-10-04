@@ -453,7 +453,7 @@ class WriteModeTest(DelegateTestBase):
         self.assertTrue(results[1]["hook_specific_output"]["tool_input"]["path"].endswith("/app.py"))
         self.assertIsNone(results[2])
         self.assertIn("guard: checked 3 tool calls, refused 1", out.stdout)
-        self.assertIn("corrected 1 path", out.stdout)
+        self.assertIn("corrected 1 path(s) Mistral guessed wrong or wrote from outside the project (e.g. /app.py -> ", out.stdout)
         self.assertIn("refused_by_guard", out.stdout)
         self.assertIn("bash: npx vitest run", out.stdout.split("denied_commands")[1])  # Vibe-side denial still shown
         # Outside a run the hook does nothing.
@@ -952,6 +952,12 @@ class WriteModeTest(DelegateTestBase):
                                 "Task\nFAKE_FILE newmod.py X = 1", FAKE_VIBE_TOUCH_APP="1")
         self.assertIn("test_strength: not conclusive", out.stdout)
 
+    def test_tests_of_brand_new_code_get_no_strength_line(self):
+        (self.repo / ".mistral-delegate.toml").write_text('test_commands = ["test ! -f"]\n')
+        out = self.run_delegate("--mode", "write", "--verify", 'test ! -f test_app.py || python3 -c "import newmod"',
+                                "Task\nFAKE_FILE newmod.py X = 1")
+        self.assertNotIn("test_strength", out.stdout)  # it can't load without newmod.py: expected, nothing to do
+
     def test_loose_assertions_are_flagged(self):
         out = self.run_delegate("--mode", "write", "Task\nFAKE_FILE tests/test_loose.py assert 1 in [1, 2]")
         self.assertIn("assertion_hint: 1 assertion(s) in the new tests check presence", out.stdout)
@@ -1016,7 +1022,7 @@ class WriteModeTest(DelegateTestBase):
         self.assertIn("most denied commands", stats)
         self.assertIn("bash: npx vitest run", stats)
         self.assertIn(", run ", stats)  # which run it was last denied in
-        (self.repo / ".mistral-delegate.toml").write_text('allow_commands = ["bash: npx vitest"]\n')
+        (self.repo / ".mistral-delegate.toml").write_text('allow_commands = ["npx vitest"]\n')
         stats = self.run_delegate("--stats").stdout
         self.assertNotIn("most denied commands", stats)
         self.assertIn("denied before, allowed now", stats)
@@ -2069,6 +2075,11 @@ class UnfinishedRunTest(unittest.TestCase):
             self.assertEqual(f([msg(text)], text), "", text)
         self.assertIn("mid-sentence", f([msg("Then I updated the")], "Then I updated the"))
         self.assertIn("without a final message", f([msg("")], ""))
+        answer = "store.py:135 counts the open loans. " * 8
+        self.assertEqual(f([msg(answer), msg("Let me double-check."), tool], answer, read=True), "")
+        bash = {"type": "effect", "title": "bash", "state": {"status": "completed"}}
+        self.assertEqual(f([msg(answer), bash], answer, read=True), "")  # a read run's bash only reads
+        self.assertIn("tool call", f([msg(answer), bash], answer))
         sys.path.insert(0, str(SCRIPT.parent))
         import delegate
         for output in ("FAILED tests/t.py::test_a - AttributeError: x has no attribute y\n9 failed, 2 passed in 0.3s",
@@ -2107,14 +2118,22 @@ class AssertionHintTest(unittest.TestCase):
     DIFF = """\
 diff --git a/tests/test_s.py b/tests/test_s.py
 +++ b/tests/test_s.py
-@@ -1,3 +1,17 @@
+@@ -1,3 +1,25 @@
  import pytest
 +
 +def test_empty(svc):
 +    svc.run()
 +
-+def test_none(svc):
++def test_skips_expired(svc):
++    assert svc.next_in_queue("b1") is None
++
++def test_missing(svc):
 +    assert svc.get("x") is None
++
++def test_crowded(svc):
++    with pytest.raises(LimitError):
++        svc.borrow("m1", "b1")
++        svc.borrow("m1", "b2")
 +
 +def test_good(svc):
 +    assert svc.get("a") == {"a": 1}
@@ -2125,7 +2144,7 @@ diff --git a/tests/test_s.py b/tests/test_s.py
  
  def test_old():
      pass
-@@ -40,3 +54,4 @@ def test_x():
+@@ -40,3 +62,4 @@ def test_x():
      a = 1
 +    b = 2
      return a
@@ -2136,7 +2155,7 @@ diff --git a/web/a.test.ts b/web/a.test.ts
 +  it('renders', () => {
 +    render(<A />);
 +  });
-+  it('finds nothing', async () => {
++  it('skips hidden books', async () => {
 +    expect(await f()).toBeNull();
 +  });
  });
@@ -2153,20 +2172,21 @@ diff --git a/src/app.py b/src/app.py
         self.delegate = delegate
 
     def test_finds_tests_added_whole(self):
-        names = [(path, name) for path, name, _body in self.delegate.new_tests(self.DIFF)]
-        self.assertEqual(names, [("tests/test_s.py", "test_empty"), ("tests/test_s.py", "test_none"),
-                                 ("tests/test_s.py", "test_good"), ("tests/test_s.py", "test_raises"),
-                                 ("web/a.test.ts", "renders"), ("web/a.test.ts", "finds nothing")])
+        names = [name for _path, name, _body in self.delegate.new_tests(self.DIFF)]
+        self.assertEqual(names, ["test_empty", "test_skips_expired", "test_missing", "test_crowded", "test_good",
+                                 "test_raises", "renders", "skips hidden books"])
 
     def test_flags_tests_without_assertions_or_with_none_only(self):
         from unittest import mock
         with mock.patch.object(self.delegate.gitops, "changes_diff", return_value=self.DIFF):
             hint = self.delegate.assertion_hint({})
         self.assertIn("2 new test(s) assert nothing: tests/test_s.py: test_empty; web/a.test.ts: renders", hint)
-        self.assertIn("2 new test(s) only check for None or a false value", hint)
-        self.assertIn("tests/test_s.py: test_none; web/a.test.ts: finds nothing", hint)
-        self.assertNotIn("test_good", hint)
-        self.assertNotIn("test_raises", hint)
+        self.assertIn("2 new test(s) about skipping or filtering only check that nothing is returned", hint)
+        self.assertIn("tests/test_s.py: test_skips_expired; web/a.test.ts: skips hidden books", hint)
+        self.assertIn("1 new test(s) put setup inside pytest.raises / assertRaises", hint)
+        self.assertIn("tests/test_s.py: test_crowded", hint)
+        for fine in ("test_good", "test_raises", "test_missing"):  # a "not found" None is a fair check
+            self.assertNotIn(fine, hint)
 
 
 class GitOpsTest(unittest.TestCase):
@@ -2298,6 +2318,17 @@ class LedgerTest(unittest.TestCase):
         stats = ledger.format_stats(runs)
         self.assertIn("1x  bash: uv run mypy shelf  (last ", stats)
         self.assertNotIn("x  tool", stats)
+        stats = ledger.format_stats(runs, allowed=["uv run mypy"])  # a configured check now
+        self.assertNotIn("most denied commands", stats)
+        self.assertIn("denied before, allowed now (allow_commands or a configured check, which Mistral may run): "
+                      "bash: uv run mypy shelf (1x)", stats)
+
+    def test_checks_column_counts_runs_without_checks(self):
+        from mdelegate import ledger
+        runs = {i: {"id": i, "kind": "docs", "status": "ok", "started": time.time(),
+                    "verification": "passed" if i == "a" else "not_run"} for i in "abcd"}
+        row = next(line for line in ledger.format_stats(runs).splitlines() if line.startswith("docs"))
+        self.assertIn("1/1 of 4", row)
 
     def test_status_uses_the_currency(self):
         from mdelegate import ledger
