@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -76,7 +77,23 @@ FAKE_VIBE = textwrap.dedent('''\
     if behaviour == "error":
         print("Error: Invalid API key", file=sys.stderr)
         sys.exit(1)
+    hook_results = []
+    if os.environ.get("FAKE_VIBE_HOOK_CALLS"):
+        import subprocess, tomllib
+        hooks = tomllib.load(open(os.path.join(os.environ["VIBE_HOME"], "hooks.toml"), "rb"))["hooks"]
+        for tool, tool_input in json.loads(os.environ["FAKE_VIBE_HOOK_CALLS"]):
+            for hook in hooks:
+                event = {"session_id": session_id, "transcript_path": "", "cwd": cwd,
+                         "hook_event_name": "pre_tool", "tool_name": tool, "tool_call_id": "t1",
+                         "tool_input": tool_input}
+                out = subprocess.run(hook["command"], shell=True, input=json.dumps(event),
+                                     capture_output=True, text=True)
+                hook_results.append(json.loads(out.stdout) if out.stdout.strip() else None)
+        calls[-1]["hook_results"] = hook_results
+        json.dump(calls, open(calls_path, "w"))
     agent = argv[argv.index("--agent") + 1]
+    if os.environ.get("FAKE_VIBE_NO_WRITE"):
+        agent = "plan"
     if agent != "plan":
         if "failed (exit code" in prompt:
             open("fixed.txt", "w").write("fixed\\n")
@@ -98,6 +115,8 @@ FAKE_VIBE = textwrap.dedent('''\
              content=[{"type": "text", "text": "Done: added test_app.py"},
                       {"type": "text", "text": "Done: added test_app.py"}]),
     ]
+    if os.environ.get("FAKE_VIBE_CANCEL"):
+        turn[-1] = dict(turn[-1], content=[{"type": "text", "text": "<user_cancellation>User cancelled the operation.</user_cancellation>"}])
     # Like the real CLI, a resumed session prints the whole history, earlier turns included.
     history = [dict(entry, id="old-u", type="message", role="user", source="turn_start",
                     content=[{"type": "text", "text": "earlier"}]),
@@ -132,7 +151,7 @@ class DelegateTestBase(unittest.TestCase):
                         PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}")
         for var in ("MISTRAL_DELEGATE_POLICY", "MISTRAL_DELEGATE_MODEL", "MISTRAL_DELEGATE_MAX_PRICE",
                     "MISTRAL_DELEGATE_MAX_TURNS", "MISTRAL_DELEGATE_WORKTREES", "FAKE_VIBE_STORAGE",
-                    "FAKE_VIBE_TOUCH_APP"):
+                    "FAKE_VIBE_TOUCH_APP", "FAKE_VIBE_HOOK_CALLS", "FAKE_VIBE_NO_WRITE", "FAKE_VIBE_CANCEL"):
             self.env.pop(var, None)
 
     def tearDown(self):
@@ -325,6 +344,42 @@ class WriteModeTest(DelegateTestBase):
         self.assertIn(f"FAIL: {check} (exit 1)", out.stdout)
         self.assertIn("failing_check_output", out.stdout)
         self.assertIn("boom", out.stdout.split("failing_check_output")[1])
+
+    def test_guard_refuses_with_an_error_and_is_removed_after_the_run(self):
+        calls = [["bash", {"command": "node -e 1"}], ["read_file", {"path": "/app.py"}],
+                 ["bash", {"command": "cat app.py | grep print"}]]
+        out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_HOOK_CALLS=json.dumps(calls))
+        self.assertEqual(out.returncode, 0, out.stdout)
+        results = self.last()["hook_results"]
+        self.assertEqual(results[0]["decision"], "deny")
+        self.assertIn("`node` isn't allowed", results[0]["reason"])
+        self.assertTrue(results[1]["hook_specific_output"]["tool_input"]["path"].endswith("/app.py"))
+        self.assertIsNone(results[2])
+        self.assertIn("guard: checked 3 tool calls, refused 1", out.stdout)
+        self.assertIn("corrected 1 path", out.stdout)
+        self.assertIn("refused_by_guard", out.stdout)
+        self.assertIn("bash: npx vitest run", out.stdout.split("denied_commands")[1])  # Vibe-side denial still shown
+        # Outside a run the hook does nothing.
+        hooks = (self.tmpdir / "vibe-home" / "hooks.toml").read_text()
+        self.assertIn("mistral-delegate-guard", hooks)
+        self.assertEqual(list((self.home / "guards").glob("*.json")), [])
+
+    def test_no_changes_is_its_own_status(self):
+        out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_NO_WRITE="1")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("status: no_changes", out.stdout)
+        self.assertIn("finished without changing any file", out.stdout)
+
+    def test_cancelled_session_is_reported(self):
+        out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_CANCEL="1")
+        self.assertIn("status: stopped_by_refusal", out.stdout)
+        self.assertIn("Resume with --resume", out.stdout)
+
+    def test_worktrees_dir_from_config(self):
+        target = self.tmpdir / "ssd-worktrees"
+        (self.repo / ".mistral-delegate.toml").write_text(f'worktrees_dir = "{target}"\n')
+        out = self.run_delegate("--mode", "write", "Task")
+        self.assertTrue(self.value(out, "worktree_path").startswith(str(target)))
 
     def test_preexisting_failure_is_not_blamed_on_mistral(self):
         out = self.run_delegate("--mode", "write", "--verify", "test -f never.txt", "--verify", "true", "Task")
@@ -578,6 +633,146 @@ class HookTest(DelegateTestBase):
         env = dict(self.env, PATH="/usr/bin:/bin")
         context = self.run_hook(env)
         self.assertIn("not installed", context)
+
+
+
+sys.path.insert(0, str(SCRIPT.parent))
+from mdelegate import gitops, guard  # noqa: E402
+
+
+class GuardPolicyTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.realpath(self.tmp.name)
+        Path(self.root, "frontend/src/router").mkdir(parents=True)
+        Path(self.root, "frontend/src/router/index.ts").write_text("export {}\n")
+        Path(self.root, ".env").write_text("SECRET=1\n")
+        self.policy = {"root": self.root, "mode": "write", "scope": ["frontend/src/**"],
+                       "allow_commands": ["cat", "grep", "ls", "find", "tail", "git diff", "npm test", "npx vitest run"],
+                       "default_commands": ["cat", "grep", "ls", "find", "tail", "git diff"], "allow_shell": False}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def shell(self, command):
+        return guard.check_shell(command, self.policy, self.root)
+
+    def test_allowed_commands(self):
+        for command in ["cat frontend/src/router/index.ts | grep export", "npm test -- --run", "CI=1 npm test",
+                        "grep -rn foo . 2>/dev/null", 'grep "a|b;c" frontend', "ls && git diff",
+                        "npx vitest run src/x.test.ts 2>&1 | tail", "cat " + self.root + "/frontend/src/router/index.ts"]:
+            with self.subTest(command=command):
+                self.assertIsNone(self.shell(command))
+
+    def test_refused_commands_explain_why(self):
+        cases = {
+            "node -e 'console.log(1)'": "`node` isn't allowed",
+            "sed -n 1,20p frontend/src/router/index.ts | grep x": "`sed` isn't allowed",
+            "ls; rm -rf frontend": "`rm` isn't allowed",
+            "ls\nrm -rf frontend": "`rm` isn't allowed",
+            "echo $(whoami)": "Command substitution",
+            "cat `ls`": "Command substitution",
+            "ls > out.txt": "Redirection",
+            "(cd frontend && ls)": "Subshells",
+            "cat /etc/passwd": "outside the project",
+            "cat ../../secret": "outside the project",
+            "find . -name '*.ts' -delete": "-exec/-delete",
+            "env rm x": "`env` isn't allowed",
+        }
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                reason = self.shell(command)
+                self.assertIsNotNone(reason)
+                self.assertIn(expected, reason)
+        self.assertIn("`npm test`", self.shell("node -e 1"))  # tells Mistral what it may run
+
+    def test_allow_shell_allows_everything(self):
+        self.assertIsNone(guard.check_shell("node -e 1", dict(self.policy, allow_shell=True), self.root))
+
+    def test_leading_slash_path_is_corrected(self):
+        action, _reason, new = guard.check_tool("read_file", {"path": "/frontend/src/router/index.ts"},
+                                                self.policy, self.root)
+        self.assertEqual(action, "rewrite")
+        self.assertEqual(new["path"], os.path.join(self.root, "frontend/src/router/index.ts"))
+
+    def test_paths_outside_the_project_are_refused(self):
+        action, reason, _ = guard.check_tool("read_file", {"path": "/etc/hosts"}, self.policy, self.root)
+        self.assertEqual(action, "deny")
+        self.assertIn("outside the project", reason)
+
+    def test_writes_must_stay_in_scope(self):
+        ok = guard.check_tool("write_file", {"path": "frontend/src/new.ts", "content": "x"}, self.policy, self.root)
+        self.assertEqual(ok[0], "allow")
+        action, reason, _ = guard.check_tool("search_replace", {"file_path": "package.json", "old_string": "a",
+                                                                "new_string": "b"}, self.policy, self.root)
+        self.assertEqual(action, "deny")
+        self.assertIn("outside this task's scope", reason)
+        self.assertEqual(guard.check_tool("write_file", {"path": "frontend/x.ts", "content": "x"},
+                                          dict(self.policy, mode="read"), self.root)[0], "deny")
+
+    def test_secrets_and_network_are_refused(self):
+        self.assertEqual(guard.check_tool("read_file", {"path": ".env"}, self.policy, self.root)[0], "deny")
+        self.assertEqual(guard.check_tool("web_fetch", {"url": "https://x"}, self.policy, self.root)[0], "deny")
+
+    def test_policy_lookup_and_expiry(self):
+        home = Path(self.root, "home")
+        os.environ["MISTRAL_DELEGATE_HOME"] = str(home)
+        try:
+            guard.write_policy(self.root, dict(self.policy, run_id="r1", expires=time.time() + 60), home)
+            self.assertEqual(guard.find_policy(os.path.join(self.root, "frontend"))["run_id"], "r1")
+            guard.remove_policy(self.root, "other-run", home)
+            self.assertIsNotNone(guard.find_policy(self.root))
+            guard.remove_policy(self.root, "r1", home)
+            self.assertIsNone(guard.find_policy(self.root))
+            guard.write_policy(self.root, dict(self.policy, run_id="r2", expires=time.time() - 1), home)
+            self.assertIsNone(guard.find_policy(self.root))
+        finally:
+            del os.environ["MISTRAL_DELEGATE_HOME"]
+
+
+class GuardInstallTest(unittest.TestCase):
+    def test_install_keeps_existing_hooks_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vibe_home, home = Path(tmp, "vibe"), Path(tmp, "md")
+            vibe_home.mkdir()
+            hooks = vibe_home / "hooks.toml"
+            hooks.write_text('[[hooks]]\nname = "mine"\ntype = "post_agent"\ncommand = "true"\n')
+            self.assertIsNone(guard.install(vibe_home, home, "python3"))
+            first = hooks.read_text()
+            self.assertIn('name = "mine"', first)
+            self.assertIn('name = "mistral-delegate-guard"', first)
+            self.assertTrue((home / "vibe_guard.py").exists())
+            self.assertIsNone(guard.install(vibe_home, home, "python3"))
+            self.assertEqual(hooks.read_text(), first)
+            import tomllib
+            self.assertEqual(len(tomllib.loads(first)["hooks"]), 2)
+
+    def test_broken_hooks_file_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vibe_home = Path(tmp)
+            (vibe_home / "hooks.toml").write_text("[[hooks]\nbroken")
+            warning = guard.install(vibe_home, Path(tmp, "md"), "python3")
+            self.assertIn("doesn't parse", warning)
+            self.assertEqual((vibe_home / "hooks.toml").read_text(), "[[hooks]\nbroken")
+
+
+class WorktreeLocationTest(unittest.TestCase):
+    def test_configured_and_automatic_locations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            top = os.path.join(tmp, "Projects", "Wishdom")
+            os.environ["MISTRAL_DELEGATE_HOME"] = os.path.join(tmp, "md")
+            try:
+                self.assertTrue(str(gitops.worktree_root(top, "/Volumes/SSD/.wt")).startswith("/Volumes/SSD/.wt/Wishdom-"))
+                self.assertTrue(str(gitops.worktree_root(top)).startswith(os.path.join(tmp, "md", "worktrees")))
+                original = gitops._device
+                gitops._device = lambda p: 1 if str(p).startswith(os.path.join(tmp, "md")) else 2
+                try:
+                    self.assertTrue(str(gitops.worktree_root(top)).startswith(
+                        os.path.join(tmp, "Projects", ".mistral-worktrees")))
+                finally:
+                    gitops._device = original
+            finally:
+                del os.environ["MISTRAL_DELEGATE_HOME"]
 
 
 class ManifestTest(unittest.TestCase):
