@@ -49,7 +49,8 @@ Read the report. If the diff wasn't included, read it with the `Review with:` co
 - tests weren't deleted or weakened;
 - nothing is listed under `out_of_scope_changes` (if something is, explain it; `--adopt` leaves those files out);
 - checks marked "already failing before Mistral" or a `baseline_warning` are reported to the main agent as an environment or pre-existing problem, not as Mistral's failure;
-- `denied_commands` doesn't include a command Mistral needed (if it does, say which, so it can be added to `allow_commands`);
+- the status isn't `no_changes` (nothing was written) or `stopped_by_refusal` (the session was cut short); if it is, say so plainly;
+- `denied_commands` / `refused_by_guard` don't include a command Mistral needed (if it does, say which, so it can be added to `allow_commands`);
 - the code follows the patterns of the surrounding code.
 
 If something small is wrong, you may follow up once with `--resume <session_id> --worktree-name <name>` and a precise instruction.

@@ -38,6 +38,12 @@ max_parallel = 3
 #   none     - nothing
 deps_mode = "hardlink"
 
+# Where Mistral's worktrees go. Keep them on the same disk as the repo, or
+# dependency hard links fall back to symlinks (which break Vite/vitest mocks).
+# Default: ~/.mistral-delegate/worktrees, or <repo parent>/.mistral-worktrees
+# when the repo is on another disk.
+# worktrees_dir = "/Volumes/SSD/Projects/.mistral-worktrees"
+
 # Run the checks once on the untouched worktree before Mistral starts, so
 # failures that were already there aren't blamed on Mistral.
 baseline = true

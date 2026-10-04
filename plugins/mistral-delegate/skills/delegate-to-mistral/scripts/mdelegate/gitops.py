@@ -65,11 +65,34 @@ def find_worktree(repo: str | Path, branch: str) -> str | None:
     return None
 
 
-def worktree_root(top: str) -> Path:
-    custom = os.environ.get("MISTRAL_DELEGATE_WORKTREES")
-    base = Path(custom).expanduser() if custom else config.home() / "worktrees"
+def _device(path: Path) -> int | None:
+    """st_dev of path or its nearest existing ancestor."""
+    for candidate in (path, *path.parents):
+        try:
+            return candidate.stat().st_dev
+        except OSError:
+            continue
+    return None
+
+
+def worktree_root(top: str, configured: str | None = None) -> Path:
+    """Where this repo's worktrees go.
+
+    A configured directory wins (relative paths are relative to the repo). Otherwise
+    ~/.mistral-delegate/worktrees, unless that is on a different disk than the repo:
+    hard links can't cross disks, so then <repo parent>/.mistral-worktrees is used.
+    """
     digest = hashlib.sha1(top.encode()).hexdigest()[:8]
-    return base / f"{Path(top).name}-{digest}"
+    name = f"{Path(top).name}-{digest}"
+    if configured:
+        base = Path(configured).expanduser()
+        if not base.is_absolute():
+            base = Path(top) / base
+        return base / name
+    base = config.home() / "worktrees"
+    if _device(base) != _device(Path(top)):
+        base = Path(top).parent / ".mistral-worktrees"
+    return base / name
 
 
 def state_path(worktree: str | Path) -> Path:
@@ -171,8 +194,9 @@ def prepare_dependencies(top: str, worktree: Path, extra: list[str], auto: bool,
         how = mode
         if how == "hardlink" and not _can_hardlink(src, dst.parent):
             how = "symlink"
-            notes.append(f"{rel}: hard links not possible (different filesystem), symlinked instead; "
-                         "set deps_mode = \"copy\" if tools reject it")
+            notes.append(f"{rel}: hard links not possible (worktree on a different disk than the repo), "
+                         "symlinked instead. Some tools (Vite, vitest mocks) misbehave with that: set "
+                         "worktrees_dir to a folder on the repo's disk, or deps_mode = \"copy\"")
         if how in ("hardlink", "copy"):
             try:
                 if how == "hardlink":
@@ -198,7 +222,7 @@ def prepare_dependencies(top: str, worktree: Path, extra: list[str], auto: bool,
 
 
 def prepare_worktree(top: str, name: str, *, snapshot: bool, link_deps: bool, extra_links: list[str],
-                     deps_mode: str = "hardlink") -> dict:
+                     deps_mode: str = "hardlink", worktrees_dir: str | None = None) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
         raise DelegateError(f"Invalid worktree name: {name!r} (use letters, digits, '.', '_' and '-')")
 
@@ -219,7 +243,7 @@ def prepare_worktree(top: str, name: str, *, snapshot: bool, link_deps: bool, ex
     if git(top, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}").strip():
         raise DelegateError(f"Branch {name!r} already exists without a worktree. Pick another --worktree-name.")
 
-    path = worktree_root(top) / name
+    path = worktree_root(top, worktrees_dir) / name
     path.parent.mkdir(parents=True, exist_ok=True)
     git_checked(top, "worktree", "add", "-q", "-b", name, str(path), "HEAD")
 

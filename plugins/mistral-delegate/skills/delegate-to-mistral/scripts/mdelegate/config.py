@@ -42,7 +42,7 @@ POLICY_GUIDANCE = {
 }
 
 KEYS = ("policy", "model", "verify", "allow_commands", "fix_attempts", "max_parallel", "deps_mode", "baseline",
-        "scope", "vibe_args")
+        "scope", "vibe_args", "worktrees_dir")
 
 DEPS_MODES = ("hardlink", "copy", "symlink", "none")
 
@@ -86,6 +86,7 @@ def load(repo_root: str | None) -> dict:
         "baseline": True,
         "scope": [],
         "vibe_args": [],
+        "worktrees_dir": None,
         "read": {},
         "write": {},
         "sources": {},
@@ -109,6 +110,9 @@ def load(repo_root: str | None) -> dict:
     if env.get("MISTRAL_DELEGATE_POLICY"):
         settings["policy"] = env["MISTRAL_DELEGATE_POLICY"]
         settings["sources"]["policy"] = "env: MISTRAL_DELEGATE_POLICY"
+    if env.get("MISTRAL_DELEGATE_WORKTREES"):
+        settings["worktrees_dir"] = env["MISTRAL_DELEGATE_WORKTREES"]
+        settings["sources"]["worktrees_dir"] = "env: MISTRAL_DELEGATE_WORKTREES"
     if env.get("MISTRAL_DELEGATE_MODEL"):
         settings["model"] = env["MISTRAL_DELEGATE_MODEL"]
         settings["sources"]["model"] = "env: MISTRAL_DELEGATE_MODEL"
@@ -163,6 +167,7 @@ def describe(settings: dict) -> str:
         f"baseline: {'on' if settings['baseline'] else 'off'} (run checks on the untouched worktree first)",
         f"scope: {', '.join(settings['scope']) or '(set per task with --scope)'}",
         f"vibe_args: {' '.join(settings['vibe_args']) or '(none)'}",
+        f"worktrees_dir: {settings['worktrees_dir'] or '(automatic: ~/.mistral-delegate/worktrees, or <repo parent>/.mistral-worktrees when the repo is on another disk)'}",
     ]
     for mode in ("read", "write"):
         c = caps(settings, mode)

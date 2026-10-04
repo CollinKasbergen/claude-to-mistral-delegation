@@ -42,7 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mdelegate import config, gitops, ledger, vibe  # noqa: E402
+from mdelegate import config, gitops, guard, ledger, vibe  # noqa: E402
 from mdelegate.gitops import DelegateError, git  # noqa: E402
 
 KINDS = ("tests", "feature", "bugfix", "refactor", "migration", "boilerplate", "docs", "search", "other")
@@ -224,6 +224,7 @@ class Run:
         self.notices: list[str] = []
         self.final_text = ""
         self.stderr = ""
+        self.cancelled = False
         self.session_id: str | None = args.resume
 
     def call_vibe(self, cmd: list[str], cwd: str) -> None:
@@ -235,6 +236,8 @@ class Run:
             self.stderr = f"Vibe did not finish within {self.args.timeout}s and was stopped."
             return
         history = vibe.parse_output(proc.stdout)
+        # A refused approval in programmatic mode cancels the session.
+        self.cancelled = self.cancelled or bool(CANCELLED.search(proc.stdout) or CANCELLED.search(proc.stderr))
         info = vibe.summarize_history(this_turn(history))
         self.stderr = proc.stderr.strip()
         self.session_id = info["session_id"] or vibe.summarize_history(history)["session_id"] or self.session_id
@@ -254,6 +257,9 @@ class Run:
             self.final_text = self.stderr
         else:
             self.status = "error"
+
+
+CANCELLED = re.compile(r"<user_cancellation>|User cancelled the operation")
 
 
 def this_turn(history: list) -> list:
@@ -362,7 +368,7 @@ def run_task(args: argparse.Namespace) -> int:
         try:
             wt = gitops.prepare_worktree(top, args.worktree_name or run_id, snapshot=not args.no_snapshot,
                                          link_deps=not args.no_link_deps, extra_links=args.link,
-                                         deps_mode=deps_mode)
+                                         deps_mode=deps_mode, worktrees_dir=settings["worktrees_dir"])
         except DelegateError as e:
             print(f"status: error\n\nCould not prepare the worktree: {e}")
             return 2
@@ -373,6 +379,29 @@ def run_task(args: argparse.Namespace) -> int:
                    "policy": settings["policy"], "model": model, "scope": scope,
                    "worktree": {k: wt[k] for k in ("name", "path", "toplevel", "base", "links")} if wt else None})
 
+    # The guard hook refuses disallowed tool calls with an error Mistral can work around,
+    # instead of letting Vibe's approval prompt cancel the session.
+    guard_root = os.path.realpath(wt["path"] if wt else (top or workdir))
+    guard_log = ledger.runs_dir() / f"{run_id}.guard.jsonl"
+    guard_log.parent.mkdir(parents=True, exist_ok=True)
+    guard_warning = guard.install(vibe.vibe_home(), config.home())
+    if not guard_warning:
+        default_cmds = vibe.DEFAULT_BASH_ALLOWLIST if write else []
+        guard.write_policy(run_dir, {
+            "run_id": run_id, "root": guard_root, "mode": args.mode, "scope": scope,
+            "allow_commands": default_cmds + allow_commands, "default_commands": default_cmds,
+            "allow_shell": args.allow_shell, "log": str(guard_log),
+            "expires": time.time() + args.timeout * (fix_attempts + 1) + args.verify_timeout * 3 + 600,
+        }, config.home())
+    try:
+        return execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps, model, write, verify,
+                       allow_commands, scope, fix_attempts, baseline_on, kind, guard_log, guard_warning)
+    finally:
+        guard.remove_policy(run_dir, run_id, config.home())
+
+
+def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps, model, write, verify,
+            allow_commands, scope, fix_attempts, baseline_on, kind, guard_log, guard_warning) -> int:
     started_wall, started = time.time(), time.monotonic()
     # Run the checks once before Mistral changes anything, so failures that were
     # already there (or come from the worktree environment) aren't blamed on it.
@@ -418,7 +447,22 @@ def run_task(args: argparse.Namespace) -> int:
     run.session_id = run.session_id or (stats_after or {}).get("session_id")
     use = vibe.usage(stats_after, stats_before)
 
+    files_now = (gitops.changed_files(wt) if wt else
+                 [line[3:] for line in git(workdir, "status", "--porcelain").splitlines()] if write else [])
+    if run.cancelled and run.status in ("ok", "error"):
+        run.status = "stopped_by_refusal"
+    elif write and run.status == "ok" and not files_now:
+        run.status = "no_changes"
+    guard_events = guard.read_log(guard_log)
+
     lines = [f"run_id: {run_id}", f"status: {run.status}"]
+    if run.status == "no_changes":
+        lines.append("note: Mistral finished without changing any file. Read its result below to see why.")
+    if run.status == "stopped_by_refusal":
+        lines.append("note: Vibe ended the session after a refused tool call (it treats a refused approval as "
+                     "the user cancelling). " + ("The guard hook was not active: " + guard_warning if guard_warning
+                     else "The guard hook should prevent this; check guard below.")
+                     + " Resume with --resume to let Mistral continue.")
     if verify:
         detail = f"after {attempts} fix attempt{'s' if attempts != 1 else ''}" if attempts else "first try"
         if verification == "not_run":
@@ -435,6 +479,7 @@ def run_task(args: argparse.Namespace) -> int:
     turns = use["steps"] if use and use.get("steps") is not None else run.turns
     lines.append(f"elapsed: {elapsed:.0f}s, turns: {turns} (max_turns {caps['max_turns']}), "
                  f"tool calls: {run.tool_calls} (several per turn; not capped by max_turns)")
+    lines.append(guard_line(guard_events, run.tool_calls, guard_warning))
     model_warning = vibe.unknown_model_warning(model) if not args.agent else None
     if model_warning:
         lines.append(f"model_warning: {model_warning}")
@@ -469,8 +514,15 @@ def run_task(args: argparse.Namespace) -> int:
 
     for cmd, code, out in failures[:3]:
         lines.append(f"failing_check_output ({cmd}, exit {code}):\n```\n{out}\n```")
-    if run.denied:
-        counts = Counter(run.denied)
+    guard_denied = [f"{e.get('tool')}: {e.get('target')} -> {e.get('reason')}" for e in guard_events
+                    if e.get("action") == "deny"]
+    if guard_denied:
+        lines.append("refused_by_guard (Mistral got these refusals as errors and could continue):\n"
+                     + "\n".join(f"  - {d}" for d in guard_denied[:15]))
+    guard_targets = {str(e.get("target")) for e in guard_events if e.get("action") == "deny"}
+    vibe_denied = [d for d in run.denied if d.split(": ", 1)[-1] not in guard_targets]
+    if vibe_denied:
+        counts = Counter(vibe_denied)
         why = ("refused because they aren't in allow_commands; add them if Mistral needs them" if write
                else "read mode runs no commands")
         lines.append(f"denied_commands ({why}):\n"
@@ -490,10 +542,24 @@ def run_task(args: argparse.Namespace) -> int:
                    "cost_estimated": use["estimated"] if use else None,
                    "steps": turns, "tokens": use["tokens"] if use else None,
                    "files_changed": len(files), "out_of_scope": out_of_scope,
-                   "denied": sorted(set(run.denied)), "baseline_failures": preexisting,
+                   "denied": sorted(set(run.denied) | {f"{e.get('tool')}: {e.get('target')}" for e in guard_events
+                                                       if e.get("action") == "deny"}),
+                   "baseline_failures": preexisting,
                    "session_id": run.session_id, "worktree_removed": worktree_removed})
     print(report)
     return 0 if run.status == "ok" and verification != "failed" else 1
+
+
+def guard_line(events: list[dict], tool_calls: int, warning: str | None) -> str:
+    if warning:
+        return f"guard: not installed ({warning}); a refused tool call can end the session"
+    if not events:
+        return ("guard: no tool calls reached it" + (" (is your Vibe version older than hooks support?)"
+                                                     if tool_calls else ""))
+    denied = sum(e.get("action") == "deny" for e in events)
+    rewritten = sum(e.get("action") == "rewrite" for e in events)
+    return (f"guard: checked {len(events)} tool calls, refused {denied} (returned to Mistral as errors), "
+            f"corrected {rewritten} path(s)")
 
 
 def usage_line(use: dict | None, max_price: float) -> str:

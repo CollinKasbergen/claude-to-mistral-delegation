@@ -40,8 +40,13 @@ python3 <wrapper> --mode write --kind feature \
 - `--spec FILE`: the plan, included in the prompt. Write it to a temp file outside the repo. `--context PATH` (repeatable) names files Mistral should read first.
 - `--verify CMD` (repeatable): checks the wrapper runs after Mistral finishes. On a failure, the output goes back to the same Mistral session for a fix (`--fix-attempts N`, default 1). **Always pass the project's real checks when they exist.** Configured checks apply automatically (see below).
   - Before Mistral starts, the checks also run once on the untouched worktree (the baseline; `--no-baseline` turns it off). Checks that already fail there are reported as `already failing before Mistral changed anything`. Mistral is told not to work around them, and they never trigger a fix round.
+  - When the worktree is on a different disk than the repo, `node_modules` can't be hard-linked and becomes a symlink, which breaks some tools (Vite, vitest mocks). By default the plugin then puts worktrees in `<repo parent>/.mistral-worktrees`. `worktrees_dir` in the config sets the location explicitly.
   - A `baseline_warning` usually means the worktree environment differs from the checkout (dependencies, `.env`), or the checks were already broken. Check that before blaming Mistral's change.
 - `--allow-command CMD` (repeatable): command prefixes Mistral may run itself while working, e.g. the test command, so it can iterate. Each part of a chained command must match. Anything else stays refused. `--allow-shell` allows every command; use it only with the user's OK.
+- **Guard hook.** During a run, a Vibe hook checks every tool call before Vibe would ask for approval:
+  - Disallowed commands, paths outside the project, writes outside `--scope`, secrets and network tools are refused with an error message Mistral sees, so it can try another way. Without the hook, Vibe treats a refused approval as the user cancelling and ends the session.
+  - A path written like `/src/app.ts` is corrected to the project.
+  - The report's `guard:` line shows what it checked, and `refused_by_guard` lists the refusals.
 - `--model ALIAS`: a Vibe model alias from the user's Vibe config, for this run.
 - Caps come from the policy (`--show-config` shows them). Override with `--max-turns`, `--max-price` or `--max-tokens` and tell the user when you raise them. Fix rounds add half the price cap each.
 - Follow-up on the same work: `--resume <session_id> --worktree-name <name>`, both from the report.
@@ -62,6 +67,7 @@ fix_attempts = 1
 max_parallel = 3
 deps_mode = "hardlink"                      # hardlink | copy | symlink | none
 baseline = true                             # run checks on the untouched worktree first
+# worktrees_dir = "/Volumes/SSD/.mistral-worktrees"  # keep worktrees on the repo's disk
 # model = "mistral-medium-3.5"
 [write]
 max_price = 1.50
@@ -87,6 +93,8 @@ The wrapper adds the rules itself: which commands may run, which checks must pas
 
 The report starts with `run_id`, `status` and `verification`, then `usage` (cost, steps, tokens), the change list, and the full diff when it is short.
 
+- **status: no_changes.** Mistral finished without changing any file. Read its result to see why (a blocked task, a misunderstanding, or the work already existed) before retrying.
+- **status: stopped_by_refusal.** Vibe ended the session after a refused approval, which the guard normally prevents. Check the `guard:` line, then `--resume` to let Mistral continue.
 - **verification: passed_except_preexisting.** Mistral broke nothing new, but some checks were already failing. Treat it like passed for Mistral's work, and look at the `baseline_warning`.
 - **verification: passed.** Review the diff for scope and quality, then run `adopt_with`. That applies only Mistral's changes to the checkout, leaves the user's uncommitted work alone, and removes the worktree. Use `--paths` to take part of it.
 - **verification: failed.** Read `failing_check_output`. Either follow up with `--resume … --worktree-name …` and a precise instruction, fix it yourself after adopting, or discard.
