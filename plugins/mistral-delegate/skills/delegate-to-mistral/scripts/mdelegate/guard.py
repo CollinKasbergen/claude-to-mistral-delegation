@@ -270,8 +270,8 @@ def _sed_script_safe(script: str) -> bool:
     return True
 
 
-def _sed_files(words: list[str]) -> list[str] | None:
-    """The file arguments of a sed call that only prints (no -i, no writing commands), or None."""
+def _sed_check(words: list[str]) -> tuple[list[str] | None, str]:
+    """(file arguments, "") for a sed call that only prints, or (None, why it isn't allowed)."""
     scripts, files, expect_script = [], [], False
     for word in words[1:]:
         if expect_script:
@@ -282,21 +282,35 @@ def _sed_files(words: list[str]) -> list[str] | None:
         elif word.startswith("--expression="):
             scripts.append(word.split("=", 1)[1])
         elif word.startswith("--"):
+            if word.startswith("--in-place"):
+                return None, "`--in-place` edits files; use the edit tools to change files"
             if word not in SED_SAFE_LONG_FLAGS:
-                return None
+                return None, f"`{word}` isn't one of the allowed sed options ({', '.join(sorted(SED_SAFE_LONG_FLAGS))})"
         elif word.startswith("-") and len(word) > 1:
             letters = word[1:]
             if letters.endswith("e") and set(letters[:-1]) <= SED_SAFE_SHORT:
                 expect_script = True  # e.g. -ne 'script'
+            elif "i" in letters:
+                return None, "`-i` edits files in place; use the edit tools to change files"
+            elif "f" in letters:
+                return None, "`-f` runs a script file; give the script inline"
             elif not set(letters) <= SED_SAFE_SHORT:
-                return None  # -i, -f, -l, ... (in place, script files)
+                return None, f"`{word}` isn't one of the allowed sed options (-n, -E, -r, -s, -z)"
         elif not scripts:
             scripts.append(word)
         else:
             files.append(word)
-    if not scripts or not all(_sed_script_safe(s) for s in scripts):
-        return None
-    return files
+    if not scripts:
+        return None, "it has no script"
+    bad = next((s for s in scripts if not _sed_script_safe(s)), None)
+    if bad is not None:
+        return None, (f"the script `{bad}` uses a command that isn't print-only (w/W write, r/R read, e runs a "
+                      "command)")
+    return files, ""
+
+
+def _sed_files(words: list[str]) -> list[str] | None:
+    return _sed_check(words)[0]
 
 
 def _shell_tokens(command: str) -> list[str]:
@@ -424,8 +438,8 @@ def analyze_shell(command: str, policy: dict, cwd: str) -> tuple[str | None, dic
         sed_files = _sed_files(words) if words[0] == "sed" else None
         if sed_files is None and not command_allowed(words, allowed):
             if words[0] == "sed":
-                return ("`sed` is only allowed when it just prints: no -i, no -f script files, and no w/r/e "
-                        f"commands. {hint}"), corrections
+                return (f"This `sed` isn't allowed: {_sed_check(words)[1]}. Only sed calls that just print are "
+                        f"allowed. {hint}"), corrections
             shown = " ".join(words[:4]) + (" …" if len(words) > 4 else "")
             return f"`{shown}` isn't allowed in this run. {hint}", corrections
         if words[0] == "find" and FIND_UNSAFE & set(words):
@@ -477,6 +491,9 @@ def _is_noop_edit(tool_input: dict) -> bool:
     blocks = tool_input.get("content")
     if isinstance(blocks, list) and blocks and all(isinstance(b, dict) and "old_str" in b for b in blocks):
         return all(b.get("old_str") == b.get("new_str") for b in blocks)
+    if isinstance(blocks, str) and "<<<<<<< SEARCH" in blocks:
+        pairs = re.findall(r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE", blocks, re.S)
+        return bool(pairs) and all(old == new for old, new in pairs)
     changes = tool_input.get("changes")
     if isinstance(changes, list) and changes and all(isinstance(c, dict) and "old_string" in c for c in changes):
         return all(c.get("old_string") == c.get("new_string") for c in changes)

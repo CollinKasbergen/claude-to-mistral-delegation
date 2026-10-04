@@ -83,6 +83,7 @@ baseline = true                             # run checks on the untouched worktr
 # min_savings = 2                            # flag kinds of task whose delegation doesn't pay off
 # autofix = [{ cmd = "ruff format .", paths = ["backend/"] }]  # run before a fix round when checks fail
 # test_strength = true                        # run new tests against the original code (default on)
+# test_commands = ["make test"]               # extra commands that count as test runners for test_strength
 [write]
 max_price = 1.50
 ```
@@ -124,6 +125,8 @@ The report starts with `run_id`, `status` and `verification`, then `usage` (cost
 - **status: stopped_by_refusal.** Vibe ended the session after a refused approval, which the guard normally prevents. Check the `guard:` line, then `--resume` to let Mistral continue.
 - **verification: passed_except_preexisting.** Mistral broke nothing new, but some checks were already failing. Treat it like passed for Mistral's work, and look at the `baseline_warning`.
 - **test_strength / test_strength_warning.** When a run changes both code and tests, the wrapper also runs Mistral's tests against the original code, with only the test changes applied, on a clean copy. They should fail there.
+  - Only test-runner checks count (pytest, vitest, jest, `go test`, `npm test`, ... or a `test_commands` entry), whose baseline passed, and whose `paths` cover the changed tests. Lint and `test -f` checks are ignored; pytest, vitest and jest run just the changed test files. Docs, configs and lockfiles don't count as code changes.
+  - The warning appears only when every selected suite passes there. A timeout or a missing directory gives `test_strength: not checked (...)`.
   - A `test_strength_warning` means they still pass without the change, so they don't test it: a guarded assertion (`if (button) expect(...)`), a missing assertion, or the wrong thing under test. Fix that before adopting, or resume Mistral with the exact problem.
   - A `test_strength` line means they fail as they should. Its output shows whether that's a real assertion failure or only a missing import, which proves less.
 - **verification: passed.** Passing checks don't prove the tests check the right thing. For tests Mistral wrote, read each assertion and ask whether it would fail if the feature were broken; watch for setups that test the wrong object, or duplicated fixtures. Then review the rest of the diff for scope and fit with the surrounding code, and run `adopt_with`. That applies only Mistral's changes to the checkout, leaves the user's uncommitted work alone, and removes the worktree. Use `--paths` to take part of it.

@@ -642,16 +642,40 @@ class WriteModeTest(DelegateTestBase):
         self.assertIn("(exit 1: eslint: 2 problems (2 errors))", out.stdout)
 
     def test_weak_tests_are_flagged(self):
+        (self.repo / ".mistral-delegate.toml").write_text('test_commands = ["test ! -f nothing_here"]\n')
         out = self.run_delegate("--mode", "write", "--verify", "test ! -f nothing_here", "Task",
                                 FAKE_VIBE_TOUCH_APP="1")
         self.assertIn("test_strength_warning: Mistral's tests still pass on the original code", out.stdout)
         self.assertIn("app.py", out.stdout.split("test_strength_warning")[1].split("\n")[0])
 
     def test_tests_that_need_the_change_pass_the_strength_check(self):
+        (self.repo / ".mistral-delegate.toml").write_text('test_commands = ["test ! -f test_app.py"]\n')
         out = self.run_delegate("--mode", "write", "--verify", "test ! -f test_app.py || grep -q 'changed by vibe' app.py",
                                 "Task", FAKE_VIBE_TOUCH_APP="1")
         self.assertIn("verification: passed", out.stdout)
         self.assertIn("test_strength: Mistral's tests fail on the original code, as they should", out.stdout)
+
+    def test_strength_check_needs_both_suites_to_pass_to_warn(self):
+        (self.repo / ".mistral-delegate.toml").write_text('test_commands = ["test ! -f"]\n')
+        out = self.run_delegate("--mode", "write", "--verify", "test ! -f nothing_here",
+                                "--verify", "test ! -f test_app.py || grep -q 'changed by vibe' app.py",
+                                "Task", FAKE_VIBE_TOUCH_APP="1")
+        self.assertNotIn("test_strength_warning", out.stdout)  # the unrelated suite passing proves nothing
+        self.assertIn("as they should", out.stdout)
+
+    def test_strength_check_skips_non_test_commands_and_unmeasured_baselines(self):
+        out = self.run_delegate("--mode", "write", "--verify", "test ! -f nothing_here", "Task",
+                                FAKE_VIBE_TOUCH_APP="1")
+        self.assertNotIn("test_strength", out.stdout)  # `test -f` isn't a test runner
+        (self.repo / ".mistral-delegate.toml").write_text('test_commands = ["test ! -f"]\nbaseline = false\n')
+        out = self.run_delegate("--mode", "write", "--verify", "test ! -f nothing_here", "Task",
+                                FAKE_VIBE_TOUCH_APP="1")
+        self.assertNotIn("test_strength", out.stdout)  # no baseline: unknown whether it passed before
+
+    def test_tests_only_changes_skip_the_strength_check(self):
+        (self.repo / ".mistral-delegate.toml").write_text('test_commands = ["test ! -f"]\n')
+        out = self.run_delegate("--mode", "write", "--verify", "test ! -f nothing_here", "Task")
+        self.assertNotIn("test_strength", out.stdout)
 
     def test_no_changes_is_its_own_status(self):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_NO_WRITE="1")
@@ -982,13 +1006,15 @@ class GuardPolicyTest(unittest.TestCase):
     def test_refused_commands_explain_why(self):
         cases = {
             "node -e 'console.log(1)'": "`node -e console.log(1)` isn't allowed",
-            "sed -i s/a/b/ frontend/src/router/index.ts": "`sed` is only allowed when it just prints",
-            "sed -n 'w out.txt' frontend/src/router/index.ts": "`sed` is only allowed when it just prints",
-            "sed 's/a/b/w out.txt' frontend/src/router/index.ts": "`sed` is only allowed when it just prints",
-            "sed -n -f script.sed frontend/src/router/index.ts": "`sed` is only allowed when it just prints",
-            "sed -n '1e rm -rf x' frontend/src/router/index.ts": "`sed` is only allowed when it just prints",
-            "sed -ie 's/a/b/' frontend/src/router/index.ts": "`sed` is only allowed when it just prints",
-            "sed -n '1r /etc/passwd' frontend/src/router/index.ts": "`sed` is only allowed when it just prints",
+            "sed -i s/a/b/ frontend/src/router/index.ts": "`-i` edits files in place",
+            "sed -n 'w out.txt' frontend/src/router/index.ts": "isn't print-only",
+            "sed 's/a/b/w out.txt' frontend/src/router/index.ts": "isn't print-only",
+            "sed -n -f script.sed frontend/src/router/index.ts": "`-f` runs a script file",
+            "sed -n '1e rm -rf x' frontend/src/router/index.ts": "isn't print-only",
+            "sed -ie 's/a/b/' frontend/src/router/index.ts": "`-i` edits files in place",
+            "sed -n '1r /etc/passwd' frontend/src/router/index.ts": "isn't print-only",
+            "sed --in-place s/a/b/ frontend/x.ts": "`--in-place` edits files",
+            "sed -x p frontend/x.ts": "isn't one of the allowed sed options",
             "ls; rm -rf frontend": "`rm -rf frontend` isn't allowed",
             "ls\nrm -rf frontend": "`rm -rf frontend` isn't allowed",
             "echo $(whoami)": "Command substitution",
@@ -1041,6 +1067,14 @@ class GuardPolicyTest(unittest.TestCase):
         self.assertIn("changes nothing", reason)
         action, _r, _n = guard.check_tool("search_replace", {"file_path": "frontend/src/x.ts", "content": [
             {"old_str": "a", "new_str": "b"}]}, self.policy, self.root)
+        self.assertEqual(action, "allow")
+        same = "<<<<<<< SEARCH\nfoo()\n=======\nfoo()\n>>>>>>> REPLACE"
+        action, _r, _n = guard.check_tool("search_replace", {"file_path": "frontend/x.ts", "content": same},
+                                          self.policy, self.root)
+        self.assertEqual(action, "deny")
+        changed = same.replace("=======\nfoo()", "=======\nbar()")
+        action, _r, _n = guard.check_tool("search_replace", {"file_path": "frontend/src/x.ts", "content": changed},
+                                          self.policy, self.root)
         self.assertEqual(action, "allow")
 
     def test_allow_shell_allows_everything(self):
@@ -1165,6 +1199,22 @@ class UnfinishedRunTest(unittest.TestCase):
         self.assertEqual(f([msg(summary), tool], summary), "")  # a trailing read after a real summary is fine
 
 
+class TestRunnerDetectionTest(unittest.TestCase):
+    def test_only_real_test_runners_count(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import delegate
+        f = lambda cmd, extra=(): delegate._test_runner(cmd, list(extra))
+        for cmd in ("ruff check src tests", "test -f x", "npx tsc --noEmit -p tests", "eslint spec/", "npm run lint"):
+            with self.subTest(command=cmd):
+                self.assertIsNone(f(cmd))
+        self.assertEqual(f("uv run --no-sync pytest -q"), "pytest")
+        self.assertEqual(f("python -m pytest tests"), "pytest")
+        self.assertEqual(f("npx vitest run"), "vitest")
+        self.assertEqual(f("npm --prefix frontend test"), "npm run test")
+        self.assertEqual(f("cd api && go test ./..."), "go test")
+        self.assertEqual(f("make check", ["make check"]), "configured")
+
+
 class CostStatsTest(unittest.TestCase):
     def test_runs_without_cost_data_are_left_out_of_averages(self):
         from mdelegate import ledger
@@ -1189,6 +1239,13 @@ class CommandFormsTest(unittest.TestCase):
                      "python -m pytest", "uv run pytest"):
             self.assertIn(form, forms)
         self.assertNotIn("npx eslint", forms)  # lint wasn't allowed
+
+    def test_normalised_spellings_expand(self):
+        from mdelegate import commands
+        with tempfile.TemporaryDirectory() as tmp:
+            forms = commands.expand(["npm --prefix frontend test", "pnpm -C web run lint"], tmp)
+        for form in ("npm run test", "pnpm test", "yarn run test", "npm t", "yarn run lint", "bun lint"):
+            self.assertIn(form, forms)
 
     def test_denied_call_labels_come_from_any_detail_shape(self):
         from mdelegate import vibe

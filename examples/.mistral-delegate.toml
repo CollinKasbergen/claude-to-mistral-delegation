@@ -88,7 +88,11 @@ model = "mistral-medium-3.5"
 # When a run changes both code and tests, also run its tests against the
 # original code (only the test changes applied). They should fail there;
 # tests that still pass don't test the change, and the report warns.
+# Only test runners count (pytest, vitest, jest, go test, `npm test`, ...),
+# and only checks whose baseline passed; pytest, vitest and jest run just the
+# changed test files. Name other test commands here (matched by prefix):
 # test_strength = true
+# test_commands = ["make test", "./scripts/run-tests.sh"]
 
 # Once enough runs are adopted or discarded, flag kinds of task where
 # delegating saved Claude less than this many times what it cost Claude
