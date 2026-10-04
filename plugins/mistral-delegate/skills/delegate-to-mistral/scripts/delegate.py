@@ -121,6 +121,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     manage.add_argument("--note", help="With --discard/--adopt: why, for the track record.")
     manage.add_argument("--include-out-of-scope", action="store_true",
                         help="With --adopt: also apply changes outside the run's --scope.")
+    manage.add_argument("--skip-out-of-scope", action="store_true",
+                        help="With --adopt: apply only changes inside the --scope and leave the rest out.")
     manage.add_argument("--keep-worktree", action="store_true", help="With --adopt: keep the worktree.")
     manage.add_argument("--show-config", action="store_true", help="Print the effective settings.")
     return p.parse_args(argv)
@@ -151,6 +153,15 @@ def find_run(run_id: str) -> dict:
     return run
 
 
+def worktree_scope(run: dict) -> list[str]:
+    """The combined scope of every run on this run's worktree; [] if any of them had no scope (no limit)."""
+    path = (run.get("worktree") or {}).get("path")
+    runs = [r for r in ledger.load_runs().values() if path and (r.get("worktree") or {}).get("path") == path] or [run]
+    if any(not r.get("scope") for r in runs):
+        return []
+    return list(dict.fromkeys(entry for r in runs for entry in r["scope"]))
+
+
 def runs_on_worktree(run: dict) -> list[dict]:
     """This run plus the runs that share its worktree (a run and its resumes), not yet settled."""
     path = (run.get("worktree") or {}).get("path")
@@ -175,17 +186,24 @@ def cmd_adopt(args: argparse.Namespace) -> int:
         raise DelegateError(f"The worktree {wt['path']} no longer exists.")
     paths = args.paths
     skipped: list[str] = []
-    scope = run.get("scope") or []
+    # A resumed run may have a narrower scope than the run it continues; the worktree holds both.
+    scope = worktree_scope(run)
     if scope and not args.include_out_of_scope:
         changed = gitops.changed_files(wt)
         if paths:
             changed = [f for f in changed if any(f == p or f.startswith(p.rstrip("/") + "/") for p in paths)]
         skipped = [f for f in changed if not vibe.matches_scope(f, scope)]
+        if skipped and not args.skip_out_of_scope:
+            print(f"Nothing applied: {len(skipped)} changed file(s) in this worktree are outside the scope of its "
+                  f"run(s) ({', '.join(scope)}):")
+            print("\n".join(f"  {f}" for f in skipped))
+            print("Look at them, then run --adopt again with --include-out-of-scope to apply them too, or "
+                  "--skip-out-of-scope to leave them out.")
+            return 1
         if skipped:
             paths = [f for f in changed if vibe.matches_scope(f, scope)]
             if not paths:
-                print("Every change is outside the run's scope (" + ", ".join(scope) + "); nothing applied. "
-                      "Use --include-out-of-scope to apply them anyway.")
+                print("Every change is outside the scope (" + ", ".join(scope) + "); nothing applied.")
                 return 1
     try:
         files = gitops.apply_to_checkout(wt, paths)
@@ -630,18 +648,32 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     checkable = run.status in ("ok", "limit_reached", "budget_exceeded", "tool_call_limit")
     if commands and checkable:
         check_round()
-    if run.unfinished and run.status == "ok":
+    def missing_new_files() -> list[str]:
+        """Files named literally in --scope that still don't exist: the task asked for them."""
+        base = wt["path"] if wt else (top or workdir)
+        return [e for e in scope if not any(c in e for c in "*?[") and not e.endswith("/")
+                and not Path(base, e).exists()]
+
+    missing = missing_new_files() if write else []
+    if run.status == "ok" and (run.unfinished or missing):
         changed_now = gitops.changed_files(wt) if wt else [ln[3:] for ln in git(workdir, "status", "--porcelain").splitlines()]
-        # Asking Mistral to finish costs a round; it's only worth it when the work looks unfinished,
-        # not when its changes are in and pass the checks (the report shows the changes anyway).
-        if commands and not failures and changed_now:
+        # Asking Mistral to finish costs a round; it's only worth it when the work looks unfinished:
+        # files the task named are missing, checks fail, nothing changed, or there are no checks to tell.
+        follow_up = None
+        if missing:
+            follow_up = (f"These files from your task don't exist yet: {', '.join(missing)}. Create them as the "
+                         "task describes, then end with the summary of every file you changed.")
+        elif commands and not failures and changed_now:
             summary_note = ("Mistral ended without a closing summary, but its changes pass the checks, so it "
                             "wasn't asked to finish (that would cost a round). Read the diff instead.")
-        elif run.session_id and settings["continue_attempts"] > 0:
+        else:
+            follow_up = CONTINUE_PROMPT
+        if follow_up and run.session_id and settings["continue_attempts"] > 0:
             continued = 1
-            vibe_call(CONTINUE_PROMPT, 0.5)
+            vibe_call(follow_up, 0.5)
             if commands:
                 check_round()
+            missing = missing_new_files()
     if commands and checkable:
         # A run stopped at a cap still gets its fix round (by default): its first pass is spent,
         # and the failures are often small.
@@ -669,11 +701,16 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         run.status = "stopped_by_refusal"
     elif write and run.status == "ok" and not files_now:
         run.status = "no_changes"
+    elif write and run.status == "ok" and missing:
+        run.status = "incomplete"
     guard_events = guard.read_log(guard_log)
 
     lines = [f"run_id: {run_id}", f"status: {run.status}"]
     if run.status == "no_changes":
         lines.append("note: Mistral finished without changing any file. Read its result below to see why.")
+    if run.status == "incomplete":
+        lines.append("missing_files (named in --scope but never created; passing checks don't cover them): "
+                     + ", ".join(missing))
     if run.status in ("budget_exceeded", "tool_call_limit"):
         lines.append(f"note: the wrapper {run.limit_note}. The work so far is in the worktree: review it, "
                      "--resume with a higher --max-price/--max-tool-calls, or discard it.")
@@ -681,7 +718,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append(f"continues: {settings['continues']} (same worktree). This run's id and the earlier one "
                      "both refer to everything in the worktree; --adopt or --discard either settles both.")
     if continued:
-        lines.append("continued: Mistral stopped without a closing summary, so it was asked once to finish.")
+        lines.append("continued: Mistral's work looked unfinished (missing files, failing checks, or no closing "
+                     "summary), so it was asked once to finish.")
     if run.status == "stopped_by_refusal":
         lines.append("note: Vibe ended the session after a refused tool call (it treats a refused approval as "
                      "the user cancelling). " + ("The guard hook was not active: " + guard_warning if guard_warning
@@ -707,7 +745,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append("baseline_warning: these checks already failed in the untouched "
                      + ("worktree" if wt else "checkout") + " before Mistral changed anything: "
                      + ", ".join(preexisting) + ". Mistral was told not to work around them. If they pass "
-                     "in your checkout, the cause is the worktree environment (see deps_mode).")
+                     "in your checkout, the cause is the worktree environment (see deps_mode); if they fail there "
+                     "too, it may be your own uncommitted changes, which the worktree starts from.")
     ran_model = (use or {}).get("model") or model
     lines.append(f"mode: {args.mode}, kind: {kind}, policy: {settings['policy']}, model: "
                  + (f"{ran_model}" if ran_model else "unknown")
@@ -749,7 +788,12 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     worktree_removed = False
     if wt:
         files = gitops.changed_files(wt)
-        out_of_scope = [f for f in files if scope and not vibe.matches_scope(f, scope)]
+        # A resumed run's scope adds to the scopes of the runs it continues.
+        combined = worktree_scope({"worktree": {"path": wt["path"]}, "scope": scope})
+        out_of_scope = [f for f in files if combined and not vibe.matches_scope(f, combined)]
+        if out_of_scope:
+            lines.insert(2, "out_of_scope_changes (outside the scope of this worktree's runs; --adopt stops until "
+                            "you choose --include-out-of-scope or --skip-out-of-scope): " + ", ".join(out_of_scope))
         if run.status in ("error", "timeout") and not wt["reused"] and not files:
             gitops.remove_worktree(wt)
             worktree_removed = True
@@ -876,9 +920,6 @@ def worktree_section(wt: dict, run_id: str, files: list[str], out_of_scope: list
         lines.append(f"dependency_note: {note}")
     stat = gitops.changes_stat(wt)
     lines.append("changes_by_vibe:\n" + (stat or "  (none)"))
-    if out_of_scope:
-        lines.append("out_of_scope_changes (outside --scope; --adopt leaves these out unless you add "
-                     "--include-out-of-scope): " + ", ".join(out_of_scope))
     if files:
         diff = gitops.changes_diff(wt)
         n = diff.count("\n")
