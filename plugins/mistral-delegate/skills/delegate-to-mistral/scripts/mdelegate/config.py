@@ -17,10 +17,14 @@ except ModuleNotFoundError:  # Python < 3.11: config files are skipped.
 
 POLICIES = ("conservative", "balanced", "aggressive")
 
+# max_price and max_tool_calls are enforced by the wrapper while Vibe runs; max_turns is passed to Vibe.
 CAPS = {
-    "conservative": {"read": {"max_turns": 10, "max_price": 0.15}, "write": {"max_turns": 20, "max_price": 0.50}},
-    "balanced": {"read": {"max_turns": 15, "max_price": 0.25}, "write": {"max_turns": 30, "max_price": 1.00}},
-    "aggressive": {"read": {"max_turns": 20, "max_price": 0.50}, "write": {"max_turns": 50, "max_price": 2.50}},
+    "conservative": {"read": {"max_turns": 10, "max_price": 0.15, "max_tool_calls": 25},
+                     "write": {"max_turns": 20, "max_price": 0.50, "max_tool_calls": 50}},
+    "balanced": {"read": {"max_turns": 15, "max_price": 0.25, "max_tool_calls": 40},
+                 "write": {"max_turns": 30, "max_price": 1.00, "max_tool_calls": 80}},
+    "aggressive": {"read": {"max_turns": 20, "max_price": 0.50, "max_tool_calls": 60},
+                   "write": {"max_turns": 50, "max_price": 2.50, "max_tool_calls": 150}},
 }
 
 POLICY_GUIDANCE = {
@@ -42,7 +46,7 @@ POLICY_GUIDANCE = {
 }
 
 KEYS = ("policy", "model", "verify", "allow_commands", "fix_attempts", "max_parallel", "deps_mode", "baseline",
-        "scope", "vibe_args", "worktrees_dir", "model_prices")
+        "scope", "vibe_args", "worktrees_dir", "model_prices", "continue_attempts")
 
 DEPS_MODES = ("hardlink", "copy", "symlink", "none")
 
@@ -105,6 +109,7 @@ def load(repo_root: str | None) -> dict:
         "vibe_args": [],
         "worktrees_dir": None,
         "model_prices": {},
+        "continue_attempts": 1,
         "read": {},
         "write": {},
         "sources": {},
@@ -122,7 +127,7 @@ def load(repo_root: str | None) -> dict:
                 settings["sources"][key] = f"{label}: {path}"
         for mode in ("read", "write"):
             if isinstance(data.get(mode), dict):
-                settings[mode].update({k: v for k, v in data[mode].items() if k in ("max_turns", "max_price", "max_tokens")})
+                settings[mode].update({k: v for k, v in data[mode].items() if k in ("max_turns", "max_price", "max_tokens", "max_tool_calls")})
 
     env = os.environ
     if env.get("MISTRAL_DELEGATE_POLICY"):
@@ -159,6 +164,7 @@ def load(repo_root: str | None) -> dict:
     settings["baseline"] = bool(settings["baseline"])
     try:
         settings["fix_attempts"] = max(0, int(settings["fix_attempts"]))
+        settings["continue_attempts"] = max(0, min(1, int(settings["continue_attempts"])))
         settings["max_parallel"] = max(1, int(settings["max_parallel"]))
     except (TypeError, ValueError):
         settings["warnings"].append("fix_attempts and max_parallel must be integers; using defaults")
@@ -174,7 +180,8 @@ def caps(settings: dict, mode: str) -> dict:
     env = os.environ
     for key, var, cast in (("max_turns", "MISTRAL_DELEGATE_MAX_TURNS", int),
                            ("max_price", "MISTRAL_DELEGATE_MAX_PRICE", float),
-                           ("max_tokens", "MISTRAL_DELEGATE_MAX_TOKENS", int)):
+                           ("max_tokens", "MISTRAL_DELEGATE_MAX_TOKENS", int),
+                           ("max_tool_calls", "MISTRAL_DELEGATE_MAX_TOOL_CALLS", int)):
         try:
             if env.get(var):
                 result[key] = cast(env[var])
@@ -200,7 +207,8 @@ def describe(settings: dict) -> str:
     ]
     for mode in ("read", "write"):
         c = caps(settings, mode)
-        lines.append(f"{mode}_caps: max_turns={c['max_turns']} max_price=${c['max_price']:.2f}"
+        lines.append(f"{mode}_caps: max_price=${c['max_price']:.2f} max_tool_calls={c['max_tool_calls']} "
+                     f"max_turns={c['max_turns']}"
                      + (f" max_tokens={c['max_tokens']}" if c.get("max_tokens") else ""))
     for key, source in settings["sources"].items():
         lines.append(f"source of {key}: {source}")

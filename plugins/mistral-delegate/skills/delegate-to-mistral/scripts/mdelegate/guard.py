@@ -305,6 +305,49 @@ def _shell_tokens(command: str) -> list[str]:
     return list(lexer)
 
 
+# Runners whose own options may sit between them and the command they run:
+# `uv run --directory . --no-sync pytest` runs the same thing as `uv run pytest`.
+RUNNERS = (("uv", "run"), ("poetry", "run"), ("pdm", "run"), ("hatch", "run"), ("pipenv", "run"),
+           ("pnpm", "exec"), ("npm", "exec"), ("pnpm",), ("npm",), ("yarn",), ("bun",), ("npx",), ("bunx",))
+RUNNER_VALUE_OPTIONS = {"--directory", "--project", "--python", "-p", "--with", "--with-requirements",
+                        "--with-editable", "--package", "--extra", "--group", "--env-file", "--index",
+                        "--index-url", "--extra-index-url", "--prefix", "-C", "--cwd", "--dir", "--filter",
+                        "-F", "--workspace", "-w", "--config", "--package-manager"}
+
+
+def normalize_command(words: list[str]) -> list[str]:
+    """Drop a runner's own options: ["uv", "run", "--no-sync", "pytest", "-q"] -> ["uv", "run", "pytest", "-q"]."""
+    for runner in RUNNERS:
+        if tuple(words[:len(runner)]) == runner:
+            rest, i = words[len(runner):], 0
+            while i < len(rest) and rest[i].startswith("-") and rest[i] != "--":
+                option = rest[i].split("=", 1)[0]
+                i += 2 if option in RUNNER_VALUE_OPTIONS and "=" not in rest[i] else 1
+            return list(runner) + rest[i:]
+    return words
+
+
+def runner_of(command: str) -> str | None:
+    """The runner an allowed command starts with ("uv run", "npm", ...), for Vibe's prefix allowlist."""
+    words = command.split()
+    for runner in RUNNERS:
+        if tuple(words[:len(runner)]) == runner:
+            return " ".join(runner)
+    return None
+
+
+def command_allowed(words: list[str], allowed: list[str]) -> bool:
+    normalized = normalize_command(words)
+    for prefix in allowed:
+        parts = prefix.split()
+        if words[:len(parts)] == parts:
+            return True
+        canonical = normalize_command(parts)
+        if normalized[:len(canonical)] == canonical:
+            return True
+    return False
+
+
 def check_shell(command: str, policy: dict, cwd: str) -> str | None:
     """Return a refusal reason, or None if the command may run as written."""
     reason, corrections = analyze_shell(command, policy, cwd)
@@ -363,11 +406,15 @@ def analyze_shell(command: str, policy: dict, cwd: str) -> tuple[str | None, dic
         if not words:
             continue
         sed_files = _sed_files(words) if words[0] == "sed" else None
-        if sed_files is None and not any(words[:len(p.split())] == p.split() for p in allowed):
+        if sed_files is None and not command_allowed(words, allowed):
             return f"`{words[0]}` isn't allowed in this run. {hint}", corrections
         if words[0] == "find" and FIND_UNSAFE & set(words):
             return "`find` with -exec/-delete isn't allowed in this run. Use plain `find` to list files.", corrections
-        for word in (sed_files if sed_files is not None else words[1:]):
+        args = sed_files if sed_files is not None else words[1:]
+        i = 0
+        while i < len(args):
+            word = args[i]
+            i += 1
             looks_like_path = word.startswith(("/", "~")) or ".." in word.split("/") or (
                 "/" in word and not word.startswith("-") and not os.path.exists(os.path.join(cwd, word)))
             if not looks_like_path or word == "/dev/null":
@@ -381,9 +428,25 @@ def analyze_shell(command: str, policy: dict, cwd: str) -> tuple[str | None, dic
             if fixed and (word.startswith(("/", "~")) or ".." in word.split("/") or os.path.exists(fixed)):
                 corrections[word] = fixed
                 continue
+            if word.startswith(("/", "~")):
+                # An unquoted path with spaces arrives in pieces ("/Volumes/2TB", "SSD/project/x.py"):
+                # rejoin it, and quote it in the command if the whole path is in the project.
+                joined = None
+                for k in range(1, 5):
+                    if i - 1 + k >= len(args):
+                        break
+                    candidate = " ".join(args[i - 1:i + k])
+                    target = _resolve(candidate, cwd)
+                    if _inside(target, policy["root"]) or (target := correct_path(candidate, policy["root"])):
+                        joined = (candidate, target, k)
+                        break
+                if joined:
+                    corrections[joined[0]] = joined[1]
+                    i += joined[2]
+                    continue
             if word.startswith(("/", "~")) or ".." in word.split("/"):
-                return (f"`{word}` is outside the project. Use paths relative to the project root "
-                        f"({policy['root']})."), corrections
+                return (f"`{word}` is outside the project. Use paths relative to your working directory, the "
+                        f"project root ({policy['root']}); if a path contains spaces, quote it."), corrections
     return None, corrections
 
 

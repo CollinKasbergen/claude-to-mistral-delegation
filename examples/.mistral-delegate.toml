@@ -69,13 +69,17 @@ model = "mistral-medium-3.5"
 # so their runs get a cost. Earlier runs are priced from their tokens too.
 # model_prices = { "glm-5-3" = [1.0, 4.0] }
 
-# Spending caps per Vibe call. Leave these out to use the policy's defaults
-# (balanced: write 30 turns / $1.00, read 15 turns / $0.25).
-# Each fix round may spend up to half the write cap again.
+# Caps per run. Leave these out to use the policy's defaults
+# (balanced: write $1.00 / 80 tool calls, read $0.25 / 40 tool calls).
+# A continuation or fix round gets half of each cap.
+# max_price and max_tool_calls are enforced by the plugin while Mistral works
+# (Vibe can't enforce a price cap for a model whose price it doesn't know).
 [write]
-max_turns = 30
 max_price = 1.00
+max_tool_calls = 80
+max_turns = 30
 
 [read]
-max_turns = 15
 max_price = 0.25
+max_tool_calls = 40
+max_turns = 15

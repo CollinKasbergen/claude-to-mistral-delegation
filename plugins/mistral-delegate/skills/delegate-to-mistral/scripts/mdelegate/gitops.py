@@ -290,3 +290,39 @@ def apply_to_checkout(wt: dict, paths: list[str] | None = None) -> list[str]:
     patch = git_checked(wt["path"], "diff", "--cached", "--binary", wt["base"], *spec)
     git_checked(wt["toplevel"], "apply", "--whitespace=nowarn", "-", input=patch)
     return files
+
+
+def save_state(worktree: str | Path, updates: dict) -> None:
+    state = load_state(worktree)
+    state.update(updates)
+    try:
+        state_path(worktree).write_text(json.dumps(state))
+    except OSError:
+        pass
+
+
+class clean_copy:
+    """A temporary detached worktree at the run's base commit (the snapshot), with dependencies.
+
+    Used to run baseline checks for a resumed run: its own worktree already holds
+    Mistral's earlier changes, so checks there would blame Mistral's code on the base.
+    """
+
+    def __init__(self, wt: dict, deps_mode: str = "hardlink"):
+        self.wt, self.deps_mode, self.path = wt, deps_mode, None
+
+    def __enter__(self) -> Path:
+        import tempfile
+        parent = Path(self.wt["path"]).parent
+        self.path = Path(tempfile.mkdtemp(prefix=".baseline-", dir=parent))
+        self.path.rmdir()
+        git_checked(self.wt["toplevel"], "worktree", "add", "-q", "--detach", str(self.path), self.wt["base"])
+        prepare_dependencies(self.wt["toplevel"], self.path, [], auto=self.deps_mode != "none",
+                             mode=self.deps_mode if self.deps_mode != "none" else "hardlink")
+        return self.path
+
+    def __exit__(self, *exc) -> None:
+        if self.path is not None:
+            git(self.wt["toplevel"], "worktree", "remove", "--force", str(self.path))
+            shutil.rmtree(self.path, ignore_errors=True)
+            git(self.wt["toplevel"], "worktree", "prune")

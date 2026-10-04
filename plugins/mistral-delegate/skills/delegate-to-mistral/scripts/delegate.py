@@ -35,6 +35,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from collections import Counter
@@ -49,6 +50,7 @@ KINDS = ("tests", "feature", "bugfix", "refactor", "migration", "boilerplate", "
 MAX_RESULT_CHARS = 12_000
 CHECK_OUTPUT_LINES = 60
 CHECK_OUTPUT_CHARS = 5_000
+WATCH_INTERVAL = float(os.environ.get("MISTRAL_DELEGATE_WATCH_INTERVAL", 3))
 SCRIPT = Path(__file__).resolve()
 
 
@@ -87,6 +89,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--max-turns", type=int)
     run.add_argument("--max-price", type=float, help="Dollar cap for Vibe's first pass.")
     run.add_argument("--max-tokens", type=int)
+    run.add_argument("--max-tool-calls", type=int, help="Stop Mistral after this many tool calls (enforced by the wrapper).")
     run.add_argument("--worktree-name", help="Worktree/branch name (default: the run id). An existing "
                                              "worktree with this name is reused, e.g. for follow-ups.")
     run.add_argument("--in-place", action="store_true", help="Write mode: edit the checkout directly.")
@@ -146,6 +149,15 @@ def find_run(run_id: str) -> dict:
     return run
 
 
+def runs_on_worktree(run: dict) -> list[dict]:
+    """This run plus the runs that share its worktree (a run and its resumes), not yet settled."""
+    path = (run.get("worktree") or {}).get("path")
+    if not path:
+        return [run]
+    return [r for r in ledger.load_runs().values()
+            if r["id"] == run["id"] or ((r.get("worktree") or {}).get("path") == path and not r.get("outcome"))]
+
+
 def cmd_adopt(args: argparse.Namespace) -> int:
     run = find_run(args.adopt)
     if ledger.state(run) == "running":
@@ -182,7 +194,8 @@ def cmd_adopt(args: argparse.Namespace) -> int:
         print("Nothing to apply" + (" for those paths." if args.paths else ": the run made no changes."))
         return 0
     outcome = "adopted_partial" if (args.paths or skipped) else "adopted"
-    ledger.append({"event": "outcome", "id": run["id"], "outcome": outcome, "paths": paths, "note": args.note})
+    for sibling in runs_on_worktree(run):
+        ledger.append({"event": "outcome", "id": sibling["id"], "outcome": outcome, "paths": paths, "note": args.note})
     print(f"Applied {len(files)} file(s) from {run['id']} to {wt['toplevel']}:")
     print("\n".join(f"  {f}" for f in files))
     if skipped:
@@ -204,7 +217,8 @@ def cmd_discard(args: argparse.Namespace) -> int:
     wt = run.get("worktree")
     if wt and os.path.isdir(wt["path"]):
         gitops.remove_worktree(wt)
-    ledger.append({"event": "outcome", "id": run["id"], "outcome": "discarded", "note": args.note})
+    for sibling in runs_on_worktree(run):
+        ledger.append({"event": "outcome", "id": sibling["id"], "outcome": "discarded", "note": args.note})
     print(f"Discarded {run['id']}" + (" and removed its worktree." if wt else "."))
     return 0
 
@@ -226,13 +240,55 @@ class Run:
         self.stderr = ""
         self.cancelled = False
         self.unfinished = ""
+        self.limit_note = ""
+        self.spent = 0.0
+        self.priced_with_fallback = False
         self.session_id: str | None = args.resume
 
-    def call_vibe(self, cmd: list[str], cwd: str) -> None:
-        try:
-            proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                                  timeout=self.args.timeout, stdin=subprocess.DEVNULL)
-        except subprocess.TimeoutExpired:
+    def call_vibe(self, cmd: list[str], cwd: str, *, cap: float, max_tool_calls: int,
+                  model_hint: str | None = None) -> None:
+        """Run one Vibe call, stopping it when it spends more than `cap` dollars or makes more
+        than `max_tool_calls` tool calls. Vibe can't enforce either when it doesn't know the
+        model's price, so the wrapper watches the session's usage while it runs."""
+        watcher = vibe.SessionWatcher(cwd, time.time(), session_id=self.session_id, model_hint=model_hint)
+        base = watcher.poll() if self.session_id else None  # a resumed session already has usage
+        out_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+        err_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+        proc = subprocess.Popen(cmd, cwd=cwd, stdout=out_file, stderr=err_file, stdin=subprocess.DEVNULL, text=True)
+        started, stopped, snap = time.monotonic(), "", None
+        while proc.poll() is None:
+            time.sleep(WATCH_INTERVAL)
+            snap = watcher.poll() or snap
+            cost, calls, fallback = vibe.spent(snap, base)
+            if time.monotonic() - started > self.args.timeout:
+                stopped = "timeout"
+            elif cost > cap:
+                stopped = "budget_exceeded"
+                self.limit_note = (f"stopped at ~${cost:.2f}, over this call's cap of ${cap:.2f}"
+                                   + (" (priced at mistral-medium-3.5 rates: the model's price is unknown)"
+                                      if fallback else ""))
+            elif calls > max_tool_calls:
+                stopped = "tool_call_limit"
+                self.limit_note = f"stopped after {calls} tool calls, over the cap of {max_tool_calls}"
+            if stopped:
+                proc.terminate()
+                try:
+                    proc.wait(10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                break
+        snap = watcher.poll() or snap
+        cost, calls, fallback = vibe.spent(snap, base)
+        self.spent += cost
+        self.priced_with_fallback = self.priced_with_fallback or (fallback and bool(snap))
+        self.session_id = self.session_id or watcher.session_id
+        out_file.seek(0)
+        err_file.seek(0)
+        proc = subprocess.CompletedProcess(cmd, proc.returncode, out_file.read(), err_file.read())
+        out_file.close()
+        err_file.close()
+        if stopped == "timeout":
             self.status = "timeout"
             self.stderr = f"Vibe did not finish within {self.args.timeout}s and was stopped."
             return
@@ -250,7 +306,9 @@ class Run:
         if info["final_text"]:
             self.final_text = info["final_text"]
         self.unfinished = unfinished_reason(this_turn(history), info["final_text"])
-        if proc.returncode == 0:
+        if stopped:
+            self.status = stopped
+        elif proc.returncode == 0:
             self.status = "ok"
         elif (proc.returncode == 1 and not proc.stdout.strip() and self.stderr
               and not re.match(r"(Error|Teleport error):", self.stderr) and "Traceback" not in self.stderr):
@@ -260,6 +318,9 @@ class Run:
         else:
             self.status = "error"
 
+
+CONTINUE_PROMPT = ("You stopped before finishing. Continue the task from where you left off, then end with "
+                   "the summary: every file you changed and why, and anything you couldn't do.")
 
 CANCELLED = re.compile(r"<user_cancellation>|User cancelled the operation")
 
@@ -289,6 +350,17 @@ def unfinished_reason(turn: list, final_text: str) -> str:
     if text and (text.endswith(("…", "...", ":", ",", ";", "(")) or text.endswith(("and", "the", "to"))):
         return "Mistral's final message stops mid-sentence; the run may have been cut short."
     return ""
+
+
+def measure_baseline(commands: list[str], cwd: str, timeout: int, flaky: list[str]) -> dict:
+    """Run checks before Mistral changes anything; a failing check is rerun once (flaky ones pass then)."""
+    baseline = run_checks(commands, cwd, timeout)
+    failing = [cmd for cmd, (code, _out) in baseline.items() if code != 0]
+    if failing:
+        rerun = run_checks(failing, cwd, timeout)
+        flaky += [cmd for cmd, (code, _out) in rerun.items() if code == 0]
+        baseline.update(rerun)
+    return baseline
 
 
 def run_checks(commands: list[str], cwd: str, timeout: int) -> dict[str, tuple[int, str]]:
@@ -348,7 +420,7 @@ def run_task(args: argparse.Namespace) -> int:
     if args.policy:
         settings["policy"] = args.policy
     caps = config.caps(settings, args.mode)
-    for key in ("max_turns", "max_price", "max_tokens"):
+    for key in ("max_turns", "max_price", "max_tokens", "max_tool_calls"):
         if getattr(args, key) is not None:
             caps[key] = getattr(args, key)
     model = args.model or settings["model"]
@@ -400,9 +472,15 @@ def run_task(args: argparse.Namespace) -> int:
                 if not target.exists() and Path(wt["path"]) in target.parents:
                     target.parent.mkdir(parents=True, exist_ok=True)
 
+    continues = None
+    if wt and wt["reused"]:
+        same = [r for r in ledger.load_runs().values()
+                if (r.get("worktree") or {}).get("path") == wt["path"]]
+        continues = max(same, key=lambda r: r.get("started") or 0)["id"] if same else None
+    settings["continues"] = continues
     ledger.append({"event": "start", "id": run_id, "pid": os.getpid(), "mode": args.mode, "kind": kind,
                    "repo": Path(top or workdir).name, "workdir": workdir, "task": task[:500],
-                   "policy": settings["policy"], "model": model, "scope": scope,
+                   "policy": settings["policy"], "model": model, "scope": scope, "continues": continues,
                    "worktree": {k: wt[k] for k in ("name", "path", "toplevel", "base", "links")} if wt else None})
 
     # The guard hook refuses disallowed tool calls with an error Mistral can work around,
@@ -435,14 +513,26 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     # Run the checks once before Mistral changes anything, so failures that were
     # already there (or come from the worktree environment) aren't blamed on it.
     # A failing check is rerun once, so a flaky one isn't reported as broken.
-    baseline, flaky = {}, []
+    baseline, flaky, baseline_source = {}, [], ""
     if commands and baseline_on:
-        baseline = run_checks(commands, run_dir, args.verify_timeout)
-        failing = [cmd for cmd, (code, _out) in baseline.items() if code != 0]
-        if failing:
-            rerun = run_checks(failing, run_dir, args.verify_timeout)
-            flaky = [cmd for cmd, (code, _out) in rerun.items() if code == 0]
-            baseline.update(rerun)
+        stored = {c: tuple(v) for c, v in (gitops.load_state(wt["path"]).get("baseline") or {}).items()} if wt else {}
+        if wt and wt["reused"]:
+            # This worktree already holds Mistral's earlier changes. Use the baseline from before them,
+            # and run any check missing from it on a clean copy of the original snapshot.
+            baseline = {c: stored[c] for c in commands if c in stored}
+            missing = [c for c in commands if c not in stored]
+            if missing:
+                rel = os.path.relpath(run_dir, wt["path"])
+                try:
+                    with gitops.clean_copy(wt, settings["deps_mode"]) as clean:
+                        baseline.update(measure_baseline(missing, str(clean / rel), args.verify_timeout, flaky))
+                except DelegateError as e:
+                    baseline_source = f"could not build a clean copy for the baseline ({e}); those checks have none"
+            baseline_source = baseline_source or "from before Mistral's earlier changes in this worktree"
+        else:
+            baseline = measure_baseline(commands, run_dir, args.verify_timeout, flaky)
+        if wt:
+            gitops.save_state(wt["path"], {"baseline": {**stored, **{c: list(v) for c, v in baseline.items()}}})
     preexisting = [cmd for cmd, (code, _out) in baseline.items() if code != 0]
 
     prompt = vibe.build_prompt(task, mode=args.mode, spec=spec, context=args.context, verify=commands,
@@ -451,32 +541,46 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                                cwd=os.path.realpath(run_dir))
     # `sed` is safe once the guard vets each call (print-only scripts, no -i); Vibe matches allowlist
     # entries as prefixes, so `sed -nE` or `sed -E -n` need the bare `sed`. Without the guard, keep Vibe's default.
-    vibe_allow = allow_commands + (["sed"] if write and not guard_warning else [])
+    # Likewise the runners of allowed commands (`uv run`, `npm`, ...): Vibe only matches prefixes, so
+    # `uv run --no-sync pytest` would otherwise need approval; the guard vets what the runner runs.
+    runners = [r for r in dict.fromkeys(guard.runner_of(c) for c in allow_commands) if r]
+    vibe_allow = allow_commands + (["sed", *runners] if write and not guard_warning else [])
     agent = args.agent or vibe.write_agent_profile(args.mode, model, vibe_allow)
     trust = args.trust or wt is not None
 
     run = Run(args)
     stats_before = vibe.read_session_stats(args.resume, run_dir, model_hint=model) if args.resume else None
-    run.call_vibe(vibe.build_command(args.vibe_bin, prompt, mode=args.mode, agent=agent, caps=caps,
-                                     allow_shell=args.allow_shell, trust=trust, resume=args.resume,
-                                     extra=settings["vibe_args"]), run_dir)
+
+    def vibe_call(text: str, share: float) -> None:
+        """One Vibe call with `share` of the caps. Vibe's own --max-price counts the whole session, so
+        on a resumed session it gets what was already spent on top; the wrapper enforces this call's share."""
+        session_cost = vibe.stats_cost(vibe.read_session_stats(run.session_id, run_dir, model_hint=model)) \
+            if run.session_id else 0.0
+        vibe_caps = dict(caps, max_price=(session_cost or 0.0) + caps["max_price"] * share)
+        run.call_vibe(vibe.build_command(args.vibe_bin, text, mode=args.mode, agent=agent, caps=vibe_caps,
+                                         allow_shell=args.allow_shell, trust=trust, resume=run.session_id,
+                                         extra=settings["vibe_args"]), run_dir,
+                      cap=caps["max_price"] * share, max_tool_calls=max(1, int(caps["max_tool_calls"] * share)),
+                      model_hint=model)
+
+    vibe_call(prompt, 1.0)
+    continued = 0
+    # A run that stops without a closing summary gets one nudge to finish, within half the caps.
+    if run.unfinished and run.status == "ok" and run.session_id and settings["continue_attempts"] > 0:
+        continued = 1
+        vibe_call(CONTINUE_PROMPT, 0.5)
 
     verification, results, failures, attempts = "not_run", {}, [], 0
     # Checks limited to paths that Mistral ended up changing outside the scope join in now.
     changed_so_far = (gitops.changed_files(wt) if wt else [])
     commands += [c["cmd"] for c in verify if c not in planned and vibe.check_applies(c["paths"], [], changed_so_far)]
     skipped_checks = [c["cmd"] for c in verify if c["cmd"] not in commands]
-    if commands and run.status in ("ok", "limit_reached"):
+    if commands and run.status in ("ok", "limit_reached", "budget_exceeded", "tool_call_limit"):
         results = run_checks(commands, run_dir, args.verify_timeout)
         failures = new_failures(results, baseline)
         while failures and attempts < fix_attempts and run.status == "ok" and run.session_id:
             attempts += 1
-            spent = vibe.stats_cost(vibe.read_session_stats(run.session_id, run_dir, model_hint=model)) or 0.0
-            fix_caps = dict(caps, max_price=spent + caps["max_price"] * 0.5)
-            run.call_vibe(vibe.build_command(args.vibe_bin, vibe.fix_prompt(failures, scope), mode=args.mode,
-                                             agent=agent, caps=fix_caps, allow_shell=args.allow_shell,
-                                             trust=trust, resume=run.session_id,
-                                             extra=settings["vibe_args"]), run_dir)
+            vibe_call(vibe.fix_prompt(failures, scope), 0.5)
             results = run_checks(commands, run_dir, args.verify_timeout)
             failures = new_failures(results, baseline)
         if failures:
@@ -503,6 +607,14 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     lines = [f"run_id: {run_id}", f"status: {run.status}"]
     if run.status == "no_changes":
         lines.append("note: Mistral finished without changing any file. Read its result below to see why.")
+    if run.status in ("budget_exceeded", "tool_call_limit"):
+        lines.append(f"note: the wrapper {run.limit_note}. The work so far is in the worktree: review it, "
+                     "--resume with a higher --max-price/--max-tool-calls, or discard it.")
+    if settings.get("continues"):
+        lines.append(f"continues: {settings['continues']} (same worktree). This run's id and the earlier one "
+                     "both refer to everything in the worktree; --adopt or --discard either settles both.")
+    if continued:
+        lines.append("continued: Mistral stopped without a closing summary, so it was asked once to finish.")
     if run.status == "stopped_by_refusal":
         lines.append("note: Vibe ended the session after a refused tool call (it treats a refused approval as "
                      "the user cancelling). " + ("The guard hook was not active: " + guard_warning if guard_warning
@@ -520,6 +632,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append("flaky_checks (failed, then passed on a rerun before Mistral started): " + ", ".join(flaky))
     if run.unfinished:
         lines.append("final_message_warning: " + run.unfinished)
+    if baseline_source:
+        lines.append("baseline: " + baseline_source)
     if preexisting:
         lines.append("baseline_warning: these checks already failed in the untouched "
                      + ("worktree" if wt else "checkout") + " before Mistral changed anything: "
@@ -533,6 +647,11 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append(f"model_note: Vibe's server-side default routed this run to {ran_model!r}, not a Mistral model. "
                      "To use Mistral, set model = \"mistral-medium-3.5\" in .mistral-delegate.toml.")
     lines.append(usage_line(use, caps["max_price"]))
+    lines.append(f"budget: ~${run.spent:.4f} spent across this run's Vibe calls; caps enforced by the wrapper: "
+                 f"${caps['max_price']:.2f} and {caps['max_tool_calls']} tool calls for the first pass, half of each "
+                 "for a continuation or fix round"
+                 + ("; spend priced at mistral-medium-3.5 rates because the model's price is unknown"
+                    if run.priced_with_fallback else ""))
     turns = use["steps"] if use and use.get("steps") is not None else run.turns
     lines.append(f"elapsed: {elapsed:.0f}s, turns: {turns} (max_turns {caps['max_turns']}), "
                  f"tool calls: {run.tool_calls} (several per turn; not capped by max_turns)")

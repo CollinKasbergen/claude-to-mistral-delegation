@@ -49,8 +49,9 @@ python3 <wrapper> --mode write --kind feature \
   - `sed` calls that only print are allowed alongside Vibe's read-only commands (`sed -n '1,40p' f`, `sed -nE '/a/,/b/p' f`, `sed 's/x/y/g' f`). `-i`, script files, and `w`/`r`/`e` commands are refused. `read_file` and `grep` are still better.
   - The report's `guard:` line shows what it checked, and `refused_by_guard` lists the refusals.
 - `--model ALIAS`: a Vibe model alias from the user's Vibe config, for this run. Without `model` in the config or this flag, Vibe uses its own default, which a server-side experiment may route to a non-Mistral model (the report's `model:` line says which ran, and `model_note` flags it). Suggest pinning `model = "mistral-medium-3.5"` when the user wants Mistral.
-- Caps come from the policy (`--show-config` shows them). Override with `--max-turns`, `--max-price` or `--max-tokens` and tell the user when you raise them. Fix rounds add half the price cap each.
-- Follow-up on the same work: `--resume <session_id> --worktree-name <name>`, both from the report.
+- Caps come from the policy (`--show-config` shows them). The wrapper itself enforces `--max-price` and `--max-tool-calls` while Mistral runs: it watches the session's usage and stops it when either is exceeded. Vibe can't do this for a model whose price it doesn't know, and its own turn limit doesn't limit tool calls. Without a known price, spend is counted at mistral-medium-3.5 rates. A continuation or fix round gets half of each cap. Raise caps only when the task clearly needs it, and tell the user.
+- Follow-up on the same work: `--resume <session_id> --worktree-name <name>`, both from the report. The follow-up gets a new run id but keeps the same worktree, and the report shows `continues: <earlier id>`. Both ids refer to everything in the worktree, and `--adopt` or `--discard` with either settles both. Its baseline comes from before Mistral's first changes, so Mistral's own failures are never counted as already failing.
+- Allowed commands may carry their runner's options: `uv run --directory . --no-sync pytest` counts as `uv run pytest`, and `npm --prefix frontend test` as `npm test`. Paths in those options must still be inside the project.
 
 ### Parallel work
 
@@ -114,6 +115,8 @@ The report starts with `run_id`, `status` and `verification`, then `usage` (cost
 - **verification: passed_except_preexisting.** Mistral broke nothing new, but some checks were already failing. Treat it like passed for Mistral's work, and look at the `baseline_warning`.
 - **verification: passed.** Review the diff for scope and quality, then run `adopt_with`. That applies only Mistral's changes to the checkout, leaves the user's uncommitted work alone, and removes the worktree. Use `--paths` to take part of it.
 - **verification: failed.** Read `failing_check_output`. Either follow up with `--resume … --worktree-name …` and a precise instruction, fix it yourself after adopting, or discard.
+- **status: budget_exceeded / tool_call_limit.** The wrapper stopped Mistral at a cap (`note:` says which, and the `budget:` line shows what was spent). The work so far is in the worktree: review it, resume with a higher cap, or discard it.
+- **continued.** Mistral stopped without a closing summary and was asked once to finish. A remaining `final_message_warning` means it still didn't.
 - **status: limit_reached / timeout.** Resume with a higher cap, or finish it yourself.
 - **out_of_scope_changes.** Mistral edited files outside the scope. `--adopt` leaves them out. Look at them before deciding whether to add `--include-out-of-scope`, and never take them just to make a check pass.
 - **denied_commands.** Commands Mistral tried to run but wasn't allowed to. If one is a check it needs (e.g. `npx vitest run`), suggest adding it to `allow_commands`. `--stats` lists the most denied commands.
