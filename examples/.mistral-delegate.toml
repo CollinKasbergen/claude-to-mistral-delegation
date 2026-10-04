@@ -81,7 +81,8 @@ model = "mistral-medium-3.5"
 # Commands that fix formatting-type check failures. They run before a
 # Mistral fix round, so a formatting failure costs no extra Mistral round.
 # {files} is replaced by the files the run changed ({files:*.py} only those
-# matching), so existing code isn't reformatted; a command whose pattern matches
+# matching), and the formatter's edits are kept only on the lines the run
+# wrote, so existing code keeps its layout; a command whose pattern matches
 # no changed file is skipped. Entries can also be limited to paths.
 # autofix = [
 #   "uv run ruff format {files:*.py}",

@@ -376,6 +376,7 @@ def summarize_history(history: list) -> dict:
     tool_calls = 0
     assistant_messages = 0
     denied: list[str] = []
+    denied_reasons: list[str] = []  # why each was refused (the guard's text, when the guard refused it)
     callback_denied: list[str] = []
     problems: list[str] = []
     notices: list[str] = []
@@ -395,6 +396,7 @@ def summarize_history(history: list) -> dict:
             state = entry.get("state") or {}
             if _is_denied(state):
                 denied.append(_label(entry))
+                denied_reasons.append(str(state.get("reason") or (state.get("error") or {}).get("message") or ""))
             elif state.get("status") not in ("completed", None):
                 reason = state.get("reason") or (state.get("error") or {}).get("message") or ""
                 problems.append(f"{_label(entry)} -> {state.get('status')}" + (f" ({reason})" if reason else ""))
@@ -411,9 +413,10 @@ def summarize_history(history: list) -> dict:
     # A refused approval shows up twice: as the approval request and as the skipped tool call.
     # The request names the call properly, so when there are any, they are the list.
     if callback_denied:
-        denied = callback_denied
+        denied, denied_reasons = callback_denied, [""] * len(callback_denied)
     return {"session_id": session_id, "final_text": final_text, "tool_calls": tool_calls,
-            "assistant_messages": assistant_messages, "denied": denied, "problems": problems,
+            "assistant_messages": assistant_messages, "denied": denied, "denied_reasons": denied_reasons,
+            "problems": problems,
             "notices": notices}
 
 

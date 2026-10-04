@@ -93,7 +93,8 @@ currency = "€"
 credit_reset_day = 1         # day of the month the credit renews (29-31: the last day in shorter months)
 min_savings = 2              # stop delegating kinds of task whose measured savings fall below this
 autofix = [                  # run these when checks fail, before asking Mistral to fix
-  "uv run ruff format {files:*.py}",                      # {files}: only the files the run changed
+  "uv run ruff format {files:*.py}",                      # {files}: only the files the run changed, and the
+                                                          # formatter's edits are kept only on Mistral's lines
   { cmd = "npx prettier --write {files:*.ts,*.vue}", paths = ["frontend/"] },  # skipped when none match
 ]
 # token_weights = { input = 1.0, cached = 0.1, output = 5.0 }  # what counts as an effective token

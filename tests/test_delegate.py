@@ -162,6 +162,13 @@ FAKE_VIBE = textwrap.dedent('''\
     if os.environ.get("FAKE_VIBE_UNFINISHED") and "You stopped before finishing" not in prompt:
         turn.append(dict(entry, id=f"t{len(calls)}", type="effect", title="Read file",
                          detail={"toolName": "read_file", "input": {"path": "app.py"}}, state={"status": "completed"}))
+    for result in (calls[-1].get("hook_results") or []):
+        if result and result.get("decision") == "deny":  # how Vibe records a call its hook refused
+            turn.insert(1, dict(entry, id=f"d{len(calls)}{len(turn)}", type="effect", title="tool",
+                                detail={"kind": "tool", "toolName": "tool"},
+                                state={"status": "skipped", "reason": result["reason"]}))
+            turn.append(dict(entry, id=f"dn{len(calls)}{len(turn)}", type="notice", level="error", detail={},
+                             message="Denied tool 'bash'"))
     if os.environ.get("FAKE_VIBE_DENIED_EDIT"):
         turn.insert(2, dict(entry, id=f"e{len(calls)}", type="effect", title="Edit",
                             detail={"kind": "file_edit", "toolName": "search_replace", "input": {"file_path": "app.py"}},
@@ -844,6 +851,18 @@ class WriteModeTest(DelegateTestBase):
         self.assertIn("verification: passed_except_preexisting", out.stdout)
         self.assertIn("already failing before Mistral changed anything", out.stdout)
 
+    def test_guard_refusals_are_listed_once_with_their_command(self):
+        calls = [["bash", {"command": "rm -rf src"}]]
+        out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_HOOK_CALLS=json.dumps(calls))
+        self.assertIn("refused_by_guard", out.stdout)
+        self.assertIn("rm -rf src", out.stdout.split("refused_by_guard")[1])
+        self.assertNotIn("didn't name", out.stdout)
+        self.assertNotIn("refused_tool_calls", out.stdout)
+        self.assertIn("1 \"Denied tool\" notice(s) for the guard's refusals", out.stdout)
+        end = [e for e in map(json.loads, (self.home / "ledger.jsonl").read_text().splitlines())
+               if e.get("event") == "end"][-1]
+        self.assertNotIn("tool", [d.split(":")[0] for d in end["denied"]])
+
     def test_refused_edits_arent_listed_as_commands(self):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_DENIED_EDIT="1")
         commands = out.stdout.split("denied_commands")[1].split("\n\n")[0].split("refused_tool_calls")[0]
@@ -890,6 +909,20 @@ class WriteModeTest(DelegateTestBase):
         self.assertFalse((wt / "ts.txt").exists())  # no TypeScript file changed: that autofix didn't run
         self.assertIn("autofix: ran echo test_app.py > formatted.txt; touch fixed.txt", out.stdout)
 
+    def test_formatters_only_change_mistrals_lines(self):
+        upper = ('python3 -c \\"import sys; [open(f, \'w\').write(t) for f in sys.argv[1:] '
+                 'for t in [open(f).read().upper()]]\\"')
+        (self.repo / ".mistral-delegate.toml").write_text(
+            f'autofix = ["{upper} {{files:*.py}}; touch fixed.txt"]\n')
+        self.git("add", "-A")
+        self.git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "config")
+        out = self.run_delegate("--mode", "write", "--fix-attempts", "0", "--verify",
+                                "test ! -f test_app.py || test -f fixed.txt", "Task", FAKE_VIBE_TOUCH_APP="1")
+        wt = Path(self.value(out, "worktree_path"))
+        self.assertEqual((wt / "app.py").read_text(), "print('v1')\n# CHANGED BY VIBE\n")  # the user's line kept
+        self.assertIn("DEF TEST_APP", (wt / "test_app.py").read_text())  # a new file is all Mistral's
+        self.assertIn("kept formatting changes to Mistral's lines only, in app.py", out.stdout)
+
     def test_verify_adds_to_the_configured_checks(self):
         (self.repo / ".mistral-delegate.toml").write_text('verify = ["test -f app.py"]\n')
         out = self.run_delegate("--mode", "write", "--verify", "true", "Task")
@@ -909,6 +942,8 @@ class WriteModeTest(DelegateTestBase):
         self.assertIn("assertion_hint: 1 assertion(s) in the new tests check presence", out.stdout)
         self.assertIn("tests/test_loose.py: assert 1 in [1, 2]", out.stdout)
         self.assertIn("worktree_base: your HEAD when the worktree was made", out.stdout)
+        out = self.run_delegate("--mode", "write", "Task\nFAKE_FILE tests/test_q.py assert first == (a if a < b else b)")
+        self.assertIn("tests/test_q.py: assert first == (a if a < b else b)", out.stdout)
 
     def test_no_changes_is_its_own_status(self):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_NO_WRITE="1")
@@ -1528,6 +1563,18 @@ class PlanRunTest(DelegateTestBase):
                     / "report.md").read_text()
         self.assertIn("worktree_base: the plan's starting code with the steps it depends on", b_report)
 
+    def test_the_usage_line_shows_fix_rounds(self):
+        plan = self.plan("""\
+            # Fixes
+            ## step: a
+            verify: test ! -f a.txt || test -f fixed.txt
+            FAKE_FILE a.txt A
+            ## step: b
+            FAKE_FILE b.txt B
+            """)
+        out = self.run_delegate("--plan", str(plan))
+        self.assertIn("(1 needed a fix round: a)", out.stdout)
+
     def test_steps_wait_for_free_slots(self):
         (self.home).mkdir(parents=True, exist_ok=True)
         (self.home / "config.toml").write_text("max_parallel = 2\n")
@@ -1976,6 +2023,21 @@ class GitOpsTest(unittest.TestCase):
             run("mv", "src/core.py", "tests/core.py", cwd=wt["path"])
             self.assertEqual(sorted(gitops.changed_files(wt)), ["src/core.py", "tests/core.py"])
 
+    def test_formatting_is_kept_only_on_changed_lines(self):
+        from mdelegate import gitops
+        with tempfile.TemporaryDirectory() as tmp:
+            run = lambda *a: subprocess.run(["git", "-C", tmp, *a], check=True, capture_output=True)
+            run("init", "-q")
+            Path(tmp, "m.py").write_text("a=1\nb  =  2\nc=3\n")
+            run("add", "-A")
+            run("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "x")
+            Path(tmp, "m.py").write_text("a=1\nb  =  2\nc=call(first_argument, second_argument)\n")  # Mistral
+            before = gitops.read_texts(tmp, ["m.py"])
+            Path(tmp, "m.py").write_text("a = 1\nb = 2\nc = call(\n    first_argument,\n    second_argument,\n)\n")
+            self.assertEqual(gitops.keep_changed_lines_only(tmp, "HEAD", before), ["m.py"])
+            self.assertEqual(Path(tmp, "m.py").read_text(),
+                             "a=1\nb  =  2\nc = call(\n    first_argument,\n    second_argument,\n)\n")
+
     def test_check_timeouts_stop_the_whole_process_group(self):
         sys.path.insert(0, str(SCRIPT.parent))
         import delegate
@@ -2123,6 +2185,16 @@ class MiniTomlTest(unittest.TestCase):
 
 
 class TestRunnerDetectionTest(unittest.TestCase):
+    def test_runners_get_only_test_files_they_can_run(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import delegate
+        tests = ["web/src/format.test.ts", "tests/test_store.py"]
+        self.assertEqual(delegate.runner_tests("pytest", tests), ["tests/test_store.py"])
+        self.assertEqual(delegate.runner_tests("vitest", tests), ["web/src/format.test.ts"])
+        self.assertEqual(delegate.runner_tests("npm run test", tests), ["web/src/format.test.ts"])
+        self.assertEqual(delegate.runner_tests("configured", tests), tests)
+        self.assertEqual(delegate.runner_tests("pytest", ["web/src/format.test.ts"]), [])
+
     def test_only_real_test_runners_count(self):
         sys.path.insert(0, str(SCRIPT.parent))
         import delegate

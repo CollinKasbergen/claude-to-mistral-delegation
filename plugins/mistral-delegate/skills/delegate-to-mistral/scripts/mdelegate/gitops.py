@@ -7,6 +7,7 @@ folders from the checkout. Vibe's changes are measured against that snapshot.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
@@ -548,3 +549,58 @@ class clean_copy:
             git(self.wt["toplevel"], "worktree", "remove", "--force", str(self.path))
             shutil.rmtree(self.path, ignore_errors=True)
             git(self.wt["toplevel"], "worktree", "prune")
+
+
+def read_texts(root: str, files: list[str]) -> dict[str, str | None]:
+    """The current text of these files (None for a missing or binary one)."""
+    out: dict[str, str | None] = {}
+    for rel in files:
+        try:
+            out[rel] = Path(root, rel).read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            out[rel] = None
+    return out
+
+
+def keep_changed_lines_only(root: str, base: str, before: dict[str, str | None]) -> list[str]:
+    """Undo what a formatter changed outside the lines Mistral changed. Returns the files it restored.
+
+    A formatter run on a changed file rewrites the whole file, including the user's own lines that
+    were never part of the task. Each of its edits is kept only where it touches a line Mistral
+    added or changed (compared with `base`); every other edit is reverted.
+    """
+    restored = []
+    for rel, mine in before.items():
+        if mine is None:
+            continue
+        try:
+            formatted = Path(root, rel).read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if formatted == mine:
+            continue
+        try:
+            original = git_checked(root, "show", f"{base}:{rel}").decode("utf-8")
+        except (DelegateError, UnicodeDecodeError):
+            continue  # a new file: every line is Mistral's
+        old, cur, new = (t.splitlines(keepends=True) for t in (original, mine, formatted))
+        touched: set[int] = set()
+        for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, old, cur, autojunk=False).get_opcodes():
+            if tag != "equal":
+                touched.update(range(j1, j2) if j2 > j1 else (j1 - 1, j1))
+        result = []
+        # Lines are matched with whitespace ignored, so respacing is decided line by line and only a real
+        # restructuring (a long line wrapped) is taken or left as a block.
+        squash = [re.sub(r"\s+", "", line) for line in cur], [re.sub(r"\s+", "", line) for line in new]
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, *squash, autojunk=False).get_opcodes():
+            if tag in ("equal", "replace") and i2 - i1 == j2 - j1:
+                # Line for line (a formatter restyling neighbouring lines): decide each line on its own.
+                result += [new[j1 + k] if i1 + k in touched else cur[i1 + k] for k in range(i2 - i1)]
+                continue
+            near = range(i1, i2) if i2 > i1 else (i1 - 1, i1)
+            result += new[j1:j2] if tag != "equal" and any(i in touched for i in near) else cur[i1:i2]
+        text = "".join(result)
+        if text != formatted:
+            Path(root, rel).write_bytes(text.encode("utf-8"))
+            restored.append(rel)
+    return restored

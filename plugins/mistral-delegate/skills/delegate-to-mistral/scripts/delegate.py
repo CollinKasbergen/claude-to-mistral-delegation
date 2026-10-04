@@ -311,6 +311,7 @@ class Run:
         self.tool_calls = 0
         self.turns = 0
         self.denied: list[str] = []
+        self.denied_reasons: list[str] = []
         self.problems: list[str] = []
         self.notices: list[str] = []
         self.final_text = ""
@@ -414,6 +415,7 @@ class Run:
         self.tool_calls += info["tool_calls"]
         self.turns += info["assistant_messages"]
         self.denied += info["denied"]
+        self.denied_reasons += info.get("denied_reasons") or [""] * len(info["denied"])
         self.problems += info["problems"]
         self.notices += info["notices"]
         if info["final_text"]:
@@ -457,6 +459,7 @@ def is_shell_label(label: str) -> bool:
 
 # Assertions that check presence, size or truthiness rather than an exact value.
 LOOSE_ASSERTION = re.compile(r"^\+\s*(assert\s+(?!.*==).*\s(not\s+)?in\s|assert\s+len\(|self\.assert(In|NotIn|True)\(|"
+                             r"assert\s.*\sif\s.*\selse\s|"  # an expected value worked out from the data
                              r".*\.(toContain|toBeTruthy|toBeDefined|toBeGreaterThan)\()")
 
 
@@ -470,8 +473,8 @@ def assertion_hint(wt: dict) -> str:
             found.append(f"{current}: {line[1:].strip()[:100]}")
     if not found:
         return ""
-    return (f"assertion_hint: {len(found)} assertion(s) in the new tests check presence, size or truthiness "
-            "rather than exact values, e.g. " + "; ".join(found[:3])
+    return (f"assertion_hint: {len(found)} assertion(s) in the new tests check presence, size or truthiness, "
+            "or compute the expected value with a condition, rather than asserting exact values, e.g. " + "; ".join(found[:3])
             + ". Check them against the project's rules before adopting.")
 
 
@@ -532,6 +535,20 @@ TEST_RUNNERS = {"pytest", "vitest", "jest", "mocha", "ava", "rspec", "phpunit", 
 LOAD_ERROR = re.compile(r"ImportError|ModuleNotFoundError|cannot import name|SyntaxError|NameError|"
                         r"Cannot find module|Failed to (?:load|resolve) (?:url|import)|error collecting|"
                         r"has no attribute|is not exported|does not provide an export")
+# The test files each runner can run: pytest isn't asked about TypeScript tests, nor vitest about Python ones.
+JS_TESTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte")
+RUNNER_FILES = {"pytest": (".py",), "unittest": (".py",), "tox": (".py",), "nox": (".py",),
+                "vitest": JS_TESTS, "jest": JS_TESTS, "mocha": JS_TESTS, "ava": JS_TESTS, "karma": JS_TESTS,
+                "jasmine": JS_TESTS, "playwright": JS_TESTS, "cypress": JS_TESTS, "go test": (".go",),
+                "cargo test": (".rs",), "rspec": (".rb",), "phpunit": (".php",)}
+
+
+def runner_tests(runner: str, tests: list[str]) -> list[str]:
+    """The changed test files this runner can run (all of them for a runner of unknown language)."""
+    suffixes = RUNNER_FILES.get(runner) or (JS_TESTS if runner.split()[0] in ("npm", "pnpm", "yarn", "bun") else None)
+    return [t for t in tests if t.endswith(suffixes)] if suffixes else tests
+
+
 FILE_ARG_RUNNERS = {"pytest", "vitest", "jest"}
 
 
@@ -576,16 +593,17 @@ def test_strength(wt: dict, run_dir: str, checks: list[dict], baseline: dict, se
     for check in checks:
         runner = _test_runner(check["cmd"], settings["test_commands"])
         measured = check["cmd"] in baseline and baseline[check["cmd"]][0] == 0
-        if runner and measured and vibe.check_applies(check["paths"], [], tests):
-            selected.append((check["cmd"], runner))
+        own = runner_tests(runner, tests) if runner else []
+        if runner and measured and own and vibe.check_applies(check["paths"], [], own):
+            selected.append((check["cmd"], runner, own))
     if not selected:
         return ""
     rel_dir = os.path.relpath(run_dir, wt["path"])
     commands = []
-    for command, runner in selected:
+    for command, runner, own in selected:
         if runner in FILE_ARG_RUNNERS and not re.search(r"(^|\s)--(\s|$)|[;&|<>]", command):
             named = set(command.split())  # test files the command already names aren't added twice
-            args = [a for a in (os.path.relpath(os.path.join(wt["path"], t), run_dir) for t in tests)
+            args = [a for a in (os.path.relpath(os.path.join(wt["path"], t), run_dir) for t in own)
                     if a not in named and f"./{a}" not in named]
             commands.append((command, command + " " + " ".join(shlex.quote(a) for a in args)))
         else:
@@ -906,6 +924,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         if failures and autofixes:
             # Formatting-type failures are fixed by a command, not by another Mistral round.
             changed = gitops.changed_files(wt) if wt else inplace_changes()
+            fix_root = wt["path"] if wt else (top or workdir)
+            before = gitops.read_texts(fix_root, changed)
             for template in autofixes:
                 command = cmdforms.with_files(template, changed, os.path.relpath(run_dir, wt["path"] if wt else
                                                                                    (top or workdir)))
@@ -915,6 +935,10 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                 tail_lines = [ln.strip() for ln in out.splitlines() if ln.strip()][-2:]
                 autofixed.append(command + ("" if code == 0 else
                                             f" (exit {code}: {' / '.join(tail_lines)[:240] or 'no output'})"))
+            # Formatters rewrite whole files; the user's own lines in them keep their layout.
+            restored = gitops.keep_changed_lines_only(fix_root, wt["base"] if wt else "HEAD", before)
+            if restored:
+                autofixed.append(f"(kept formatting changes to Mistral's lines only, in {', '.join(restored[:5])})")
             results = run_checks(commands, run_dir, args.verify_timeout)
             failures = new_failures(results, baseline)
 
@@ -1114,7 +1138,11 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append("refused_by_guard (Mistral got these refusals as errors and could continue):\n"
                      + "\n".join(f"  - {d}" for d in guard_denied[:15]))
     guard_targets = {str(e.get("target")) for e in guard_events if e.get("action") == "deny"}
-    vibe_denied = [d for d in run.denied if d.split(": ", 1)[-1] not in guard_targets]
+    # A call the guard refused shows up in Vibe's history too, often without a name ("tool") and with the
+    # guard's reason: it's already listed under refused_by_guard.
+    guard_reasons = {str(e.get("reason")) for e in guard_events if e.get("action") == "deny"}
+    vibe_denied = [d for d, why in zip(run.denied, run.denied_reasons)
+                   if d.split(": ", 1)[-1] not in guard_targets and why not in guard_reasons]
     # Shell commands are refused for not being allowed; other tools (an edit, a write) for other reasons.
     vibe_denied = [d if d != "tool" else "a tool call Vibe didn't name" for d in vibe_denied]
     denied_shell = [d for d in vibe_denied if is_shell_label(d)]
@@ -1131,10 +1159,13 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                      + "\n".join(f"  - {call}" + (f"  ({n}x)" if n > 1 else "") for call, n in counts.most_common(15)))
     if run.problems:
         lines.append("tool_calls_failed:\n" + "\n".join(f"  - {p}" for p in run.problems[:20]))
-    notices = [n for n in run.notices if "Rewrote tool_input" not in n]
-    rewrites = len(run.notices) - len(notices)
+    notices = [n for n in run.notices if "Rewrote tool_input" not in n and "Denied tool" not in n]
+    rewrites = sum("Rewrote tool_input" in n for n in run.notices)
+    refusals = sum("Denied tool" in n for n in run.notices)
     if rewrites:
         notices.append(f"{rewrites} tool-input rewrite notice(s) from the guard's path corrections (see guard: above)")
+    if refusals:
+        notices.append(f"{refusals} \"Denied tool\" notice(s) for the guard's refusals (see refused_by_guard)")
     if notices:
         lines.append("vibe_notices:\n" + "\n".join(f"  - {n}" for n in notices[:10]))
     if run.stderr and run.status != "ok" and run.stderr.strip() != run.final_text.strip():
@@ -1159,7 +1190,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                    "cost_estimated": use["estimated"] if use else None,
                    "steps": steps, "tool_calls": tool_calls, "tokens": use["tokens"] if use else None,
                    "files_changed": len(files), "out_of_scope": out_of_scope,
-                   "denied": sorted(set(run.denied) | {f"{e.get('tool')}: {e.get('target')}" for e in guard_events
+                   "denied": sorted(set(vibe_denied) | {f"{e.get('tool')}: {e.get('target')}" for e in guard_events
                                                        if e.get("action") == "deny"}),
                    "baseline_failures": preexisting,
                    "session_id": run.session_id, "worktree_removed": worktree_removed})

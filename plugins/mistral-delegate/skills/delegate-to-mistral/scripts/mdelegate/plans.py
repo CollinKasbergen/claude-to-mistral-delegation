@@ -421,6 +421,10 @@ class PlanRun:
         priced = [c for c in costs if c is not None]
         c = self.settings["currency"]
         line = f"usage: {effective:,} effective tokens across {len(runs)} Mistral run(s) of this plan"
+        fixed = [r for r in runs if (r.get("fix_attempts_used") or 0) > 0]
+        if fixed:
+            line += (f" ({len(fixed)} needed a fix round: "
+                     + ", ".join(str(r.get("step") or r["id"]) for r in fixed) + ")")
         if priced:
             line += f"; ~{c}{sum(priced):.4f} at list prices"
         if len(priced) < len(costs):
