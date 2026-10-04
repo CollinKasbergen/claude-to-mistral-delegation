@@ -61,7 +61,7 @@ Claude delegates on its own, following the active policy. You can also ask ("hav
 8. **Report.** It shows status, any `config_warning` (a misspelled or mistyped setting) or `budget_warning` (the caps couldn't be tracked), verification, usage (effective tokens and cost) and month-to-date credit, the path of the run's full diff (kept after the worktree is removed), the change list, files changed outside the scope, commands Mistral was refused, the diff when short, and `adopt_with` / `discard_with` commands.
 9. **Adopt or discard.** `--adopt <id>` applies Mistral's changes inside the scope to your checkout (your own uncommitted work is left alone) and removes the worktree. `--paths` takes only some files (git pathspecs such as `src/` or `.`, checked against the scope like the rest) and keeps the worktree with what you didn't take, and `--discard <id> --note "why"` drops the run. After `--adopt --keep-worktree`, a resume in that worktree adopts only what came after. If any change is outside the scope of the worktree's runs (all of them, when a resume narrowed the scope), `--adopt` stops and lists those files until you choose `--include-out-of-scope` or `--skip-out-of-scope`. New files named literally in `--scope` must exist when the run ends: a missing one gets Mistral one request to create it, and otherwise the run reports `status: incomplete`.
 
-Read tasks (`--mode read`) run in place with read-only tools. `--in-place` write tasks edit your checkout directly; their report lists only the files the run changed, not your earlier uncommitted work.
+Read tasks (`--mode read`) run in place with read-only tools, plus read-only shell commands (`ls`, `find`, `cat`, `grep`, `sed -n`) while the guard is active. `--in-place` write tasks edit your checkout directly; their report lists only the files the run changed, not your earlier uncommitted work.
 
 When a linked `.venv` installs part of your project in editable mode (its `.pth` points into your checkout), checks and Mistral's commands put the worktree's copy first on `PYTHONPATH`, so they test Mistral's code rather than yours; the report's `python_path:` line says so.
 
@@ -134,7 +134,7 @@ Environment variables: `MISTRAL_DELEGATE_POLICY`, `MISTRAL_DELEGATE_MODEL`, `MIS
 |---|---|---|---|
 | Plans (several steps) | `<repo>/.mistral-delegate/plans/<name>.md` | Claude | the wrapper; each Mistral run sees only its own step |
 | Specs (one step) | `<repo>/.mistral-delegate/specs/<name>.md` | Claude | the wrapper, into Mistral's prompt |
-| Standing rules for Mistral's code | the project's `AGENTS.md` | you or Claude, committed | Mistral, on every run (Vibe loads it) |
+| Standing rules for Mistral's code | the project's `AGENTS.md` | you or Claude, committed | Mistral, on every write run (pasted into its prompt as "Project rules") |
 | Settings | `<repo>/.mistral-delegate.toml` | you | the wrapper |
 | Run records: `report.md`, `spec.md`, `changes.diff`, `guard.jsonl`; for a plan also `plan.md` and each step's spec and log | `~/.mistral-delegate/runs/<run or plan id>/` | the wrapper | Claude, via `--result <id>` |
 | Ledger of all runs | `~/.mistral-delegate/ledger.jsonl` | the wrapper | `--status`, `--stats`, the session-start reminder |
@@ -145,10 +145,10 @@ The `.mistral-delegate/` folder in the repo is created by the wrapper with a `.g
 
 For a change with several steps, Claude writes one Markdown plan to `.mistral-delegate/plans/<name>.md` and runs it with `delegate.py --plan <name>` (see [`examples/plan.md`](examples/plan.md)): a title, optional `verify:`/`kind:` settings, shared context, and `## step: <id>` sections with their own `scope`, `context`, `verify`, `allow` and `depends`.
 
-1. **Steps run in parallel worktrees**, up to `max_parallel` at a time. A step that `depends` on others waits for them and starts from their result. Each step is an ordinary run: it gets the shared context, its own instructions and one line about every other step, plus the guard, caps, checks and fix rounds. A step whose dependency failed is skipped.
+1. **Steps run in parallel worktrees**, up to `max_parallel` at a time. A step that `depends` on others waits for them and starts from their result. Each step is an ordinary run: it gets the shared context, its own instructions and one line about every other step, plus the guard, caps, checks and fix rounds. A step whose dependency failed is skipped. A step's `verify:` adds to the configured checks; it doesn't replace them.
 2. **Merging:** steps that succeeded are merged into the plan's own worktree. A step that conflicts with the steps merged before it isn't merged, and the report names the files.
 3. **Checks on the combined result:** the plan's `verify` (or every merged step's checks plus the configured ones) run on the merged result, with a baseline from the starting code. If only the combination fails, one Mistral run fixes it there.
-4. **One report:** a line per step, warnings from the steps' reports, the combined verification, usage and credit, and the combined diff. `--adopt <plan id>` applies it all (or `--steps a,b` for some), `--discard <plan id>` drops it. A failed step can be resumed and merged again with `--integrate <plan id>`.
+4. **One report:** `status: ok` only when every step merged and the merged result passes; `checks_failed` when they merged but fail together. A line per step, warnings from the steps' reports, the combined verification, usage and credit, and the combined diff. `--adopt <plan id>` applies it all (or `--steps a,b` for some), `--discard <plan id>` drops it. A failed step can be resumed and merged again with `--integrate <plan id>`.
 
 This replaces a `mistral-worker` subagent per step: Claude writes one plan and reads one report, and the wrapper does the coordination without spending Claude's tokens. `--stats` shows Claude's tokens per delegated step for plans and single runs, so you can compare.
 
