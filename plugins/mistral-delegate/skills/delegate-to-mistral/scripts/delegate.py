@@ -85,6 +85,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--verify", action="append", default=[], metavar="CMD",
                      help="Write mode: a check to run after Vibe finishes (e.g. 'npm test'). Repeatable. "
                           "Replaces the configured checks.")
+    run.add_argument("--add-verify", action="append", default=[], metavar="CMD",
+                     help="Write mode: a check to run in addition to the configured ones. Repeatable.")
     run.add_argument("--no-verify", action="store_true", help="Skip the configured checks.")
     run.add_argument("--fix-attempts", type=int, help="Times to send a failing check back to Vibe (default 1).")
     run.add_argument("--verify-timeout", type=int, default=600, help="Seconds per check (default 600).")
@@ -431,6 +433,15 @@ class Run:
             self.status = "error"
 
 
+def project_rules(root: str) -> str:
+    """The project's AGENTS.md, which Mistral's prompt repeats: Vibe loads it, but gives it little weight."""
+    try:
+        text = Path(root, "AGENTS.md").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    return text[:6000] + ("\n[... AGENTS.md truncated ...]" if len(text) > 6000 else "")
+
+
 CONTINUE_PROMPT = ("You stopped before finishing. Continue the task from where you left off, then end with "
                    "the summary: every file you changed and why, and anything you couldn't do.")
 
@@ -461,7 +472,10 @@ def unfinished_reason(turn: list, final_text: str) -> str:
         return ""
     entries = [e for e in turn if isinstance(e, dict) and e.get("type") in ("message", "effect")]
     # Trailing read-only calls (re-reading a file, updating a todo list) after the summary don't matter.
-    while entries and entries[-1].get("type") == "effect" and READ_ONLY_TOOL.search(vibe._effect_tool(entries[-1])):
+    # Trailing read-only or refused calls after a real answer don't make the answer unfinished.
+    while entries and entries[-1].get("type") == "effect" and (
+            READ_ONLY_TOOL.search(vibe._effect_tool(entries[-1]))
+            or ((entries[-1].get("state") or {}).get("status") in ("skipped", "cancelled", "failed"))):
         if any(e.get("type") == "message" and e.get("role") == "assistant" and len(vibe.text_of(e)) >= 80
                for e in entries):
             entries.pop()
@@ -541,7 +555,9 @@ def test_strength(wt: dict, run_dir: str, checks: list[dict], baseline: dict, se
     commands = []
     for command, runner in selected:
         if runner in FILE_ARG_RUNNERS and not re.search(r"(^|\s)--(\s|$)|[;&|<>]", command):
-            args = [os.path.relpath(os.path.join(wt["path"], t), run_dir) for t in tests]
+            named = set(command.split())  # test files the command already names aren't added twice
+            args = [a for a in (os.path.relpath(os.path.join(wt["path"], t), run_dir) for t in tests)
+                    if a not in named and f"./{a}" not in named]
             commands.append((command, command + " " + " ".join(shlex.quote(a) for a in args)))
         else:
             commands.append((command, command))
@@ -613,6 +629,8 @@ def run_task(args: argparse.Namespace) -> int:
     write = args.mode == "write"
     verify = [] if (args.no_verify or not write) else (
         [{"cmd": c, "paths": []} for c in args.verify] if args.verify else settings["verify"])
+    if write:
+        verify += [{"cmd": c, "paths": []} for c in args.add_verify if c not in {v["cmd"] for v in verify}]
     allow_commands = list(dict.fromkeys(settings["allow_commands"] + args.allow_command)) if write else []
     # `npm test` also covers `npm run test`, `npx vitest` (when that's the test script), etc.
     settings["allow_commands_as_given"] = allow_commands
@@ -716,7 +734,7 @@ def run_task(args: argparse.Namespace) -> int:
     EDITABLE_SOURCES[:] = gitops.editable_sources(top, wt.get("links") or []) if wt else []
     run.env = dict(python_path_env(wt["path"] if wt else None) or os.environ, **{guard.RUN_ENV: run_id})
     if not guard_warning:
-        default_cmds = vibe.DEFAULT_BASH_ALLOWLIST if write else []
+        default_cmds = vibe.DEFAULT_BASH_ALLOWLIST  # read-only commands; the guard vets every call
         run.guard_policy = {
             "run_id": run_id, "root": guard_root, "mode": args.mode, "scope": scope,
             "allow_commands": default_cmds + allow_commands, "default_commands": default_cmds,
@@ -787,13 +805,15 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     prompt = vibe.build_prompt(task, mode=args.mode, spec=spec, context=args.context, verify=commands,
                                allow_commands=settings.get("allow_commands_as_given") or allow_commands, allow_shell=args.allow_shell, scope=scope,
                                preexisting_failures=preexisting, root=guard_root,
-                               cwd=os.path.realpath(run_dir))
+                               cwd=os.path.realpath(run_dir), project_rules=project_rules(guard_root) if write else "")
     # `sed` is safe once the guard vets each call (print-only scripts, no -i); Vibe matches allowlist
     # entries as prefixes, so `sed -nE` or `sed -E -n` need the bare `sed`. Without the guard, keep Vibe's default.
     # Likewise the runners of allowed commands (`uv run`, `npm`, ...): Vibe only matches prefixes, so
     # `uv run --no-sync pytest` would otherwise need approval; the guard vets what the runner runs.
     runners = [r for r in dict.fromkeys(guard.runner_of(c) for c in allow_commands) if r]
-    vibe_allow = allow_commands + (["sed", *runners] if write and not guard_warning else [])
+    vibe_allow = allow_commands + (["sed", *runners] if not guard_warning else [])
+    # Read runs may use read-only shell commands (ls, find, cat, sed -n) only while the guard checks them.
+    read_shell = not write and not guard_warning
     agent = args.agent or vibe.write_agent_profile(args.mode, model, vibe_allow)
     trust = args.trust or wt is not None
 
@@ -815,6 +835,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                 if run.session_id else 0.0
             vibe_caps["max_price"] = (session_cost or 0.0) + caps["max_price"] * share
         run.call_vibe(vibe.build_command(args.vibe_bin, text, mode=args.mode, agent=agent, caps=vibe_caps,
+                                         read_shell=read_shell,
                                          allow_shell=args.allow_shell, trust=trust, resume=run.session_id,
                                          extra=settings["vibe_args"]), run_dir,
                       token_budget=int(caps["token_budget"] * share),
@@ -872,6 +893,9 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         if missing:
             follow_up = (f"These files from your task don't exist yet: {', '.join(missing)}. Create them as the "
                          "task describes, then end with the summary of every file you changed.")
+        elif not write and len(run.final_text.strip()) >= 200:
+            summary_note = ("Mistral's last step wasn't its answer, but it did answer; it wasn't asked to "
+                            "continue (that would cost a round).")
         elif commands and not failures and changed_now:
             summary_note = ("Mistral ended without a closing summary, but its changes pass the checks, so it "
                             "wasn't asked to finish (that would cost a round). Read the diff instead.")
@@ -1049,7 +1073,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     if denied_shell:
         counts = Counter(denied_shell)
         why = ("refused because they aren't in allow_commands; add them if Mistral needs them" if write
-               else "read mode runs no commands")
+               else "read mode allows only read-only commands such as ls, cat, grep, find and sed -n")
         lines.append(f"denied_commands ({why}):\n"
                      + "\n".join(f"  - {cmd}" + (f"  ({n}x)" if n > 1 else "") for cmd, n in counts.most_common(15)))
     if denied_other:
@@ -1073,7 +1097,9 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     # itself would have taken (Mistral's work, scaled by claude_relative_effort). Recorded for --stats.
     # A plan step's report is read by the plan runner, not Claude: the plan records Claude's overhead.
     overhead = 0 if args.plan_step else vibe.effective_tokens(len(report) // 4, 0, (len(task) + len(spec or "")) // 4)
-    equivalent = int((use["effective"] if use else run.effective) * settings["claude_relative_effort"])
+    # An integration fix repairs what the plan's steps did together: it replaces no work Claude would have done.
+    equivalent = 0 if (args.plan_step or "").endswith(":integration") else \
+        int((use["effective"] if use else run.effective) * settings["claude_relative_effort"])
     ledger.save_report(run_id, report)
     ledger.append({"event": "end", "id": run_id, "status": run.status, "verification": verification,
                    "fix_attempts_used": attempts, "cost": use["cost"] if use else None,

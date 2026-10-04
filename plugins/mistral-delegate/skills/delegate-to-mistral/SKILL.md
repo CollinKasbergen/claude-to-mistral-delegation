@@ -29,7 +29,7 @@ The session context may also show:
 |---|---|---|---|
 | Plan (several steps) | `<repo>/.mistral-delegate/plans/<name>.md` | you | the wrapper; each Mistral run sees only its own step |
 | Spec (one step) | `<repo>/.mistral-delegate/specs/<name>.md` | you | the wrapper, into Mistral's prompt |
-| Standing rules for Mistral's code | the project's `AGENTS.md` | you or the user, committed | Mistral, on every run (Vibe loads it) |
+| Standing rules for Mistral's code | the project's `AGENTS.md` | you or the user, committed | Mistral, on every write run (the wrapper puts it in the prompt as "Project rules") |
 | Settings | `<repo>/.mistral-delegate.toml` | the user | the wrapper |
 | Run records: `report.md`, `spec.md`, `changes.diff`, `guard.jsonl`, a plan's `plan.md` and step specs and logs | `~/.mistral-delegate/runs/<run or plan id>/` | the wrapper | you, through `--result <id>` or the `diff:` line |
 
@@ -50,7 +50,7 @@ python3 <wrapper> --mode write --kind feature \
   "Add the /api/teams endpoint as described in the spec"
 ```
 
-- `--mode read` (default): read-only tools, runs in place. Use it for codebase questions.
+- `--mode read` (default): read-only tools, runs in place. Use it for codebase questions. Mistral may also use read-only shell commands (`ls`, `find`, `cat`, `grep`, `sed -n`) while the guard is active.
 - `--mode write`: a new worktree starting from the current code (uncommitted and untracked files included). Ignored `node_modules`, `.venv` and similar folders come in as real folders by default (copy-on-write clones where the disk supports it, else hard links shared with the checkout), so tools like Vite accept them. `--deps-mode copy|symlink|none` changes that, and `--link .env` adds a symlink to another path. `--in-place` edits the checkout directly; use it only when the user asks.
 - `--scope GLOB` (repeatable, relative to the repo root): the files Mistral may create or change. **Always set it for write tasks.** Mistral is told to stay inside it, and changes outside it are flagged near the top of the report as `out_of_scope_changes`. `--adopt` then stops and lists them until you choose `--include-out-of-scope` or `--skip-out-of-scope`. A tests-only task gets only the test files as scope. `*` also matches `/`. New files named literally in the scope must exist when the run ends: a missing one gets Mistral one request to create it, and otherwise the run is `incomplete`. A resume may use a narrower scope for its fix; the worktree's scope is then the combination of its runs' scopes, so the earlier run's files aren't treated as out of scope.
 - `--kind`: one of `tests feature bugfix refactor migration boilerplate docs search other`. It feeds the track record, so always set it.
@@ -98,10 +98,10 @@ scope: src/pages/Teams.vue, src/pages/Teams.test.ts
 What to build in this step.
 ```
 
-- **Format:** `# Title`, then optional plan settings (`verify:` checks for the merged result, `kind:` default kind), then the shared context. Each `## step: <id> - <title>` starts with its settings: `scope`, `context`, `depends` (comma-separated), `verify`, `allow` (one command per line, may repeat), `kind`. The rest is that step's instructions. A step gets the shared context, its own instructions, and one line about every other step; write each step as you'd write a spec.
+- **Format:** `# Title`, then optional plan settings (`verify:` checks for the merged result, `kind:` default kind), then the shared context. Each `## step: <id> - <title>` starts with its settings: `scope`, `context`, `depends` (comma-separated), `verify`, `allow` (one command per line, may repeat), `kind`. A step's `verify:` adds to the configured checks (lint, type check), it doesn't replace them. The rest is that step's instructions. A step gets the shared context, its own instructions, and one line about every other step; write each step as you'd write a spec.
 - **Split by file:** steps that change the same file conflict when merged (the report says so, and the later step isn't merged). Give each step its own files, and make a step that builds on another `depends` on it.
 - **Run it in the background:** write it to `.mistral-delegate/plans/teams-page.md`, then `python3 <wrapper> --plan teams-page` (Bash `run_in_background`; it takes as long as its slowest chain of steps). `--steps api,ui` runs only some. Caps and flags (`--fix-attempts`, `--max-price`, ...) apply to each step. `--status` shows the plan and its steps while they run.
-- **The report:** `status: ok` (every step merged), `partial` or `failed`. One line per step (`-> merged`, `not merged: conflicts with ... in <files>`, `skipped: needs <step>`, or how to resume it), `step_notes` (warnings from the steps' own reports), `verification` of the merged result, usage and credit, the combined diff, and `adopt_with`. `--result <step run id>` prints a step's own report when you need detail.
+- **The report:** `status: ok` (every step merged and the merged result passes its checks), `checks_failed` (every step merged, but together they fail a check), `partial` (some steps didn't merge) or `failed` (none did). One line per step (`-> merged`, `not merged: conflicts with ... in <files>`, `skipped: needs <step>`, or how to resume it), `step_notes` (warnings from the steps' own reports), `verification` of the merged result, usage and credit, the combined diff, and `adopt_with`. `--result <step run id>` prints a step's own report when you need detail.
 - **Finishing a step that failed:** resume it with the `--resume <session> --worktree-name <name>` the report gives, then `--integrate <plan id>` to merge again and recheck. Its report comes back like the first.
 - **Adopt or discard the plan, never a step:** `--adopt <plan id>` applies the merged result; `--adopt <plan id> --steps api` only those steps (with what they depend on); `--discard <plan id>` drops it all. `--include-out-of-scope` / `--skip-out-of-scope` work as for a run.
 

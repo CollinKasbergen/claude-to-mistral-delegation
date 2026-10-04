@@ -250,17 +250,30 @@ class ReadModeTest(DelegateTestBase):
         out = self.run_delegate("--mode", "read", "Find the config parser")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         argv = self.last()["argv"]
-        self.assertEqual(argv[argv.index("--agent") + 1], "plan")
+        profile = self.profile(argv)  # read-only shell commands, vetted by the guard; no edits
+        self.assertIn('permission = "never"', profile)
+        self.assertIn('"ls"', profile)
+        self.assertIn('"sed"]', profile)
         self.assertNotIn("--auto-approve", argv)
         self.assertNotIn("--trust", argv)
         enabled = [argv[i + 1] for i, a in enumerate(argv) if a == "--enabled-tools"]
-        self.assertEqual(sorted(enabled), ["grep", "read_file", "todo"])
+        self.assertEqual(sorted(enabled), ["bash", "grep", "read_file", "todo"])
         self.assertEqual(Path(self.last()["cwd"]).resolve(), self.repo.resolve())
         self.assertIn("status: ok", out.stdout)
         self.assertIn("kind: search", out.stdout)
         self.assertIn("session_id: sess-1234567890", out.stdout)
         self.assertIn("Done: added test_app.py", out.stdout)
-        self.assertIn("denied_commands (read mode runs no commands):\n  - bash: npx vitest run", out.stdout)
+        self.assertIn("denied_commands (read mode allows only read-only commands such as ls, cat, grep, find and "
+                      "sed -n):\n  - bash: npx vitest run", out.stdout)
+
+    def test_read_mode_without_the_guard_has_no_shell(self):
+        (self.tmpdir / "vibe-home").mkdir(exist_ok=True)
+        (self.tmpdir / "vibe-home" / "hooks.toml").write_text("[[hooks]\nbroken")  # guard can't install
+        self.run_delegate("--mode", "read", "Find the config parser")
+        argv = self.last()["argv"]
+        self.assertEqual(argv[argv.index("--agent") + 1], "plan")
+        enabled = [argv[i + 1] for i, a in enumerate(argv) if a == "--enabled-tools"]
+        self.assertEqual(sorted(enabled), ["grep", "read_file", "todo"])
 
     def test_usage_reports_cost_steps_and_tokens(self):
         out = self.run_delegate("--max-price", "0.5", "Task")
@@ -290,7 +303,7 @@ class ReadModeTest(DelegateTestBase):
         profile = self.profile(argv)
         self.assertIn('active_model = "mistral-small"', profile)
         self.assertIn('permission = "never"', profile)
-        self.assertNotIn("[tools.bash]", profile)
+        self.assertNotIn('"npm test"', profile)  # only read-only commands in read mode
 
     def test_unknown_model_is_flagged(self):
         out = self.run_delegate("--model", "mistral-small", "Task")
@@ -857,6 +870,16 @@ class WriteModeTest(DelegateTestBase):
             f.write(json.dumps({"event": "start", "id": "mistral-old00001", "time": 1}) + "\n")
         self.assertIn("an old report", self.run_delegate("--result", "mistral-old00001").stdout)
 
+    def test_agents_md_rules_are_in_the_prompt(self):
+        (self.repo / "AGENTS.md").write_text("Tests assert exact values.\n")
+        self.git("add", "-A")
+        self.git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "rules")
+        self.run_delegate("--mode", "write", "Task")
+        prompt = self.last()["prompt"]
+        self.assertIn("## Project rules (from AGENTS.md; follow them in code and tests)\n\nTests assert exact values.",
+                      prompt)
+        self.assertIn("check your code and tests against the project rules", prompt)
+
     def test_no_changes_is_its_own_status(self):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_NO_WRITE="1")
         self.assertEqual(out.returncode, 1)
@@ -1305,6 +1328,11 @@ class PlanRunTest(DelegateTestBase):
         self.assertEqual(outcomes[steps["a"]], "adopted")
         self.assertEqual(outcomes[steps["b"]], "discarded")
         self.assertEqual(outcomes[fix["id"]], "discarded")
+        fix_end = next(e for e in map(json.loads, (self.home / "ledger.jsonl").read_text().splitlines())
+                       if e.get("event") == "end" and e["id"] == fix["id"])
+        self.assertEqual(fix_end["claude_equivalent"], 0)  # a repair replaces no work Claude would have done
+        fix_report = (self.home / "runs" / fix["id"] / "report.md").read_text()
+        self.assertIn("first pass at 500,000 effective tokens and 40 tool calls", fix_report)  # half the caps
         self.assertEqual(outcomes[self.value(out, "plan_id")], "adopted_partial")
 
     def test_a_resumed_step_joins_after_integrate(self):
@@ -1398,6 +1426,49 @@ class PlanRunTest(DelegateTestBase):
         self.assertTrue((self.home / "runs" / plan_id / "plan.md").is_file())
         self.assertTrue((self.home / "runs" / plan_id / "report.md").is_file())
         self.assertTrue((self.home / "runs" / plan_id / "a.spec.md").is_file())
+
+    def test_merged_checks_import_the_worktrees_code(self):
+        (self.repo / ".gitignore").write_text("node_modules/\n.venv/\n")
+        (self.repo / "src" / "pkg").mkdir(parents=True)
+        (self.repo / "src" / "pkg" / "__init__.py").write_text("")
+        self.git("add", "-A")
+        self.git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "pkg")
+        site = self.repo / ".venv" / "lib" / "python3.11" / "site-packages"
+        site.mkdir(parents=True)
+        (site / "_editable_impl_pkg.pth").write_text(str(self.repo / "src") + "\n")  # uv sync / pip install -e
+        plan = self.plan("""\
+            # Editable
+            verify: python3 -c "import pkg.extra"
+
+            ## step: a
+            FAKE_FILE src/pkg/extra.py VALUE = 1
+
+            ## step: b
+            FAKE_FILE b.txt B
+            """)
+        out = self.run_delegate("--plan", str(plan), "--fix-attempts", "0", PYTHONPATH="")
+        self.assertIn("status: ok", out.stdout)
+        self.assertIn('pass: python3 -c "import pkg.extra"', out.stdout)
+
+    def test_step_checks_add_to_the_configured_ones_and_failed_checks_show_in_the_status(self):
+        (self.repo / ".mistral-delegate.toml").write_text('verify = ["test -f app.py"]\n')
+        plan = self.plan("""\
+            # Checks
+            verify: test ! -f a.txt -o ! -f b.txt
+
+            ## step: a
+            verify: test -f a.txt
+            FAKE_FILE a.txt A
+
+            ## step: b
+            FAKE_FILE b.txt B
+            """)
+        out = self.run_delegate("--plan", str(plan), "--fix-attempts", "0")
+        step_a = next(c["prompt"] for c in self.calls() if Path(c["cwd"]).name.endswith("-a"))
+        self.assertIn("`test -f app.py`, `test -f a.txt`", step_a)  # configured check kept, step's added
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("status: checks_failed", out.stdout)  # every step merged, but together they fail
+        self.assertIn("verification: failed", out.stdout)
 
     def test_steps_wait_for_free_slots(self):
         (self.home).mkdir(parents=True, exist_ok=True)
@@ -1796,6 +1867,13 @@ class UnfinishedRunTest(unittest.TestCase):
             self.assertEqual(f([msg(text)], text), "", text)
         self.assertIn("mid-sentence", f([msg("Then I updated the")], "Then I updated the"))
         self.assertIn("without a final message", f([msg("")], ""))
+        answer = "Open loans are counted in Store.count_open_loans; tests/test_service.py covers the limit."
+        refused = {"type": "effect", "title": "Denied tool 'bash'", "detail": {"input": {"command": "ls"}},
+                   "state": {"status": "skipped", "reason": "denied"}}
+        self.assertEqual(f([msg(answer), refused], answer), "")  # refused calls after the answer
+        from mdelegate import vibe
+        self.assertEqual(vibe._label(refused), "bash: ls")
+        self.assertEqual(vibe._label({"detail": {"kind": "tool", "input": {"command": "find ."}}}), "bash: find .")
         summary = "Added tests for the shop list: paused shops, renamed shops, and the empty state. Files: a.test.ts."
         self.assertEqual(f([msg(summary), tool], summary), "")  # a trailing read after a real summary is fine
 
@@ -1910,6 +1988,15 @@ class LedgerTest(unittest.TestCase):
         self.assertIn("r1", ledger.format_status(runs, currency="€"))
         self.assertIn("1/1", ledger.format_stats(runs))  # passed_except_preexisting counts as passed
         ledger.month_spend(runs)
+
+    def test_token_averages_skip_runs_without_token_data(self):
+        from mdelegate import ledger
+        now = time.time()
+        runs = {"a": {"id": "a", "kind": "docs", "status": "ok", "started": now, "cost": 0.4, "tokens": 9},
+                "b": {"id": "b", "kind": "docs", "status": "ok", "started": now, "cost": 0.5, "tokens": 9,
+                      "effective": 300_000}}
+        row = next(line for line in ledger.format_stats(runs).splitlines() if line.startswith("docs"))
+        self.assertIn("300,000", row)  # not 150,000: run a predates effective tokens
 
     def test_status_uses_the_currency(self):
         from mdelegate import ledger

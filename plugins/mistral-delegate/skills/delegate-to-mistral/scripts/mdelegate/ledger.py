@@ -261,7 +261,8 @@ def compute_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = N
     cutoff = time.time() - days * 86400
     by_kind: dict[str, dict] = defaultdict(lambda: {"runs": 0, "ok": 0, "verified": 0, "passed": 0,
                                                     "adopted": 0, "partial": 0, "discarded": 0, "cost": 0.0,
-                                                    "costed": 0, "effective": 0, "saved": 0, "overhead": 0})
+                                                    "costed": 0, "effective": 0, "measured": 0, "saved": 0,
+                                                    "overhead": 0})
     for r in runs.values():
         if (r.get("started") or 0) < cutoff or not r.get("status") or r.get("mode") == "plan":
             continue
@@ -282,7 +283,10 @@ def compute_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = N
         if cost is not None:
             s["cost"] += cost
             s["costed"] += 1
-        s["effective"] += r.get("effective") if isinstance(r.get("effective"), int) else 0
+        # Runs from before effective tokens were recorded don't count towards the average.
+        if isinstance(r.get("effective"), (int, float)) and r["effective"] > 0:
+            s["effective"] += int(r["effective"])
+            s["measured"] += 1
         # Savings count decided runs only: adopted work saves Claude its equivalent (half for a partial
         # adopt); discarded work saves nothing, but its overhead still counts.
         if r.get("outcome") and isinstance(r.get("claude_overhead"), (int, float)):
@@ -322,8 +326,9 @@ def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = No
         ratio = savings(s)
         flag = "  (below min_savings)" if min_savings and ratio is not None and ratio < min_savings else ""
         avg_cost = f"{currency}{s['cost'] / s['costed']:.3f}" if s["costed"] else "?"
+        avg_effective = f"{s['effective'] // s['measured']:,}" if s["measured"] else "?"
         lines.append(f"{kind:<13} {s['runs']:<5} {s['ok']:<4} {verify:<12} {_adopted(s):<21} "
-                     f"{s['effective'] // max(s['runs'], 1):<15,} {avg_cost:<10} "
+                     f"{avg_effective:<15} {avg_cost:<10} "
                      + (f"x{ratio:.1f}" if ratio is not None else "-") + flag)
         total_runs += s["runs"]
         total_cost += s["cost"]

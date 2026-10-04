@@ -21,7 +21,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import config, gitops, ledger, vibe
+from . import checks, config, gitops, ledger, vibe
 from .checks import CheckResult, check_lines, measure_baseline, new_failures, run_checks, stop_process_group
 from .gitops import DelegateError
 from .plan import Plan, PlanError, Step, parse, select, step_spec
@@ -87,12 +87,14 @@ class PlanRun:
         return out
 
     def child_command(self, *, worktree: str, kind: str, spec: Path, step_tag: str, task: str, scope: list[str],
-                      verify: list[str], allow: list[str], context: list[str]) -> list[str]:
+                      verify: list[str], allow: list[str], context: list[str], add_verify: list[str] = (),
+                      extra: list[str] = ()) -> list[str]:
         cmd = [sys.executable, str(self.script), "--mode", "write", "--workdir", self.workdir,
                "--worktree-name", worktree, "--kind", kind, "--spec", str(spec), "--plan-step", step_tag,
-               "--diff-lines", "0", *self.passthrough()]
-        for flag, values in (("--scope", scope), ("--verify", verify), ("--allow-command", allow),
-                             ("--context", context)):
+               "--diff-lines", "0", *self.passthrough(), *extra]
+        # A step's own checks come on top of the configured ones (lint, type check), which still apply.
+        for flag, values in (("--scope", scope), ("--verify", verify), ("--add-verify", add_verify),
+                             ("--allow-command", allow), ("--context", context)):
             for value in values:
                 cmd += [flag, value]
         return cmd + [task]
@@ -158,7 +160,7 @@ class PlanRun:
         task = f"{self.plan.title} [{step.id}]: {step.summary()}"
         self.spawn(step.id, self.child_command(
             worktree=wt["name"], kind=kind, spec=spec, step_tag=f"{self.plan_id}:{step.id}", task=task,
-            scope=step.scope, verify=step.verify, allow=step.allow, context=step.context))
+            scope=step.scope, verify=[], add_verify=step.verify, allow=step.allow, context=step.context))
         return None
 
     def finish_step(self, step: Step, result: dict) -> None:
@@ -253,6 +255,11 @@ class PlanRun:
                                if any(code for code, _o in results.values()) else "passed")
         return out
 
+    def use_worktree_code(self) -> None:
+        """Checks on the merged result import its code, not the checkout's: a virtualenv installed in
+        editable mode (uv sync, pip install -e) points into the user's checkout."""
+        checks.EDITABLE_SOURCES[:] = gitops.editable_sources(self.top, self.int_wt.get("links") or [])
+
     def baseline_for(self, commands: list[str]) -> dict:
         """Check results on the plan's starting code: from steps that started there, else a clean copy."""
         baseline = {c: CheckResult.load(v) for c, v in
@@ -272,6 +279,15 @@ class PlanRun:
         gitops.save_state(self.int_wt["path"], {"baseline": {c: v.stored() for c, v in baseline.items()}})
         return baseline
 
+    def fix_caps(self) -> list[str]:
+        """The integration fix gets half a write run's caps: it repairs, it doesn't build."""
+        caps = config.caps(self.settings, "write")
+        out = []
+        for flag, key in (("--token-budget", "token_budget"), ("--max-tool-calls", "max_tool_calls")):
+            if getattr(self.args, key, None) is None:
+                out += [flag, str(max(1, int(caps[key]) // 2))]
+        return out
+
     def fix_integration(self, failures: list, commands: list[str], merged: list[str]) -> dict:
         lines = [f"# Plan: {self.plan.title}",
                  "The steps of this plan were done separately and are now merged in your working directory:",
@@ -288,7 +304,7 @@ class PlanRun:
         self.spawn("integration", self.child_command(
             worktree=self.plan_id, kind="integration", spec=spec, step_tag=f"{self.plan_id}:integration",
             task=f"Make the merged steps of plan '{self.plan.title}' pass their checks together",
-            scope=scope, verify=commands, allow=[], context=[]))
+            scope=scope, verify=commands, allow=[], context=[], extra=self.fix_caps()))
         while self.children["integration"][0].poll() is None:
             time.sleep(POLL)
         result = self.collect("integration")
@@ -302,10 +318,12 @@ class PlanRun:
         if integration.get("fix") and integration["fix"].get("run_id"):
             runs.append(integration["fix"])
         all_merged = len(merged) == len(self.steps)
-        status = "ok" if all_merged else "partial" if merged else "failed"
         verification = integration["verification"]
         if verification == "same_as_step":
             verification = (self.results[merged[0]].get("verification") or "not_run") if merged else "not_run"
+        # ok means every step merged and the merged result passes its checks.
+        status = ("failed" if not merged else "partial" if not all_merged
+                  else "checks_failed" if verification == "failed" else "ok")
         lines = [f"plan_id: {self.plan_id}", f"status: {status}",
                  f"plan: {self.plan.title} ({len(merged)} of {len(self.steps)} steps merged)"]
         for warning in self.settings["warnings"]:
@@ -511,6 +529,7 @@ def main(args, script: Path, kinds: tuple, script_cmd) -> int:
         ledger.append({"event": "update", "id": plan_id, "worktree": {
             k: run.int_wt[k] for k in ("name", "path", "toplevel", "base", "links")}})
         run.run_steps()
+        run.use_worktree_code()
         integration = run.integrate()
         report, end = run.report(integration)
         run.record_end(report, end, plan_text)
@@ -602,6 +621,7 @@ def integrate_again(args, script: Path, script_cmd) -> int:
             if result["ok"]:
                 gitops.commit_all(wt, f"mistral-delegate: {record['id']} step {step.id}")
             run.results[step.id] = result
+        run.use_worktree_code()
         integration = run.integrate()
         report, end = run.report(integration)
         run.record_end(report, end, _plan_text(record["id"]))
