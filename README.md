@@ -25,6 +25,8 @@ A Claude Code plugin that lets Claude hand implementation steps to [Mistral Vibe
    allow_commands = ["npm test"]               # commands Mistral may run itself while working
    ```
 
+   A fully commented starting point is in [`examples/.mistral-delegate.toml`](examples/.mistral-delegate.toml).
+
 ## Use
 
 Claude delegates on its own, following the active policy. You can also ask ("have Mistral add the teams endpoint"), or use the command:

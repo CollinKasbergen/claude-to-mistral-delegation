@@ -1,0 +1,42 @@
+# mistral-delegate settings for this project.
+# Copy this file to your repository root as .mistral-delegate.toml and adjust it.
+# Check the effective settings with: /delegate-mistral config
+
+# How much Claude hands to Mistral:
+#   conservative - tests, docs, boilerplate and read-only searches only
+#   balanced     - any step with a short spec and an automatic check
+#   aggressive   - every such step by default, in parallel
+policy = "balanced"
+
+# Checks the wrapper runs after every write task. A failing check is sent back
+# to Mistral for a fix. Keep them fast; they run once per attempt.
+# Set up here for Node/TypeScript. For other stacks, replace with e.g.:
+#   Python: ["pytest -q", "ruff check ."]
+#   Go:     ["go test ./...", "go vet ./..."]
+#   Rust:   ["cargo test", "cargo clippy -- -D warnings"]
+verify = ["npm test", "npx tsc --noEmit"]
+
+# Commands Mistral may run itself while it works, so it can fix its own
+# mistakes before handing back. These are prefixes: "npm test" also allows
+# "npm test -- src/foo.test.ts". Anything not listed is refused.
+allow_commands = ["npm test", "npx tsc --noEmit"]
+
+# How many times a failing check goes back to Mistral (0 turns this off).
+fix_attempts = 1
+
+# Maximum number of Mistral tasks running at the same time.
+max_parallel = 3
+
+# Mistral model alias from your Vibe config. Leave unset for Vibe's default.
+# model = "mistral-medium-3.5"
+
+# Spending caps per Vibe call. Leave these out to use the policy's defaults
+# (balanced: write 30 turns / $1.00, read 15 turns / $0.25).
+# Each fix round may spend up to half the write cap again.
+[write]
+max_turns = 30
+max_price = 1.00
+
+[read]
+max_turns = 15
+max_price = 0.25
