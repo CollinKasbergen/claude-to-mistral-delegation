@@ -329,9 +329,11 @@ def _effect_tool(entry: dict) -> str:
             # A title such as "Denied tool 'bash'" names the tool inside it.
             named = NAMED_TITLE.search(value)
             return named.group(1) if named else value
-    # No name at all: a call with a command is a shell call.
-    data = detail.get("input") if isinstance(detail.get("input"), dict) else {}
-    return "bash" if isinstance(data.get("command") or data.get("cmd"), str) else "tool"
+    # No name in the usual places: look deeper, then treat a call with a command as a shell call.
+    named = _find_string({k: v for k, v in entry.items() if k != "state"}, ("toolName", "tool_name", "tool"))
+    if named:
+        return named
+    return "bash" if _find_string(detail, ("command", "cmd")) else "tool"
 
 
 def _label(entry: dict) -> str:

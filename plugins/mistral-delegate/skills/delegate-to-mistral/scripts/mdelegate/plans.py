@@ -30,6 +30,7 @@ POLL = max(0.05, min(1.0, float(os.environ.get("MISTRAL_DELEGATE_WATCH_INTERVAL"
 # Report lines from a step worth repeating in the plan's report.
 STEP_NOTE_PREFIXES = ("out_of_scope_changes", "test_strength_warning", "final_message_warning", "missing_files",
                       "baseline_warning", "budget_warning", "note:", "denied_commands", "refused_tool_calls",
+                      "assertion_hint", "test_strength:",
                       "checks_skipped")
 SUCCESS_VERIFICATIONS = ("passed", "passed_except_preexisting", "not_run")
 
@@ -172,7 +173,8 @@ class PlanRun:
             k: r.get("run_id") for k, r in self.results.items() if r.get("run_id")}})
 
     def run_steps(self) -> None:
-        pending = list(self.steps)
+        """Run every step that has no result yet (all of them, or what an earlier run left undone)."""
+        pending = [s for s in self.steps if s.id not in self.results]
         retry_at: dict[str, float] = {}
         limit = max(1, self.settings["max_parallel"])
         while pending or self.children:
@@ -406,13 +408,19 @@ class PlanRun:
             line += " -> not merged"
         return line
 
-    def usage_lines(self, runs: list[dict]) -> list[str]:
+    def every_run(self) -> list[dict]:
+        """Every finished Mistral run of this plan, earlier attempts and follow-ups included."""
+        record = ledger.load_runs().get(self.plan_id) or {"id": self.plan_id}
+        return [r for r in _plan_runs(record) if r["id"] != self.plan_id and r.get("status")]
+
+    def usage_lines(self, _runs: list[dict]) -> list[str]:
         prices = vibe.model_prices()
-        costs = [ledger.run_cost(r.get("record") or {}, prices) for r in runs]
-        effective = sum((r.get("record") or {}).get("effective") or 0 for r in runs)
+        runs = self.every_run()
+        costs = [ledger.run_cost(r, prices) for r in runs]
+        effective = sum(r.get("effective") or 0 for r in runs if isinstance(r.get("effective"), (int, float)))
         priced = [c for c in costs if c is not None]
         c = self.settings["currency"]
-        line = f"usage: {effective:,} effective tokens across {len(runs)} Mistral run(s)"
+        line = f"usage: {effective:,} effective tokens across {len(runs)} Mistral run(s) of this plan"
         if priced:
             line += f"; ~{c}{sum(priced):.4f} at list prices"
         if len(priced) < len(costs):
@@ -454,7 +462,7 @@ class PlanRun:
 
     def record_end(self, report: str, end: dict, plan_text: str) -> None:
         runs = self.all_runs  # the steps and an integration fix
-        record_runs = [r.get("record") or {} for r in runs]
+        record_runs = self.every_run()  # what the plan cost, earlier attempts and follow-ups included
         prices = vibe.model_prices()
         costs = [ledger.run_cost(r, prices) for r in record_runs]
         # Claude wrote the plan once and reads this one report: that is the overhead, shared by the steps.
@@ -462,7 +470,8 @@ class PlanRun:
         ledger.save_report(self.plan_id, report)
         ledger.append({"event": "end", "id": self.plan_id, **end, "claude_overhead": overhead,
                        "cost": sum(c for c in costs if c is not None) if any(c is not None for c in costs) else None,
-                       "effective": sum(r.get("effective") or 0 for r in record_runs)})
+                       "effective": sum(r.get("effective") or 0 for r in record_runs
+                                        if isinstance(r.get("effective"), (int, float)))})
         if runs:
             share = overhead // len(runs)
             for r in runs:
@@ -584,7 +593,8 @@ def _latest_on(path: str) -> dict | None:
 
 
 def integrate_again(args, script: Path, script_cmd) -> int:
-    """Merge a plan's steps again from their worktrees (after a step was resumed) and check the result."""
+    """Finish a plan: run the steps that never ran or whose worktree is gone (once what they need succeeded),
+    then merge every step again from its worktree (after a step was resumed) and check the result."""
     record = ledger.load_runs().get(args.integrate)
     if not record or record.get("mode") != "plan":
         raise DelegateError(f"No plan with id {args.integrate!r}. See --status.")
@@ -611,8 +621,7 @@ def integrate_again(args, script: Path, script_cmd) -> int:
             wt = (record.get("step_worktrees") or {}).get(step.id)
             latest = _latest_on(wt["path"]) if wt and os.path.isdir(wt["path"]) else None
             if not latest:
-                run.results[step.id] = {"ok": False, "status": "missing", "note": "its worktree is gone"}
-                continue
+                continue  # never ran (skipped, blocked) or its worktree is gone: run_steps runs it now
             wt = dict(wt, base=gitops.load_state(wt["path"]).get("base") or wt["base"])
             run.step_wts[step.id] = wt
             result = {"ok": step_succeeded(latest), "status": latest.get("status"), "run_id": latest["id"],
@@ -621,11 +630,13 @@ def integrate_again(args, script: Path, script_cmd) -> int:
             if result["ok"]:
                 gitops.commit_all(wt, f"mistral-delegate: {record['id']} step {step.id}")
             run.results[step.id] = result
+        run.run_steps()
         run.use_worktree_code()
         integration = run.integrate()
         report, end = run.report(integration)
         run.record_end(report, end, _plan_text(record["id"]))
     except BaseException as e:
+        run.stop_children()
         ledger.append({"event": "end", "id": record["id"], "verification": "not_run",
                        "status": "interrupted" if isinstance(e, (SystemExit, KeyboardInterrupt)) else "error",
                        "error": f"{e.__class__.__name__}: {e}"[:300]})

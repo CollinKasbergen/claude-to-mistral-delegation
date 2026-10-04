@@ -880,6 +880,36 @@ class WriteModeTest(DelegateTestBase):
                       prompt)
         self.assertIn("check your code and tests against the project rules", prompt)
 
+    def test_autofix_formats_only_the_changed_files(self):
+        (self.repo / ".mistral-delegate.toml").write_text(
+            'autofix = ["echo {files:*.py} > formatted.txt; touch fixed.txt", "echo {files:*.ts} > ts.txt"]\n')
+        out = self.run_delegate("--mode", "write", "--fix-attempts", "0", "--verify",
+                                "test ! -f test_app.py || test -f fixed.txt", "Task")
+        wt = Path(self.value(out, "worktree_path"))
+        self.assertEqual((wt / "formatted.txt").read_text().strip(), "test_app.py")
+        self.assertFalse((wt / "ts.txt").exists())  # no TypeScript file changed: that autofix didn't run
+        self.assertIn("autofix: ran echo test_app.py > formatted.txt; touch fixed.txt", out.stdout)
+
+    def test_verify_adds_to_the_configured_checks(self):
+        (self.repo / ".mistral-delegate.toml").write_text('verify = ["test -f app.py"]\n')
+        out = self.run_delegate("--mode", "write", "--verify", "true", "Task")
+        self.assertIn("pass: test -f app.py", out.stdout)
+        self.assertIn("pass: true", out.stdout)
+        out = self.run_delegate("--mode", "write", "--no-verify", "--verify", "true", "Task")
+        self.assertNotIn("test -f app.py", out.stdout.split("verification:")[1].split("\n\n")[0])
+
+    def test_tests_that_only_fail_to_load_are_not_conclusive(self):
+        (self.repo / ".mistral-delegate.toml").write_text('test_commands = ["test ! -f"]\n')
+        out = self.run_delegate("--mode", "write", "--verify", 'test ! -f test_app.py || python3 -c "import newmod"',
+                                "Task\nFAKE_FILE newmod.py X = 1", FAKE_VIBE_TOUCH_APP="1")
+        self.assertIn("test_strength: not conclusive", out.stdout)
+
+    def test_loose_assertions_are_flagged(self):
+        out = self.run_delegate("--mode", "write", "Task\nFAKE_FILE tests/test_loose.py assert 1 in [1, 2]")
+        self.assertIn("assertion_hint: 1 assertion(s) in the new tests check presence", out.stdout)
+        self.assertIn("tests/test_loose.py: assert 1 in [1, 2]", out.stdout)
+        self.assertIn("worktree_base: your HEAD when the worktree was made", out.stdout)
+
     def test_no_changes_is_its_own_status(self):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_NO_WRITE="1")
         self.assertEqual(out.returncode, 1)
@@ -1470,6 +1500,34 @@ class PlanRunTest(DelegateTestBase):
         self.assertIn("status: checks_failed", out.stdout)  # every step merged, but together they fail
         self.assertIn("verification: failed", out.stdout)
 
+    def test_integrate_runs_the_steps_a_failed_step_held_back(self):
+        plan = self.plan("""\
+            # Finish
+            ## step: a
+            scope: a.txt, test_app.py, fixed.txt
+            verify: test -f fixed.txt
+            FAKE_FILE a.txt A
+
+            ## step: b
+            depends: a
+            FAKE_FILE b.txt B
+            """)
+        out = self.run_delegate("--plan", str(plan), "--fix-attempts", "0")
+        self.assertIn("b: skipped", out.stdout)
+        plan_id = self.value(out, "plan_id")
+        resume = re.search(r"--resume (\S+) --worktree-name (\S+)", out.stdout)
+        follow = self.run_delegate("--mode", "write", "--resume", resume.group(1), "--worktree-name",
+                                   resume.group(2), "The check `test -f fixed.txt` failed (exit code 1). Fix it.")
+        self.assertIn("caps this follow-up's first call at 500,000 effective tokens", follow.stdout)
+        again = self.run_delegate("--integrate", plan_id)
+        self.assertIn("(2 of 2 steps merged)", again.stdout)
+        b_call = next(c for c in self.calls() if Path(c["cwd"]).name.endswith("-b"))
+        self.assertIn("a.txt", b_call["files"])  # b started from a's finished result
+        self.assertIn("across 3 Mistral run(s) of this plan", again.stdout)  # a, its follow-up, and b
+        b_report = (self.home / "runs" / next(r["id"] for r in self.runs().values() if r.get("step") == "b")
+                    / "report.md").read_text()
+        self.assertIn("worktree_base: the plan's starting code with the steps it depends on", b_report)
+
     def test_steps_wait_for_free_slots(self):
         (self.home).mkdir(parents=True, exist_ok=True)
         (self.home / "config.toml").write_text("max_parallel = 2\n")
@@ -1637,6 +1695,11 @@ class GuardPolicyTest(unittest.TestCase):
                 self.assertIsNone(guard.check_shell(command, policy, self.root))
         self.assertIn("isn't allowed", guard.check_shell("uv run --no-sync python -c 1", policy, self.root))
         self.assertIn("outside the project", guard.check_shell("uv run --directory /etc pytest", policy, self.root))
+
+    def test_escaped_parentheses_are_arguments(self):
+        self.assertIsNone(self.shell(r"find frontend \( -name '*.ts' -o -name '*.vue' \) -print"))
+        self.assertIsNone(self.shell("find frontend '(' -name x ')'"))
+        self.assertIn("Subshells", self.shell("(cd frontend && ls)"))
 
     def test_options_that_run_code_or_write_are_refused(self):
         policy = dict(self.policy, allow_commands=self.policy["allow_commands"]
@@ -1873,6 +1936,10 @@ class UnfinishedRunTest(unittest.TestCase):
         self.assertEqual(f([msg(answer), refused], answer), "")  # refused calls after the answer
         from mdelegate import vibe
         self.assertEqual(vibe._label(refused), "bash: ls")
+        sys.path.insert(0, str(SCRIPT.parent))
+        import delegate
+        self.assertTrue(delegate.is_shell_label("tool: Denied tool 'bash'"))
+        self.assertFalse(delegate.is_shell_label("search_replace: app.py"))
         self.assertEqual(vibe._label({"detail": {"kind": "tool", "input": {"command": "find ."}}}), "bash: find .")
         summary = "Added tests for the shop list: paused shops, renamed shops, and the empty state. Files: a.test.ts."
         self.assertEqual(f([msg(summary), tool], summary), "")  # a trailing read after a real summary is fine

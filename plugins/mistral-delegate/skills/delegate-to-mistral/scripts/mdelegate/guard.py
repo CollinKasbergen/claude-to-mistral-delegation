@@ -357,10 +357,22 @@ def _sed_files(words: list[str]) -> list[str] | None:
     return _sed_check(words)[0]
 
 
+# Escaped or quoted parentheses (find's `\(` ... `\)` grouping) are arguments, not a subshell: they are
+# swapped for placeholders before tokenizing and restored in the words afterwards.
+LITERAL_PARENS = {"\\(": "\x00LP\x00", "\\)": "\x00RP\x00", "'('": "\x00LP\x00", "')'": "\x00RP\x00",
+                  '"("': "\x00LP\x00", '")"': "\x00RP\x00"}
+
+
 def _shell_tokens(command: str) -> list[str]:
+    for literal, placeholder in LITERAL_PARENS.items():
+        command = command.replace(literal, f" {placeholder} ")
     lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     return list(lexer)
+
+
+def _restore_parens(word: str) -> str:
+    return word.replace("\x00LP\x00", "(").replace("\x00RP\x00", ")")
 
 
 # Runners whose own options may sit between them and the command they run:
@@ -530,6 +542,7 @@ def analyze_shell(command: str, policy: dict, cwd: str) -> tuple[str | None, dic
             segments[-1].append(tok)
         i += 1
 
+    segments = [[_restore_parens(w) for w in words] for words in segments]
     for words in segments:
         while words and (assignment := re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=", words[0])):
             if assignment.group(1) not in SAFE_ENV_VARS:

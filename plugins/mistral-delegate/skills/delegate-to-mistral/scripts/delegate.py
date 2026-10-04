@@ -83,10 +83,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--context", action="append", default=[], metavar="PATH",
                      help="A file Vibe should read before starting. Repeatable.")
     run.add_argument("--verify", action="append", default=[], metavar="CMD",
-                     help="Write mode: a check to run after Vibe finishes (e.g. 'npm test'). Repeatable. "
-                          "Replaces the configured checks.")
-    run.add_argument("--add-verify", action="append", default=[], metavar="CMD",
-                     help="Write mode: a check to run in addition to the configured ones. Repeatable.")
+                     help="Write mode: a check to run after Vibe finishes (e.g. 'npm test'), on top of the "
+                          "configured ones. Repeatable. With --no-verify, only these run.")
+    run.add_argument("--add-verify", action="append", default=[], metavar="CMD", help=argparse.SUPPRESS)  # = --verify
     run.add_argument("--no-verify", action="store_true", help="Skip the configured checks.")
     run.add_argument("--fix-attempts", type=int, help="Times to send a failing check back to Vibe (default 1).")
     run.add_argument("--verify-timeout", type=int, default=600, help="Seconds per check (default 600).")
@@ -449,6 +448,33 @@ READ_ONLY_TOOL = re.compile(r"read|grep|glob|search|todo|list|view", re.I)
 
 SHELL_TOOLS = {"bash", "shell", "sh", "run command", "run_command", "terminal", "exec"}
 
+def is_shell_label(label: str) -> bool:
+    """A refused call's label names a shell command: "bash: ls", or Vibe's "Denied tool 'bash'"."""
+    named = vibe.NAMED_TITLE.search(label)
+    return (label.split(":", 1)[0].strip().lower() in SHELL_TOOLS
+            or bool(named and named.group(1).lower() in SHELL_TOOLS))
+
+
+# Assertions that check presence, size or truthiness rather than an exact value.
+LOOSE_ASSERTION = re.compile(r"^\+\s*(assert\s+(?!.*==).*\s(not\s+)?in\s|assert\s+len\(|self\.assert(In|NotIn|True)\(|"
+                             r".*\.(toContain|toBeTruthy|toBeDefined|toBeGreaterThan)\()")
+
+
+def assertion_hint(wt: dict) -> str:
+    """New test lines that assert loosely (membership, length, truthiness), a pattern Mistral falls back to."""
+    found, current = [], ""
+    for line in gitops.changes_diff(wt).splitlines():
+        if line.startswith("+++ b/"):
+            current = line[6:]
+        elif current and TEST_FILE.search(current) and LOOSE_ASSERTION.search(line):
+            found.append(f"{current}: {line[1:].strip()[:100]}")
+    if not found:
+        return ""
+    return (f"assertion_hint: {len(found)} assertion(s) in the new tests check presence, size or truthiness "
+            "rather than exact values, e.g. " + "; ".join(found[:3])
+            + ". Check them against the project's rules before adopting.")
+
+
 CANCELLED = re.compile(r"<user_cancellation>|User cancelled the operation")
 
 
@@ -503,6 +529,9 @@ NOT_CODE = re.compile(r"(^|/)(testdata|fixtures?|__snapshots__|__mocks__|migrati
 TEST_RUNNERS = {"pytest", "vitest", "jest", "mocha", "ava", "rspec", "phpunit", "tox", "nox", "karma", "jasmine",
                 "playwright", "cypress"}
 # Runners that accept test files as arguments, so only Mistral's changed tests need to run.
+LOAD_ERROR = re.compile(r"ImportError|ModuleNotFoundError|cannot import name|SyntaxError|NameError|"
+                        r"Cannot find module|Failed to (?:load|resolve) (?:url|import)|error collecting|"
+                        r"has no attribute|is not exported|does not provide an export")
 FILE_ARG_RUNNERS = {"pytest", "vitest", "jest"}
 
 
@@ -588,8 +617,12 @@ def test_strength(wt: dict, run_dir: str, checks: list[dict], baseline: dict, se
     for run, out in failing[:2]:
         last = [ln.strip() for ln in out.splitlines() if ln.strip()][-1:] or ["no output"]
         shown.append(f"{run}: {last[0][:160]}")
-    return ("test_strength: Mistral's tests fail on the original code, as they should (" + "; ".join(shown)
-            + "). If that's an import or setup error rather than an assertion, it proves less.")
+    if all(LOAD_ERROR.search(out) for _run, out in failing):
+        # The tests can't even load without the new code: that says nothing about their assertions.
+        return ("test_strength: not conclusive: Mistral's tests fail on the original code only because they can't "
+                "load there (" + "; ".join(shown) + "), so this doesn't show they would catch a broken change. "
+                "Read the assertions.")
+    return ("test_strength: Mistral's tests fail on the original code, as they should (" + "; ".join(shown) + ").")
 
 
 def run_task(args: argparse.Namespace) -> int:
@@ -627,10 +660,13 @@ def run_task(args: argparse.Namespace) -> int:
             caps[key] = getattr(args, key)
     model = args.model or settings["model"]
     write = args.mode == "write"
-    verify = [] if (args.no_verify or not write) else (
-        [{"cmd": c, "paths": []} for c in args.verify] if args.verify else settings["verify"])
+    # Checks given for this run come on top of the configured ones (lint, type check): replacing them
+    # silently let lint errors through. --no-verify drops the configured ones.
+    verify = [] if (args.no_verify or not write) else list(settings["verify"])
     if write:
-        verify += [{"cmd": c, "paths": []} for c in args.add_verify if c not in {v["cmd"] for v in verify}]
+        for command in args.verify + args.add_verify:
+            if command not in {v["cmd"] for v in verify}:
+                verify.append({"cmd": command, "paths": []})
     allow_commands = list(dict.fromkeys(settings["allow_commands"] + args.allow_command)) if write else []
     # `npm test` also covers `npm run test`, `npx vitest` (when that's the test script), etc.
     settings["allow_commands_as_given"] = allow_commands
@@ -850,7 +886,9 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     def inplace_changes() -> list[str]:
         return gitops.changed_since(inplace_root, inplace_before) if inplace_root else []
 
-    vibe_call(prompt if args.resume else prompt + "\n\n" + vibe.run_marker(run_id), 1.0)
+    # A follow-up (--resume) fixes or extends earlier work: it gets half the caps, like a fix round.
+    first_share = 0.5 if args.resume else 1.0
+    vibe_call(prompt if args.resume else prompt + "\n\n" + vibe.run_marker(run_id), first_share)
     continued, summary_note = 0, ""
 
     verification, results, failures, attempts = "not_run", {}, [], 0
@@ -867,7 +905,12 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         failures = new_failures(results, baseline)
         if failures and autofixes:
             # Formatting-type failures are fixed by a command, not by another Mistral round.
-            for command in autofixes:
+            changed = gitops.changed_files(wt) if wt else inplace_changes()
+            for template in autofixes:
+                command = cmdforms.with_files(template, changed, os.path.relpath(run_dir, wt["path"] if wt else
+                                                                                   (top or workdir)))
+                if command is None:
+                    continue  # it formats changed files of a kind this run didn't change
                 code, out = run_checks([command], run_dir, args.verify_timeout)[command]
                 tail_lines = [ln.strip() for ln in out.splitlines() if ln.strip()][-2:]
                 autofixed.append(command + ("" if code == 0 else
@@ -984,6 +1027,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append("flaky_checks (failed, then passed on a rerun before Mistral started): " + ", ".join(flaky))
     if strength_line:
         lines.append(strength_line)
+    if wt and files_now and (hint := assertion_hint(wt)):
+        lines.append(hint)
     if summary_note:
         lines.append("note: " + summary_note)
     elif run.unfinished:
@@ -1004,10 +1049,13 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append(f"model_note: Vibe's server-side default routed this run to {ran_model!r}, not a Mistral model. "
                      "To use Mistral, set model = \"mistral-medium-3.5\" in .mistral-delegate.toml.")
     lines.append(usage_line(use, settings["currency"]))
-    lines.append(f"budget: {run.effective:,} effective tokens used across this run's Vibe calls; the wrapper caps the "
-                 f"first pass at {caps['token_budget']:,} effective tokens and {caps['max_tool_calls']} tool calls"
-                 + (f" and {settings['currency']}{caps['max_price']:.2f}" if caps.get("max_price") else "")
-                 + ", and a continuation or fix round at half of that")
+    first = 0.5 if args.resume else 1.0
+    lines.append(f"budget: {run.effective:,} effective tokens used across this run's Vibe calls; the wrapper caps "
+                 + ("this follow-up's first call" if args.resume else "the first pass")
+                 + f" at {int(caps['token_budget'] * first):,} effective tokens and "
+                 f"{max(1, int(caps['max_tool_calls'] * first))} tool calls"
+                 + (f" and {settings['currency']}{caps['max_price'] * first:.2f}" if caps.get("max_price") else "")
+                 + ", and a continuation or fix round at half of the full caps")
     month_line = credit_line(settings, use)
     if month_line:
         lines.append(month_line)
@@ -1068,7 +1116,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     guard_targets = {str(e.get("target")) for e in guard_events if e.get("action") == "deny"}
     vibe_denied = [d for d in run.denied if d.split(": ", 1)[-1] not in guard_targets]
     # Shell commands are refused for not being allowed; other tools (an edit, a write) for other reasons.
-    denied_shell = [d for d in vibe_denied if d.split(":", 1)[0].strip().lower() in SHELL_TOOLS]
+    vibe_denied = [d if d != "tool" else "a tool call Vibe didn't name" for d in vibe_denied]
+    denied_shell = [d for d in vibe_denied if is_shell_label(d)]
     denied_other = [d for d in vibe_denied if d not in denied_shell]
     if denied_shell:
         counts = Counter(denied_shell)
@@ -1172,7 +1221,15 @@ def worktree_section(wt: dict, run_id: str, files: list[str], out_of_scope: list
         lines.append(f"worktree_base: snapshot of your uncommitted work ({snap['modified']} modified, "
                      f"{snap['untracked']} untracked files) at {wt['base'][:12]}")
     else:
-        lines.append(f"worktree_base: your HEAD at {wt['base'][:12]}")
+        start = wt.get("start") or gitops.load_state(wt["path"]).get("start")
+        merged = wt.get("merged") or gitops.load_state(wt["path"]).get("merged") or []
+        if start:
+            # A dependent step starts from a step's branch (and merges the others); a first step from a commit.
+            after_steps = bool(merged) or not re.fullmatch(r"[0-9a-f]{40}", start)
+            lines.append("worktree_base: the plan's starting code" + (" with the steps it depends on" if after_steps
+                                                                      else "") + f", commit {wt['base'][:12]}")
+        else:
+            lines.append(f"worktree_base: your HEAD when the worktree was made, commit {wt['base'][:12]}")
     if wt.get("links"):
         labels = {"clone": "copy-on-write clones", "hardlink": "hard-linked copies", "copy": "copies",
                   "symlink": "symlinks"}
