@@ -309,7 +309,9 @@ def top_denied(runs: dict[str, dict], days: int = 90, limit: int = 5) -> list[tu
     counts: Counter = Counter()
     for r in runs.values():
         if (r.get("started") or 0) >= cutoff:
-            counts.update(d for d in (r.get("denied") or []) if isinstance(d, str))
+            # Unnamed entries ("tool") were guard refusals recorded twice by earlier versions: they say nothing.
+            counts.update(d for d in (r.get("denied") or []) if isinstance(d, str)
+                          and d not in ("tool", "a tool call Vibe didn't name"))
     return counts.most_common(limit)
 
 
@@ -326,7 +328,7 @@ def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = No
         ratio = savings(s)
         flag = "  (below min_savings)" if min_savings and ratio is not None and ratio < min_savings else ""
         avg_cost = f"{currency}{s['cost'] / s['costed']:.3f}" if s["costed"] else "?"
-        avg_effective = f"{s['effective'] // s['measured']:,}" if s["measured"] else "?"
+        avg_effective = f"{s['effective'] // s['measured']:,}" if s["measured"] else "n/a"
         lines.append(f"{kind:<13} {s['runs']:<5} {s['ok']:<4} {verify:<12} {_adopted(s):<21} "
                      f"{avg_effective:<15} {avg_cost:<10} "
                      + (f"x{ratio:.1f}" if ratio is not None else "-") + flag)
@@ -337,6 +339,8 @@ def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = No
                  + (f" ({uncosted} run(s) without a price are left out of costs)" if uncosted else ""))
     lines.append("savings: Claude-equivalent work of adopted runs per token Claude spent delegating "
                  "(writing specs, reading reports); x1 means delegating saved nothing.")
+    if any(not s["measured"] for s in stats.values()):
+        lines.append("avg-eff-tokens n/a: those runs come from plugin versions that didn't record effective tokens.")
     overhead = claude_overhead_per_step(runs, days)
     if overhead:
         lines.append(overhead)

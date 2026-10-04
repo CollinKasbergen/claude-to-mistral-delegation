@@ -97,14 +97,28 @@ def stop_process_group(proc: subprocess.Popen, grace: float = 10) -> None:
             continue
 
 
-def measure_baseline(commands: list[str], cwd: str, timeout: int, flaky: list[str]) -> dict:
-    """Run checks before Mistral changes anything; a failing check is rerun once (flaky ones pass then)."""
+# A check that names test files the run is still to create can't run beforehand: that isn't a failure.
+NOT_RUNNABLE = re.compile(r"file or directory not found|no tests ran|No test files found|no test files|"
+                          r"Cannot find module|does not exist|No such file or directory|not found: ", re.I)
+
+
+def measure_baseline(commands: list[str], cwd: str, timeout: int, flaky: list[str],
+                     not_runnable: list[str] | None = None) -> dict:
+    """Run checks before Mistral changes anything; a failing check is rerun once (flaky ones pass then).
+
+    A check that can't run yet (its test files don't exist) is left out of the baseline, and listed in
+    not_runnable: if it fails afterwards, that counts as Mistral's failure, not an old one."""
     baseline = run_checks(commands, cwd, timeout)
     failing = [cmd for cmd, (code, _out) in baseline.items() if code != 0]
     if failing:
         rerun = run_checks(failing, cwd, timeout)
         flaky += [cmd for cmd, (code, _out) in rerun.items() if code == 0]
         baseline.update(rerun)
+    for cmd, (code, out) in list(baseline.items()):
+        if code != 0 and NOT_RUNNABLE.search(out):
+            del baseline[cmd]
+            if not_runnable is not None:
+                not_runnable.append(cmd)
     return baseline
 
 
