@@ -44,7 +44,9 @@ def build_context(cwd: str) -> str:
         lines.append(f"Configured checks: {'; '.join(config.check_label(c) for c in settings['verify']) or '(none)'}; "
                      f"commands Mistral may run: {', '.join(settings['allow_commands']) or '(none)'}.")
     runs = ledger.load_runs()
-    record = ledger.compact_stats(runs)
+    from mdelegate import vibe
+    vibe.EXTRA_PRICES.update(settings["model_prices"])
+    record = ledger.compact_stats(runs, prices=vibe.model_prices())
     if record:
         lines.append(f"Track record (90 days): {record}.")
     pending = ledger.pending_review(runs)
