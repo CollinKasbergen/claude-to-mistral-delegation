@@ -17,7 +17,7 @@ import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from . import config
+from . import config, guard
 
 
 def ledger_path():
@@ -310,23 +310,26 @@ def in_repo(run: dict, top: str) -> bool:
     return workdir == top or workdir.startswith(top.rstrip("/") + "/")
 
 
-def top_denied(runs: dict[str, dict], days: int = 90, limit: int = 5) -> list[tuple[str, int, float]]:
-    """The most denied commands: (command, times, when it was last denied)."""
+def top_denied(runs: dict[str, dict], days: int = 90, limit: int = 5) -> list[tuple[str, int, float, str]]:
+    """The most denied commands: (command, times, when it was last denied, the run that was)."""
     cutoff = time.time() - days * 86400
     counts: Counter = Counter()
-    last: dict[str, float] = {}
-    for r in runs.values():
+    last: dict[str, tuple[float, str]] = {}
+    for run_id, r in runs.items():
         if (r.get("started") or 0) >= cutoff:
             # Unnamed entries ("tool") were guard refusals recorded twice by earlier versions: they say nothing.
             for d in r.get("denied") or []:
                 if isinstance(d, str) and d not in ("tool", "a tool call Vibe didn't name"):
                     counts[d] += 1
-                    last[d] = max(last.get(d, 0), r.get("started") or 0)
-    return [(cmd, n, last[cmd]) for cmd, n in counts.most_common(limit)]
+                    if (r.get("started") or 0) >= last.get(d, (0, ""))[0]:
+                        last[d] = (r.get("started") or 0, run_id)
+    return [(cmd, n, *last[cmd]) for cmd, n in counts.most_common(limit)]
 
 
 def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = None, currency: str = "$",
-                 min_savings: float | None = None) -> str:
+                 min_savings: float | None = None, allowed: list[str] | None = None) -> str:
+    """allowed: the commands Mistral may run now (allow_commands and the configured checks); denials of
+    those come from before they were allowed and are listed apart."""
     stats = compute_stats(runs, days, prices)
     if not stats:
         return f"No finished delegations in the last {days} days."
@@ -354,10 +357,19 @@ def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = No
     overhead = claude_overhead_per_step(runs, days)
     if overhead:
         lines.append(overhead)
-    denied = top_denied(runs, days)
-    if denied:
+    denied = top_denied(runs, days, limit=20)
+    allowed_now = [d for d in denied if allowed and guard.command_allowed(d[0].split(), allowed)]
+    still = [d for d in denied if d not in allowed_now][:5]
+
+    def entry(cmd: str, n: int, when: float, run_id: str) -> str:
+        return f"  {n}x  {cmd}  (last {time.strftime('%b %d', time.localtime(when))}, run {run_id})"
+
+    if still:
         lines.append("most denied commands (add to allow_commands if Mistral needs them):")
-        lines += [f"  {n}x  {cmd}  (last {time.strftime('%b %d', time.localtime(when))})" for cmd, n, when in denied]
+        lines += [entry(*d) for d in still]
+    if allowed_now:
+        lines.append("denied before, allowed now (allow_commands or a configured check, which Mistral may run): "
+                     + ", ".join(f"{cmd} ({n}x)" for cmd, n, _w, _r in allowed_now[:5]))
     return "\n".join(lines)
 
 
