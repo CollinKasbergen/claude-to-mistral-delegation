@@ -145,6 +145,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     manage = p.add_argument_group("managing runs")
     manage.add_argument("--status", action="store_true", help="List running and recent delegations.")
     manage.add_argument("--stats", action="store_true", help="Show the track record per kind of task.")
+    manage.add_argument("--all-repos", action="store_true", help="With --status: include runs in other projects.")
     manage.add_argument("--result", metavar="ID", help="Print the full report of a run.")
     manage.add_argument("--adopt", metavar="ID", help="Apply a write run's changes to your checkout.")
     manage.add_argument("--discard", metavar="ID", help="Discard a write run and remove its worktree.")
@@ -626,6 +627,9 @@ def test_strength(wt: dict, run_dir: str, checks: list[dict], baseline: dict, se
             results = run_checks([run for _orig, run in commands], str(cwd), timeout)
     except (DelegateError, OSError) as e:
         return f"test_strength: not checked ({e})"
+    # Reports name each check as configured, not with the test files the wrapper added to it.
+    orig_of = {run: orig for orig, run in commands}
+    results = {orig_of.get(run, run): value for run, value in results.items()}
     timed_out = [run for run, (code_, _o) in results.items() if code_ == 124]
     if timed_out:
         return f"test_strength: not checked ({', '.join(timed_out)} timed out on the original code)"
@@ -1212,6 +1216,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     ledger.save_report(run_id, report)
     ledger.append({"event": "end", "id": run_id, "status": run.status, "verification": verification,
                    "fix_attempts_used": attempts, "cost": use["cost"] if use else None,
+                   "unfinished": bool(run.unfinished),
                    "model": ran_model, "tokens_in": use["tokens_in"] if use else None,
                    "tokens_out": use["tokens_out"] if use else None, "cached": use["cached"] if use else None,
                    "effective": use["effective"] if use else run.effective,
@@ -1344,7 +1349,13 @@ def main(argv: list[str]) -> int:
         if args.status:
             top = gitops.toplevel(str(Path(args.workdir).resolve()))
             currency = config.load(top or args.workdir)["currency"]
-            print(ledger.format_status(ledger.load_runs(), currency=currency))
+            runs = ledger.load_runs()
+            # This project's runs; other projects (another session, another repo) only with --all-repos.
+            here = {k: r for k, r in runs.items()
+                    if args.all_repos or not top or ledger.in_repo(r, top)}
+            print(ledger.format_status(here, currency=currency))
+            if len(here) < len(runs):
+                print(f"{len(runs) - len(here)} run(s) in other projects not shown (--all-repos shows them).")
             return 0
         if args.stats:
             settings = config.load(gitops.toplevel(str(Path(args.workdir).resolve())) or args.workdir)

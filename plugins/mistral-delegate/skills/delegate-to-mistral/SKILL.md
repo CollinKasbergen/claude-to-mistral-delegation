@@ -108,7 +108,7 @@ What to build in this step.
 
 ### Single steps and subagents
 
-A single step is a plain run, in the background or through the `mistral-worker` subagent when you want its review done outside your context. Several plain runs can run at once (`max_parallel`, default 3); `--status` lists them and `--result <id>` prints a finished report. Adopt them one at a time.
+A single step is a plain run, in the background or through the `mistral-worker` subagent when you want its review done outside your context. Several plain runs can run at once (`max_parallel`, default 3); `--status` lists this project's runs (`--all-repos` for every project) and `--result <id>` prints a finished report. Adopt them one at a time.
 
 ### Project settings
 
