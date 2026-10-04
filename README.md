@@ -36,13 +36,22 @@ Two modes:
 - **read** (default): Vibe's `plan` agent with only `read_file`, `grep` and `todo` enabled. Nothing changes on disk. Default cap 15 turns, $0.25.
 - **write**: Vibe's `accept-edits` agent in a new git worktree on branch `mistral-<id>`, so your checkout is untouched until Claude reviews and adopts the changes. Default cap 30 turns, $1.00. `--in-place` edits the current checkout instead.
 
+How write mode prepares the worktree:
+
+- **Your uncommitted work comes along.** Modified and untracked files are copied into the worktree and committed there as a snapshot, so you don't have to commit before delegating (`--no-snapshot` to turn off).
+- **Dependencies are linked, not reinstalled.** Ignored `node_modules`, `.venv`, `venv`, `vendor` and `bower_components` folders, nested ones included, are symlinked from your checkout. Add more with `--link PATH`, e.g. `--link .env`, or turn this off with `--no-link-deps`.
+- **The report shows only Vibe's changes** and gives ready-made commands to review them, apply them to your checkout (leaving your own uncommitted work alone) and remove the worktree. An untouched worktree is removed automatically if Vibe fails.
+- **Follow-ups reuse the worktree** with `--resume <session_id> --worktree-name <name>`.
+
+Every report includes what the run cost, read from Vibe's session log (`~/.vibe/logs/session/*/meta.json`), along with the number of steps and tokens.
+
 Safety defaults:
 
 - Shell commands are denied. In programmatic mode, Vibe refuses any tool call that needs approval, and `--auto-approve` is passed only with `--allow-shell`.
 - Every run has a turn and price cap and a 15-minute timeout.
-- Project `.vibe/` config and `AGENTS.md` are ignored in folders Vibe doesn't already trust, unless you pass `--trust`.
+- In read mode, project `.vibe/` config and `AGENTS.md` are ignored in folders Vibe doesn't already trust, unless you pass `--trust`. Write-mode worktrees are always trusted.
 
-Defaults can be changed with the environment variables `MISTRAL_DELEGATE_MAX_TURNS`, `MISTRAL_DELEGATE_MAX_PRICE`, `MISTRAL_DELEGATE_MAX_TOKENS`, `MISTRAL_DELEGATE_TIMEOUT` and `VIBE_BIN`.
+Defaults can be changed with the environment variables `MISTRAL_DELEGATE_MAX_TURNS`, `MISTRAL_DELEGATE_MAX_PRICE`, `MISTRAL_DELEGATE_MAX_TOKENS`, `MISTRAL_DELEGATE_TIMEOUT`, `MISTRAL_DELEGATE_WORKTREES` (default `~/.mistral-delegate/worktrees`) and `VIBE_BIN`.
 
 ## Tests
 
