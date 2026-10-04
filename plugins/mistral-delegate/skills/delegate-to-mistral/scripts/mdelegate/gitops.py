@@ -338,9 +338,11 @@ def changes_stat(wt: dict) -> str:
     return git(wt["path"], "diff", *DIFF_OPTS, "--cached", "--stat", wt["base"]).rstrip()
 
 
-def changed_files(wt: dict) -> list[str]:
+def changed_files(wt: dict, paths: list[str] | None = None) -> list[str]:
     stage_changes(wt)
-    return [f for f in git(wt["path"], "diff", *DIFF_OPTS, "--cached", "--name-only", wt["base"]).splitlines() if f]
+    spec = ["--", *paths] if paths else []
+    return [f for f in git(wt["path"], "diff", *DIFF_OPTS, "--cached", "--name-only", wt["base"], *spec).splitlines()
+            if f]
 
 
 def changes_diff(wt: dict) -> str:
@@ -364,6 +366,79 @@ def apply_to_checkout(wt: dict, paths: list[str] | None = None) -> list[str]:
     patch = git_checked(wt["path"], "diff", *DIFF_OPTS, "--cached", "--binary", wt["base"], *spec)
     git_checked(wt["toplevel"], "apply", "--whitespace=nowarn", "-", input=patch)
     return files
+
+
+def editable_sources(top: str, links: list[str]) -> list[str]:
+    """Folders of the checkout that its linked virtualenvs install in editable mode (relative to top).
+
+    A .pth file or setuptools' editable finder holds absolute paths into the user's checkout, so
+    without help, checks in the worktree would import the user's code instead of Mistral's.
+    """
+    found: list[str] = []
+    for link in links:
+        if Path(link).name not in (".venv", "venv"):
+            continue
+        for site in Path(top, link).glob("lib/python*/site-packages"):
+            texts = []
+            for f in [*site.glob("*.pth"), *site.glob("__editable__*finder.py")]:
+                try:
+                    texts.append(f.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    continue
+            for text in texts:
+                for raw in re.findall(r"""['"]?(/[^'"\n:]+)['"]?""", text):
+                    path = Path(raw.strip())
+                    try:
+                        rel = path.relative_to(top)
+                    except ValueError:
+                        continue
+                    if path.is_file() or (path / "__init__.py").exists():
+                        rel = rel.parent  # a package folder: import it from its parent
+                    if str(rel) not in found and not str(rel).startswith(link):
+                        found.append(str(rel))
+    return found
+
+
+def checkout_state(top: str) -> dict[str, str | None]:
+    """Content hashes of the files git reports as changed or untracked in a checkout (None: deleted).
+
+    Taken before and after an in-place run, so the user's own uncommitted work isn't counted as Mistral's.
+    """
+    out = git(top, "status", "--porcelain", "-z", "--untracked-files=all")
+    entries, parts, i = {}, out.split("\0"), 0
+    while i < len(parts):
+        entry = parts[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        status, path = entry[:2], entry[3:]
+        if "R" in status or "C" in status:
+            i += 1  # the original path follows a rename or copy
+        full = Path(top, path)
+        try:
+            data = os.readlink(full).encode() if full.is_symlink() else full.read_bytes()
+            entries[path] = hashlib.sha1(data).hexdigest()
+        except (IsADirectoryError, PermissionError):
+            continue
+        except OSError:
+            entries[path] = None
+    return entries
+
+
+def changed_since(top: str, before: dict[str, str | None]) -> list[str]:
+    after = checkout_state(top)
+    missing = object()
+    return sorted(p for p in set(before) | set(after) if before.get(p, missing) != after.get(p, missing))
+
+
+def commit_applied(wt: dict, files: list[str]) -> None:
+    """Commit the files just applied to the checkout in the worktree and make that commit its base."""
+    try:
+        git_checked(wt["path"], *GIT_IDENTITY, "commit", "-q", "--no-verify", "-m",
+                    "mistral-delegate: adopted into the checkout", "--", *files)
+    except DelegateError:
+        return
+    save_state(wt["path"], {"base": git(wt["path"], "rev-parse", "HEAD").strip()})
 
 
 def save_state(worktree: str | Path, updates: dict) -> None:

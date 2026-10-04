@@ -7,8 +7,11 @@ the events in order. Full reports are kept in ~/.mistral-delegate/runs/<id>.txt.
 
 from __future__ import annotations
 
+import calendar
+import contextlib
 import json
 import os
+import subprocess
 import time
 from collections import Counter, defaultdict
 
@@ -24,11 +27,33 @@ def runs_dir():
 
 
 def append(event: dict) -> None:
+    """Append one event as a single write, so parallel runs never interleave their lines."""
     path = ledger_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    event = {"time": time.time(), **event}
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(event) + "\n")
+    line = json.dumps({"time": time.time(), **event}) + "\n"
+    fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        # A line cut short by a killed writer would swallow this event: start on a fresh line.
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b"\n":
+            line = "\n" + line
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def locked():
+    """Hold the ledger's lock (between checking how many runs are going and recording a new one)."""
+    path = config.home() / "ledger.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        try:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+        yield
 
 
 def load_runs() -> dict[str, dict]:
@@ -42,9 +67,13 @@ def load_runs() -> dict[str, dict]:
             event = json.loads(line)
         except ValueError:
             continue
-        run_id = event.get("id")
-        if not run_id:
+        if not isinstance(event, dict):
             continue
+        run_id = event.get("id")
+        if not run_id or not isinstance(run_id, str):
+            continue
+        if not isinstance(event.get("time"), (int, float)):
+            event["time"] = None
         kind = event.get("event")
         if kind == "start":
             runs[run_id] = {**event, "started": event.get("time")}
@@ -65,10 +94,30 @@ def pid_alive(pid) -> bool:
     return True
 
 
+_START_TIMES: dict = {}
+
+
+def process_started(pid) -> str | None:
+    """When a process started (as ps prints it), to tell a run's process from a later one with the same pid."""
+    if pid not in _START_TIMES:
+        try:
+            out = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True,
+                                 timeout=5)
+            _START_TIMES[pid] = out.stdout.strip() or None
+        except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+            _START_TIMES[pid] = None
+    return _START_TIMES[pid]
+
+
 def state(run: dict) -> str:
     if run.get("status"):
-        return run["status"]
-    return "running" if pid_alive(run.get("pid")) else "died"
+        return str(run["status"])
+    if not pid_alive(run.get("pid")):
+        return "died"
+    recorded = run.get("pid_started")
+    if recorded and process_started(run.get("pid")) not in (None, recorded):
+        return "died"  # the pid now belongs to another process (after a reboot, or in a container)
+    return "running"
 
 
 def running(runs: dict[str, dict]) -> list[dict]:
@@ -120,7 +169,7 @@ def _took(r: dict, now: float) -> str:
     return _age(max(0.0, end - start))
 
 
-def format_status(runs: dict[str, dict], limit: int = 15) -> str:
+def format_status(runs: dict[str, dict], limit: int = 15, currency: str = "$") -> str:
     if not runs:
         return "No delegations recorded yet."
     now = time.time()
@@ -130,13 +179,13 @@ def format_status(runs: dict[str, dict], limit: int = 15) -> str:
     for r in rows:
         st = state(r)
         cost = r.get("cost")
-        cost = f"${cost:.3f}" if isinstance(cost, (int, float)) and (cost > 0 or r.get("tokens")) else "-"
-        task = " ".join((r.get("task") or "").split())[:50]
+        cost = f"{currency}{cost:.3f}" if isinstance(cost, (int, float)) and (cost > 0 or r.get("tokens")) else "-"
+        task = " ".join(str(r.get("task") or "").split())[:50]
         outcome = OUTCOME_LABELS.get(r.get("outcome"), r.get("outcome")) or ("pending" if r["id"] in pending else "-")
         lines.append(
-            f"{r['id']:<18} {st:<18} {(r.get('verification') or '-')[:10]:<10} {cost:<9} {outcome:<10} "
+            f"{r['id']:<18} {st:<18} {str(r.get('verification') or '-')[:10]:<10} {cost:<9} {str(outcome):<10} "
             f"{_when(r.get('started'), now):<13} {_took(r, now):<6} "
-            f"{r.get('kind', '?') + '/' + r.get('mode', '?'):<17} {task}")
+            f"{str(r.get('kind') or '?') + '/' + str(r.get('mode') or '?'):<17} {task}")
     active = running(runs)
     lines.append("\nstarted: local time the run began; took: how long it ran (so far, if running); "
                  "outcome 'pending': finished, waiting for --adopt or --discard.")
@@ -162,11 +211,13 @@ def run_cost(r: dict, prices: dict | None = None) -> float | None:
 
 
 def month_start(reset_day: int, now: float | None = None) -> time.struct_time:
+    """The credit's last reset. A reset day past the end of a month falls on that month's last day."""
     t = time.localtime(now or time.time())
     year, month = t.tm_year, t.tm_mon
-    if t.tm_mday < reset_day:
+    if t.tm_mday < min(reset_day, calendar.monthrange(year, month)[1]):
         year, month = (year - 1, 12) if month == 1 else (year, month - 1)
-    return time.strptime(f"{year}-{month:02d}-{reset_day:02d}", "%Y-%m-%d")
+    day = min(reset_day, calendar.monthrange(year, month)[1])
+    return time.strptime(f"{year}-{month:02d}-{day:02d}", "%Y-%m-%d")
 
 
 def month_spend(runs: dict[str, dict], reset_day: int = 1, prices: dict | None = None) -> tuple[float, int, str]:
@@ -198,12 +249,12 @@ def compute_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = N
     for r in runs.values():
         if (r.get("started") or 0) < cutoff or not r.get("status"):
             continue
-        s = by_kind[r.get("kind") or "other"]
+        s = by_kind[str(r.get("kind") or "other")]
         s["runs"] += 1
         s["ok"] += r["status"] == "ok"
-        if r.get("verification") in ("passed", "failed"):
+        if r.get("verification") in ("passed", "passed_except_preexisting", "failed"):
             s["verified"] += 1
-            s["passed"] += r["verification"] == "passed"
+            s["passed"] += r["verification"] != "failed"
         if r.get("outcome") == "adopted":
             s["adopted"] += 1
         elif r.get("outcome") == "adopted_partial":
@@ -215,10 +266,10 @@ def compute_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = N
         if cost is not None:
             s["cost"] += cost
             s["costed"] += 1
-        s["effective"] += r.get("effective") or 0
+        s["effective"] += r.get("effective") if isinstance(r.get("effective"), int) else 0
         # Savings count decided runs only: adopted work saves Claude its equivalent (half for a partial
         # adopt); discarded work saves nothing, but its overhead still counts.
-        if r.get("outcome") and r.get("claude_overhead"):
+        if r.get("outcome") and isinstance(r.get("claude_overhead"), (int, float)):
             s["overhead"] += r["claude_overhead"]
             share = {"adopted": 1.0, "adopted_partial": 0.5}.get(r["outcome"], 0.0)
             s["saved"] += int((r.get("claude_equivalent") or 0) * share)
@@ -233,16 +284,12 @@ def _adopted(s: dict) -> str:
     return text + (f" (+{s['partial']} partial)" if s["partial"] else "")
 
 
-def _avg_cost(s: dict) -> str:
-    return f"${s['cost'] / s['costed']:.3f}" if s["costed"] else "?"
-
-
 def top_denied(runs: dict[str, dict], days: int = 90, limit: int = 5) -> list[tuple[str, int]]:
     cutoff = time.time() - days * 86400
     counts: Counter = Counter()
     for r in runs.values():
         if (r.get("started") or 0) >= cutoff:
-            counts.update(r.get("denied") or [])
+            counts.update(d for d in (r.get("denied") or []) if isinstance(d, str))
     return counts.most_common(limit)
 
 

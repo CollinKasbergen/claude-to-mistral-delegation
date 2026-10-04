@@ -76,7 +76,7 @@ model = "mistral-medium-3.5"
 # Claude delegates freely early in the month and selectively near the end.
 # monthly_credit = 225
 # currency = "€"
-# credit_reset_day = 1
+# credit_reset_day = 1     # 29-31 mean the last day in shorter months
 
 # Commands that fix formatting-type check failures. They run before a
 # Mistral fix round, so a formatting failure costs no extra Mistral round.
@@ -100,6 +100,13 @@ model = "mistral-medium-3.5"
 # delegating saved Claude less than this many times what it cost Claude
 # (writing the spec, reading the report). Claude then keeps those itself.
 # min_savings = 2
+
+# Default --scope for write runs that don't pass one (usually set per task).
+# scope = ["src/**"]
+
+# When Mistral stops without finishing (missing files, no closing summary and
+# no checks to tell), it is asked once to finish. 0 turns that off.
+# continue_attempts = 1
 
 # Caps per run in effective tokens: fresh input counts in full, cached input
 # at a tenth, output five times (adjust with token_weights). The plugin

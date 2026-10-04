@@ -704,7 +704,7 @@ class WriteModeTest(DelegateTestBase):
         first = self.run_delegate("--mode", "write", "Task")
         run_id = self.value(first, "run_id")
         runs = [json.loads(line) for line in (self.home / "ledger.jsonl").read_text().splitlines()]
-        worktree = next(e["worktree"] for e in runs if e.get("event") == "start")
+        worktree = next(e["worktree"] for e in runs if e.get("event") == "start" and e.get("worktree"))
         with open(self.home / "ledger.jsonl", "a") as f:  # a resume of it, still running (this process)
             f.write(json.dumps({"event": "start", "id": "mistral-resume1", "pid": os.getpid(), "mode": "write",
                                 "time": time.time(), "worktree": worktree}) + "\n")
@@ -919,6 +919,32 @@ class WriteModeTest(DelegateTestBase):
         self.assertEqual(res.returncode, 0, res.stdout)
         self.assertTrue((self.repo / "other.py").exists())
         self.assertFalse((self.repo / "test_app.py").exists())
+        self.assertTrue((wt / "test_app.py").exists())  # the rest stays in the kept worktree
+        self.assertIn(f"--discard {run_id} removes it", res.stdout)
+        self.run_delegate("--discard", run_id)
+        self.assertFalse(wt.exists())
+        self.assertIn("partial", self.run_delegate("--status").stdout)  # still counted as partly adopted
+
+    def test_adopt_paths_are_scope_checked_like_git_reads_them(self):
+        out = self.run_delegate("--mode", "write", "--scope", "test_*.py", "Task", FAKE_VIBE_TOUCH_APP="1")
+        res = self.run_delegate("--adopt", self.value(out, "run_id"), "--paths", ".")
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("app.py", res.stdout)
+        self.assertNotIn("# changed by vibe", (self.repo / "app.py").read_text())
+
+    def test_a_resume_after_a_kept_adopt_can_be_adopted(self):
+        first = self.run_delegate("--mode", "write", "Task")
+        name = self.value(first, "worktree_name")
+        adopt = self.run_delegate("--adopt", self.value(first, "run_id"), "--keep-worktree")
+        self.assertEqual(adopt.returncode, 0, adopt.stdout)
+        wt = Path(self.value(first, "worktree_path"))
+        (wt / "later.py").write_text("z = 3\n")
+        second = self.run_delegate("--mode", "write", "--worktree-name", name, "--resume", "sess-1234567890",
+                                   "More", FAKE_VIBE_NO_WRITE="1")
+        res = self.run_delegate("--adopt", self.value(second, "run_id"))
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertTrue((self.repo / "later.py").exists())
+        self.assertNotIn("test_app.py", res.stdout)  # applied the first time
 
     def test_discard_removes_worktree_and_records_note(self):
         out = self.run_delegate("--mode", "write", "--kind", "feature", "Task")
@@ -972,12 +998,18 @@ class WriteModeTest(DelegateTestBase):
         self.assertIn("pkg/test_app.py", out.stdout)
 
     def test_allow_shell_and_in_place(self):
-        out = self.run_delegate("--mode", "write", "--in-place", "--allow-shell", "Fix it")
+        (self.repo / "app.py").write_text("print('my own edit')\n")  # the user's uncommitted work
+        (self.repo / "NOTES.txt").write_text("mine\n")
+        out = self.run_delegate("--mode", "write", "--in-place", "--allow-shell", "--scope", "test_app.py", "Fix it")
         argv = self.last()["argv"]
         self.assertIn("--auto-approve", argv)
         self.assertNotIn("--trust", argv)
         self.assertTrue((self.repo / "test_app.py").exists())
-        self.assertIn("?? test_app.py", out.stdout)
+        changed = out.stdout.split("changed_files")[1].split("\n\n")[0]
+        self.assertIn("  test_app.py", changed)
+        self.assertNotIn("app.py\n", changed.replace("test_app.py", ""))
+        self.assertNotIn("NOTES.txt", out.stdout)
+        self.assertNotIn("out_of_scope_changes", out.stdout)
 
     def test_failed_run_removes_untouched_worktree(self):
         out = self.run_delegate("--mode", "write", "--worktree-name", "mistral-err", "Task", behaviour="error")
@@ -1055,6 +1087,25 @@ class ConfigTest(DelegateTestBase):
         self.assertEqual(self.calls(), [])
 
 
+class EditableInstallTest(DelegateTestBase):
+    def test_checks_import_the_worktrees_copy_of_an_editable_package(self):
+        (self.repo / ".gitignore").write_text("node_modules/\n.venv/\n")
+        (self.repo / "src" / "pkg").mkdir(parents=True)
+        (self.repo / "src" / "pkg" / "__init__.py").write_text("VALUE = 'user'\n")
+        self.git("add", "-A")
+        self.git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "pkg")
+        site = self.repo / ".venv" / "lib" / "python3.11" / "site-packages"
+        site.mkdir(parents=True)
+        (site / "__editable__.pkg.pth").write_text(str(self.repo / "src") + "\n")
+        check = "python3 -c \"import pkg, sys; sys.exit(0 if pkg.VALUE == 'user' else 3)\""
+        # Without the fix, the check would import the checkout's pkg; the worktree's copy says 'mistral'.
+        out = self.run_delegate("--mode", "write", "--no-baseline", "--fix-attempts", "0", "--verify",
+                                "sed -i s/user/mistral/ src/pkg/__init__.py; " + check.replace("'user'", "'mistral'"),
+                                "Task", PYTHONPATH="")
+        self.assertIn("python_path: your virtualenv installs src in editable mode", out.stdout)
+        self.assertIn("verification: passed", out.stdout)
+
+
 class HookTest(DelegateTestBase):
     def run_hook(self, env=None):
         out = subprocess.run([sys.executable, str(HOOK)], input=json.dumps({"cwd": str(self.repo)}),
@@ -1090,8 +1141,16 @@ class HookTest(DelegateTestBase):
 
     def test_session_start_without_vibe(self):
         env = dict(self.env, PATH="/usr/bin:/bin")
+        env.pop("VIBE_BIN")
         context = self.run_hook(env)
         self.assertIn("not installed", context)
+        context = self.run_hook(dict(env, VIBE_BIN=str(self.vibe)))  # vibe outside PATH, named by VIBE_BIN
+        self.assertNotIn("not installed", context)
+
+    def test_session_start_mentions_a_broken_config(self):
+        (self.repo / ".mistral-delegate.toml").write_text("policy = balanced\n")
+        context = self.run_hook(self.env)
+        self.assertIn("Config problem", context)
 
 
 
@@ -1477,6 +1536,63 @@ class SessionWatcherTest(unittest.TestCase):
             self.assertEqual(snap["session_id"], "B-session")
             self.assertEqual(snap["tokens_in"], 1_000)
             self.assertEqual(watcher.found_id, "B-session")
+
+
+class LedgerTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["MISTRAL_DELEGATE_HOME"] = self.tmp.name
+        self.addCleanup(os.environ.pop, "MISTRAL_DELEGATE_HOME", None)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_odd_lines_dont_break_status_or_stats(self):
+        from mdelegate import ledger
+        path = Path(self.tmp.name, "ledger.jsonl")
+        path.write_text("\n".join(["null", "[1, 2]", '{"id": ["a"]}', '{"event": "start", "id": "r1", "time": "x",'
+                                    ' "kind": null, "task": 5}', '{"event": "end", "id": "r1", "status": "ok",'
+                                    ' "effective": "lots", "denied": [1, "bash: x"]}', '{"event": "start", "id": "r2"'])
+                        )  # the last line was cut short by a killed writer
+        ledger.append({"event": "start", "id": "r3", "kind": "tests", "mode": "write", "pid": 0})
+        ledger.append({"event": "end", "id": "r3", "status": "ok", "verification": "passed_except_preexisting"})
+        runs = ledger.load_runs()
+        self.assertEqual(runs["r3"]["status"], "ok")  # not swallowed by the torn line
+        self.assertIn("r1", ledger.format_status(runs, currency="€"))
+        self.assertIn("1/1", ledger.format_stats(runs))  # passed_except_preexisting counts as passed
+        ledger.month_spend(runs)
+
+    def test_status_uses_the_currency(self):
+        from mdelegate import ledger
+        runs = {"a": {"id": "a", "status": "ok", "cost": 0.5, "tokens": 10, "started": time.time()}}
+        self.assertIn("€0.500", ledger.format_status(runs, currency="€"))
+
+    def test_credit_reset_day_past_the_end_of_a_month(self):
+        from mdelegate import ledger
+        at = lambda day: time.mktime(time.strptime(day, "%Y-%m-%d"))
+        self.assertEqual(time.strftime("%Y-%m-%d", ledger.month_start(31, at("2026-01-29"))), "2025-12-31")
+        self.assertEqual(time.strftime("%Y-%m-%d", ledger.month_start(31, at("2026-04-30"))), "2026-04-30")
+        self.assertEqual(time.strftime("%Y-%m-%d", ledger.month_start(31, at("2026-03-15"))), "2026-02-28")
+        self.assertEqual(time.strftime("%Y-%m-%d", ledger.month_start(30, at("2026-03-01"))), "2026-02-28")
+
+    def test_a_reused_pid_isnt_taken_for_a_running_run(self):
+        from mdelegate import ledger
+        run = {"id": "a", "pid": os.getpid(), "pid_started": "Thu Jan  1 00:00:00 1970"}
+        self.assertEqual(ledger.state(run), "died")
+        self.assertEqual(ledger.state(dict(run, pid_started=ledger.process_started(os.getpid()))), "running")
+
+
+class VibeStatsTest(unittest.TestCase):
+    def test_zero_prices_count_only_when_configured(self):
+        from mdelegate import vibe
+        snap = {"model": "devstral-free", "price": (0.0, 0.0, 0.0), "tokens_in": 1000, "cached": 0, "tokens_out": 10}
+        self.assertEqual(vibe.snapshot_cost(snap), (None, False))  # Vibe's 0 means "no price"
+        vibe.EXTRA_PRICES["devstral-free"] = (0.0, 0.0, 0.0)
+        self.addCleanup(vibe.EXTRA_PRICES.pop, "devstral-free")
+        self.assertEqual(vibe.snapshot_cost(snap), (0.0, False))
+
+    def test_journals_are_read_in_numeric_order(self):
+        from mdelegate import vibe
+        names = [Path(f"{n}.jsonl") for n in (10, 9, 2)]
+        self.assertEqual([p.stem for p in sorted(names, key=vibe._journal_order)], ["2", "9", "10"])
 
 
 class MiniTomlTest(unittest.TestCase):

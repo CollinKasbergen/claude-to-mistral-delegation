@@ -59,9 +59,11 @@ Claude delegates on its own, following the active policy. You can also ask ("hav
 6. **Checks.** The wrapper runs each `--verify` command in the worktree. If one fails, its output goes back to the same Vibe session for a fix (`--fix-attempts`, default 1), and the checks run again. A failed `autofix` command shows the end of its output. When the run changed both code and tests, its test commands also run against the original code with only the test changes applied (`test_strength`, on by default). Only test runners count (pytest, vitest, jest, `go test`, `npm test`, or a `test_commands` entry), and only those whose baseline passed. Tests that pass there don't test the change, and the report says so.
 7. **Resumes.** `--resume <session> --worktree-name <name>` continues in the same worktree under a new run id. The report shows which run it continues, and adopting or discarding either id settles both. Its baseline is the one stored before Mistral's first changes. A check that wasn't measured then runs on a clean copy of the original snapshot, so Mistral's own failures are never counted as already failing.
 8. **Report.** It shows status, any `config_warning` (a misspelled or mistyped setting) or `budget_warning` (the caps couldn't be tracked), verification, usage (effective tokens and cost) and month-to-date credit, the path of the run's full diff (kept after the worktree is removed), the change list, files changed outside the scope, commands Mistral was refused, the diff when short, and `adopt_with` / `discard_with` commands.
-9. **Adopt or discard.** `--adopt <id>` applies Mistral's changes inside the scope to your checkout (your own uncommitted work is left alone) and removes the worktree. `--paths` takes only some files, and `--discard <id> --note "why"` drops the run. If any change is outside the scope of the worktree's runs (all of them, when a resume narrowed the scope), `--adopt` stops and lists those files until you choose `--include-out-of-scope` or `--skip-out-of-scope`. New files named literally in `--scope` must exist when the run ends: a missing one gets Mistral one request to create it, and otherwise the run reports `status: incomplete`.
+9. **Adopt or discard.** `--adopt <id>` applies Mistral's changes inside the scope to your checkout (your own uncommitted work is left alone) and removes the worktree. `--paths` takes only some files (git pathspecs such as `src/` or `.`, checked against the scope like the rest) and keeps the worktree with what you didn't take, and `--discard <id> --note "why"` drops the run. After `--adopt --keep-worktree`, a resume in that worktree adopts only what came after. If any change is outside the scope of the worktree's runs (all of them, when a resume narrowed the scope), `--adopt` stops and lists those files until you choose `--include-out-of-scope` or `--skip-out-of-scope`. New files named literally in `--scope` must exist when the run ends: a missing one gets Mistral one request to create it, and otherwise the run reports `status: incomplete`.
 
-Read tasks (`--mode read`) run in place with read-only tools.
+Read tasks (`--mode read`) run in place with read-only tools. `--in-place` write tasks edit your checkout directly; their report lists only the files the run changed, not your earlier uncommitted work.
+
+When a linked `.venv` installs part of your project in editable mode (its `.pth` points into your checkout), checks and Mistral's commands put the worktree's copy first on `PYTHONPATH`, so they test Mistral's code rather than yours; the report's `python_path:` line says so.
 
 ## Policy and settings
 
@@ -88,13 +90,15 @@ baseline = true              # run the checks on the untouched worktree first
 
 monthly_credit = 225         # your Vibe credit per month (e.g. Mistral Pro's), tracked in reports
 currency = "€"
-credit_reset_day = 1         # day of the month the credit renews
+credit_reset_day = 1         # day of the month the credit renews (29-31: the last day in shorter months)
 min_savings = 2              # stop delegating kinds of task whose measured savings fall below this
 autofix = [                  # run these when checks fail, before asking Mistral to fix
   { cmd = "ruff format .", paths = ["backend/"] },        # only when the run touches backend/
   { cmd = "npm --prefix frontend run lint:fix", paths = ["frontend/"] },
 ]
 # token_weights = { input = 1.0, cached = 0.1, output = 5.0 }  # what counts as an effective token
+# scope = ["src/**"]          # default --scope when a run doesn't pass one
+# continue_attempts = 1       # 0: never ask Mistral to finish work that looks unfinished
 
 [write]
 token_budget = 1000000  # stop Mistral after this many effective tokens (enforced by the wrapper)

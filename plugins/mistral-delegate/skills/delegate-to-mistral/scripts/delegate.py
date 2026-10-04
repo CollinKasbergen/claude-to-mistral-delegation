@@ -47,7 +47,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mdelegate import commands as cmdforms, config, gitops, guard, ledger, vibe  # noqa: E402
-from mdelegate.gitops import DelegateError, git  # noqa: E402
+from mdelegate.gitops import DelegateError  # noqa: E402
 
 KINDS = ("tests", "feature", "bugfix", "refactor", "migration", "boilerplate", "docs", "search", "other")
 MAX_RESULT_CHARS = 12_000
@@ -165,8 +165,9 @@ def find_run(run_id: str) -> dict:
 
 def worktree_scope(run: dict) -> list[str]:
     """The combined scope of every run on this run's worktree; [] if any of them had no scope (no limit)."""
-    path = (run.get("worktree") or {}).get("path")
-    runs = [r for r in ledger.load_runs().values() if path and (r.get("worktree") or {}).get("path") == path] or [run]
+    runs = runs_on_worktree(run) if (run.get("worktree") or {}).get("path") else [run]
+    if run.get("id") is None:  # the report of a run not recorded under an id here: add its own scope
+        runs = runs + [run]
     if any(not r.get("scope") for r in runs):
         return []
     return list(dict.fromkeys(entry for r in runs for entry in r["scope"]))
@@ -178,7 +179,7 @@ def runs_on_worktree(run: dict) -> list[dict]:
     if not path:
         return [run]
     return [r for r in ledger.load_runs().values()
-            if r["id"] == run["id"] or ((r.get("worktree") or {}).get("path") == path and not r.get("outcome"))]
+            if r["id"] == run.get("id") or ((r.get("worktree") or {}).get("path") == path and not r.get("outcome"))]
 
 
 def refuse_while_running(run: dict) -> None:
@@ -202,14 +203,15 @@ def cmd_adopt(args: argparse.Namespace) -> int:
         return 0
     if not os.path.isdir(wt["path"]):
         raise DelegateError(f"The worktree {wt['path']} no longer exists.")
+    # An earlier --adopt --keep-worktree moved the base past what it applied.
+    wt = dict(wt, base=gitops.load_state(wt["path"]).get("base") or wt["base"])
     paths = args.paths
     skipped: list[str] = []
     # A resumed run may have a narrower scope than the run it continues; the worktree holds both.
     scope = worktree_scope(run)
     if scope and not args.include_out_of_scope:
-        changed = gitops.changed_files(wt)
-        if paths:
-            changed = [f for f in changed if any(f == p or f.startswith(p.rstrip("/") + "/") for p in paths)]
+        # --paths are git pathspecs (`.`, `src/*`): check exactly the files they select.
+        changed = gitops.changed_files(wt, paths)
         skipped = [f for f in changed if not vibe.matches_scope(f, scope)]
         if skipped and not args.skip_out_of_scope:
             print(f"Nothing applied: {len(skipped)} changed file(s) in this worktree are outside the scope of its "
@@ -239,8 +241,13 @@ def cmd_adopt(args: argparse.Namespace) -> int:
     if skipped:
         print("Left out (outside the run's scope; --include-out-of-scope to apply):")
         print("\n".join(f"  {f}" for f in skipped))
-    if args.keep_worktree:
-        print(f"Worktree kept at {wt['path']}.")
+    partial = bool(args.paths or skipped)
+    if args.keep_worktree or partial:
+        # What was applied becomes the worktree's new base, so a later adopt (after a resume) applies only
+        # what came after it.
+        gitops.commit_applied(wt, files)
+        print(f"Worktree kept at {wt['path']}"
+              + (f" with the changes you didn't apply; --discard {run['id']} removes it." if partial else "."))
     else:
         gitops.remove_worktree(wt)
         print("Worktree removed.")
@@ -254,6 +261,10 @@ def cmd_discard(args: argparse.Namespace) -> int:
     wt = run.get("worktree")
     if wt and os.path.isdir(wt["path"]):
         gitops.remove_worktree(wt)
+    if run.get("outcome") == "adopted_partial":
+        # The rest of a partly adopted run: the track record keeps it as partly adopted.
+        print(f"Removed the worktree of {run['id']} (its adopted part stays in your checkout).")
+        return 0
     for sibling in runs_on_worktree(run):
         ledger.append({"event": "outcome", "id": sibling["id"], "outcome": "discarded", "note": args.note})
     print(f"Discarded {run['id']}" + (" and removed its worktree." if wt else "."))
@@ -564,13 +575,26 @@ def measure_baseline(commands: list[str], cwd: str, timeout: int, flaky: list[st
     return baseline
 
 
+# Folders (relative to the repo) that the linked virtualenv installs in editable mode from the user's
+# checkout: checks put the copy in the folder they run in first on PYTHONPATH.
+EDITABLE_SOURCES: list[str] = []
+
+
+def python_path_env(root: str | None) -> dict | None:
+    if not EDITABLE_SOURCES or not root:
+        return None
+    paths = [str(Path(root, rel)) for rel in EDITABLE_SOURCES]
+    return dict(os.environ, PYTHONPATH=os.pathsep.join(paths + [p for p in [os.environ.get("PYTHONPATH")] if p]))
+
+
 def run_checks(commands: list[str], cwd: str, timeout: int) -> dict[str, tuple[int, str]]:
     """Run every check. Returns {command: (exit code, end of output)}."""
     results = {}
+    env = python_path_env(gitops.toplevel(cwd)) if EDITABLE_SOURCES else None
     for command in commands:
         # Its own process group, so a timeout also stops what the check started (test workers, servers).
         proc = subprocess.Popen(command, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
+                                stdin=subprocess.DEVNULL, start_new_session=True, env=env)
         timed_out = False
         try:
             out, _ = proc.communicate(timeout=timeout)
@@ -653,32 +677,52 @@ def run_task(args: argparse.Namespace) -> int:
     deps_mode = args.deps_mode or settings["deps_mode"]
     kind = args.kind or ("search" if args.mode == "read" else "other")
 
-    if shutil.which(args.vibe_bin) is None and not Path(args.vibe_bin).is_file():
+    vibe_path = shutil.which(args.vibe_bin) or (args.vibe_bin if Path(args.vibe_bin).is_file() else None)
+    if vibe_path is None:
         print("status: error\n\nVibe CLI not found. Install it with `uv tool install mistral-vibe` "
               "(or `pip install mistral-vibe`), then run `vibe --setup` once to store your API key.")
         return 2
-
-    active = ledger.running(ledger.load_runs())
-    if len(active) >= settings["max_parallel"]:
-        raise DelegateError(f"{len(active)} delegations are already running (max_parallel = "
-                            f"{settings['max_parallel']}): {', '.join(r['id'] for r in active)}. "
-                            "Wait for one to finish (see --status) or raise max_parallel in the config.")
+    if not os.access(vibe_path, os.X_OK):
+        raise DelegateError(f"{vibe_path} isn't executable (chmod +x it, or point VIBE_BIN at the vibe CLI).")
+    if write and not args.in_place and not top:
+        print("status: error\n\nWrite mode needs a git repository for worktree isolation. "
+              "Pass --in-place to let Vibe edit the directory directly.")
+        return 2
 
     prefix = "read" if not write else ("inplace" if args.in_place else "mistral")
     run_id = f"{prefix}-{uuid.uuid4().hex[:8]}"
+    start = {"event": "start", "id": run_id, "time": time.time(), "pid": os.getpid(),
+             "pid_started": ledger.process_started(os.getpid()), "mode": args.mode, "kind": kind,
+             "repo": Path(top or workdir).name, "workdir": workdir, "task": task[:500], "policy": settings["policy"],
+             "model": model, "scope": scope, "continues": None, "worktree": None}
+    # Counting the running delegations and recording this one happen under one lock, so two runs
+    # started at the same moment can't both slip under max_parallel.
+    with ledger.locked():
+        active = ledger.running(ledger.load_runs())
+        if len(active) >= settings["max_parallel"]:
+            raise DelegateError(f"{len(active)} delegations are already running (max_parallel = "
+                                f"{settings['max_parallel']}): {', '.join(r['id'] for r in active)}. "
+                                "Wait for one to finish (see --status) or raise max_parallel in the config.")
+        ledger.append(start)
 
     run_dir, wt = workdir, None
     if write and not args.in_place:
-        if not top:
-            print("status: error\n\nWrite mode needs a git repository for worktree isolation. "
-                  "Pass --in-place to let Vibe edit the directory directly.")
-            return 2
         try:
             wt = gitops.prepare_worktree(top, args.worktree_name or run_id, snapshot=not args.no_snapshot,
                                          link_deps=not args.no_link_deps, extra_links=args.link,
                                          deps_mode=deps_mode, worktrees_dir=settings["worktrees_dir"])
         except DelegateError as e:
+            ledger.append({"event": "end", "id": run_id, "status": "error", "verification": "not_run",
+                           "error": f"worktree: {e}"[:300]})
             print(f"status: error\n\nCould not prepare the worktree: {e}")
+            return 2
+        if not Path(wt["path"], Path(workdir).relative_to(top)).is_dir():
+            if not wt["reused"]:
+                gitops.remove_worktree(wt)
+            ledger.append({"event": "end", "id": run_id, "status": "error", "verification": "not_run",
+                           "error": "workdir missing in worktree"})
+            print(f"status: error\n\n{Path(workdir).relative_to(top)} isn't in the worktree: it is untracked or "
+                  "ignored in your checkout. Run from a tracked folder, or drop --no-snapshot.")
             return 2
         run_dir = str(Path(wt["path"]) / Path(workdir).relative_to(top))
         # New files named literally in the scope get their folders up front, so writing them can't fail on that.
@@ -697,10 +741,9 @@ def run_task(args: argparse.Namespace) -> int:
     # A follow-up is listed under the task it continues, not under its resume message.
     original = (ledger.load_runs().get(continues) or {}).get("task") if continues else None
     label = f"{original.split(' [follow-up')[0]} [follow-up]" if original else task
-    ledger.append({"event": "start", "id": run_id, "pid": os.getpid(), "mode": args.mode, "kind": kind,
-                   "repo": Path(top or workdir).name, "workdir": workdir, "task": label[:500],
-                   "policy": settings["policy"], "model": model, "scope": scope, "continues": continues,
-                   "worktree": {k: wt[k] for k in ("name", "path", "toplevel", "base", "links")} if wt else None})
+    # The full start record, now that the worktree and the run it continues are known.
+    ledger.append(dict(start, task=label[:500], continues=continues,
+                       worktree={k: wt[k] for k in ("name", "path", "toplevel", "base", "links")} if wt else None))
 
     # The guard hook refuses disallowed tool calls with an error Mistral can work around,
     # instead of letting Vibe's approval prompt cancel the session.
@@ -711,7 +754,8 @@ def run_task(args: argparse.Namespace) -> int:
     run = Run(args)
     run.run_id = run_id
     # Vibe passes its environment on to hooks: the guard finds this run's policy by this id.
-    run.env = dict(os.environ, **{guard.RUN_ENV: run_id})
+    EDITABLE_SOURCES[:] = gitops.editable_sources(top, wt.get("links") or []) if wt else []
+    run.env = dict(python_path_env(wt["path"] if wt else None) or os.environ, **{guard.RUN_ENV: run_id})
     if not guard_warning:
         default_cmds = vibe.DEFAULT_BASH_ALLOWLIST if write else []
         run.guard_policy = {
@@ -818,6 +862,13 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                       max_price=caps["max_price"] * share if caps.get("max_price") is not None else None,
                       model_hint=model)
 
+    # In place, only what changes from now on is Mistral's: the checkout may hold the user's own uncommitted work.
+    inplace_root = (top or workdir) if write and not wt else None
+    inplace_before = gitops.checkout_state(inplace_root) if inplace_root else {}
+
+    def inplace_changes() -> list[str]:
+        return gitops.changed_since(inplace_root, inplace_before) if inplace_root else []
+
     vibe_call(prompt if args.resume else prompt + "\n\n" + vibe.run_marker(run_id), 1.0)
     continued, summary_note = 0, ""
 
@@ -854,7 +905,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
 
     missing = missing_new_files() if write else []
     if run.status == "ok" and (run.unfinished or missing):
-        changed_now = gitops.changed_files(wt) if wt else [ln[3:] for ln in git(workdir, "status", "--porcelain").splitlines()]
+        changed_now = gitops.changed_files(wt) if wt else inplace_changes()
         # Asking Mistral to finish costs a round; it's only worth it when the work looks unfinished:
         # files the task named are missing, checks fail, nothing changed, or there are no checks to tell.
         follow_up = None
@@ -900,8 +951,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     run.session_id = run.session_id or (stats_after or {}).get("session_id")
     use = vibe.usage(stats_after, stats_before)
 
-    files_now = (gitops.changed_files(wt) if wt else
-                 [line[3:] for line in git(workdir, "status", "--porcelain").splitlines()] if write else [])
+    files_now = gitops.changed_files(wt) if wt else inplace_changes()
     if run.cancelled and run.status in ("ok", "error"):
         run.status = "stopped_by_refusal"
     elif write and run.status == "ok" and not files_now:
@@ -1016,10 +1066,10 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         else:
             lines += worktree_section(wt, run_id, files, out_of_scope, args.diff_lines)
     elif write:
-        status_out = git(workdir, "status", "--porcelain").rstrip()
-        files = [line[3:] for line in status_out.splitlines()]
+        files = files_now
         out_of_scope = [f for f in files if scope and not vibe.matches_scope(f, scope)]
-        lines.append("changed_files (in your checkout):\n" + (status_out or "  (none)"))
+        lines.append("changed_files (in your checkout, by this run; your earlier uncommitted changes aren't "
+                     "listed):\n" + ("\n".join(f"  {f}" for f in files) or "  (none)"))
         if out_of_scope:
             lines.append("out_of_scope_changes (in your checkout, outside --scope; revert them if unwanted): "
                          + ", ".join(out_of_scope))
@@ -1140,6 +1190,10 @@ def worktree_section(wt: dict, run_id: str, files: list[str], out_of_scope: list
             lines.append(f"dependencies ({label} from your checkout): " + ", ".join(links))
     for note in wt.get("notes") or []:
         lines.append(f"dependency_note: {note}")
+    if EDITABLE_SOURCES:
+        lines.append("python_path: your virtualenv installs " + ", ".join(EDITABLE_SOURCES) + " in editable mode "
+                     "from your checkout; checks and Mistral's commands put the worktree's copy first on PYTHONPATH, "
+                     "so they test Mistral's code")
     stat = gitops.changes_stat(wt)
     lines.append("changes_by_vibe:\n" + (stat or "  (none)"))
     if files:
@@ -1169,7 +1223,9 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
         if args.status:
-            print(ledger.format_status(ledger.load_runs()))
+            top = gitops.toplevel(str(Path(args.workdir).resolve()))
+            currency = config.load(top or args.workdir)["currency"]
+            print(ledger.format_status(ledger.load_runs(), currency=currency))
             return 0
         if args.stats:
             settings = config.load(gitops.toplevel(str(Path(args.workdir).resolve())) or args.workdir)

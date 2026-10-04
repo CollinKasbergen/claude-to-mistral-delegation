@@ -261,8 +261,7 @@ def load(repo_root: str | None) -> dict:
     settings["monthly_credit"] = settings["monthly_credit"] or None
     _as_number(settings, "min_savings", float, None, low=0)
     settings["min_savings"] = settings["min_savings"] or None
-    _as_number(settings, "credit_reset_day", int, 1, low=1, high=31)
-    settings["credit_reset_day"] = min(28, settings["credit_reset_day"])
+    _as_number(settings, "credit_reset_day", int, 1, low=1, high=31)  # 29-31: the month's last day when shorter
     _as_number(settings, "claude_relative_effort", float, 0.5, low=0)
     _as_number(settings, "fix_attempts", int, 1, low=0)
     _as_number(settings, "continue_attempts", int, 1, low=0, high=1)
@@ -303,11 +302,17 @@ def describe(settings: dict) -> str:
         f"vibe_args: {' '.join(settings['vibe_args']) or '(none)'}",
         f"model_prices: {', '.join(f'{a} = {list(p)} per M tokens' for a, p in settings['model_prices'].items()) or '(none)'}",
         f"token_weights: {dict(DEFAULT_WEIGHTS, **settings['token_weights'])} (effective tokens = fresh input, cached and output tokens times these)",
-        f"monthly_credit: " + (f"{settings['currency']}{settings['monthly_credit']:.2f}, resets on day {settings['credit_reset_day']}"
+        "monthly_credit: " + (f"{settings['currency']}{settings['monthly_credit']:.2f}, resets on day {settings['credit_reset_day']}"
                                if settings['monthly_credit'] else "(not set)"),
         f"min_savings: {settings['min_savings'] or '(not set)'}",
         f"autofix: {'; '.join(check_label(c) for c in settings['autofix']) or '(none)'}",
         f"worktrees_dir: {settings['worktrees_dir'] or '(automatic: ~/.mistral-delegate/worktrees, or <repo parent>/.mistral-worktrees when the repo is on another disk)'}",
+        f"continue_attempts: {settings['continue_attempts']} (asks to finish when the work looks unfinished)",
+        f"fix_after_cap: {'on' if settings['fix_after_cap'] else 'off'} (a fix round after a cap stop)",
+        f"test_strength: {'on' if settings['test_strength'] else 'off'}"
+        + (f", test_commands: {', '.join(settings['test_commands'])}" if settings["test_commands"] else ""),
+        f"claude_relative_effort: {settings['claude_relative_effort']}",
+        f"currency: {settings['currency']}",
     ]
     for mode in ("read", "write"):
         c = caps(settings, mode)
@@ -317,6 +322,10 @@ def describe(settings: dict) -> str:
                      + (f" max_tokens={c['max_tokens']}" if c.get("max_tokens") else ""))
     for key, source in settings["sources"].items():
         lines.append(f"source of {key}: {source}")
+    for key in CAP_KEYS:
+        var = f"MISTRAL_DELEGATE_{key.upper()}"
+        if os.environ.get(var):
+            lines.append(f"source of {key} (both modes): env: {var}")
     for error in settings["errors"]:
         lines.append(f"error: {error}")
     for warning in settings["warnings"]:

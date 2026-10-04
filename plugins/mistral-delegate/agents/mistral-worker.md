@@ -48,7 +48,7 @@ python3 <wrapper> --mode write --kind <tests|feature|bugfix|refactor|migration|b
 
 ## 4. Review
 
-Read the report. If the diff wasn't included, read it with the `Review with:` command. Check that:
+Read the report. If the diff wasn't included, read the file named on its `diff:` line. Check that:
 - the change does what the spec asked, and nothing unrelated;
 - tests weren't deleted or weakened, and new tests would actually fail if the feature were broken (right object under test, no duplicated fixtures);
 - nothing is listed under `out_of_scope_changes` (if something is, explain it and recommend `--include-out-of-scope` or `--skip-out-of-scope`, since `--adopt` stops until one is chosen);

@@ -429,6 +429,18 @@ def _same_dir(a: str | None, b: str) -> bool:
     return not a or Path(a).resolve() == Path(b).resolve()
 
 
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _journal_order(path: Path) -> tuple:
+    """Journal files in numeric order (9.jsonl before 10.jsonl), whatever their padding."""
+    return (int(path.stem), "") if path.stem.isdigit() else (float("inf"), path.stem)
+
+
 class JournalReader:
     """Reads a Unified Harness session journal incrementally.
 
@@ -446,7 +458,7 @@ class JournalReader:
         self.effects: set[str] = set()
 
     def read(self) -> None:
-        for journal in sorted((self.dir / "journal").glob("*.jsonl")):
+        for journal in sorted((self.dir / "journal").glob("*.jsonl"), key=_journal_order):
             try:
                 with journal.open("r", encoding="utf-8", errors="replace") as f:
                     f.seek(self._offsets.get(journal, 0))
@@ -547,7 +559,8 @@ def _candidates(root: Path, session_id: str | None, since: float | None) -> list
     unified = root / "unified"
     if session_id:
         found = [(unified / session_id, "unified")] if (unified / session_id).is_dir() else []
-        return found + [(m.parent, "legacy") for m in root.glob(f"*_{session_id[:8]}/meta.json")]
+        legacy = sorted(root.glob(f"*_{session_id[:8]}/meta.json"), key=_mtime, reverse=True)  # newest first
+        return found + [(m.parent, "legacy") for m in legacy]
     out = []
     for base, kind in ((unified, "unified"), (root, "legacy")):
         if not base.is_dir():
@@ -636,7 +649,8 @@ def snapshot_cost(snap: dict | None, base: dict | None = None, *, fallback: bool
         return 0.0, False
     base = base or {}
     price, used_fallback = snap.get("price"), False
-    if not price or not any(price[:2]):
+    # A price of zero is "not set" in Vibe's model config, unless the plugin's model_prices says the model is free.
+    if not price or (not any(price[:2]) and snap.get("model") not in EXTRA_PRICES):
         if not fallback:
             return None, False
         price, used_fallback = BUILTIN_MODELS[DEFAULT_MODEL_ALIAS], True

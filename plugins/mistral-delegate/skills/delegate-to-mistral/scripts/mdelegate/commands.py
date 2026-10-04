@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 
-from .guard import PACKAGE_MANAGER_BUILTINS, normalize_command
+from .guard import normalize_command
 
 PACKAGE_MANAGERS = ("npm", "pnpm", "yarn", "bun")
 # Tools that only test, lint, type-check or format; `npx <tool>` is allowed when a
