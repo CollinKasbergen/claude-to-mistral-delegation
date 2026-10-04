@@ -1,0 +1,13 @@
+{
+  "name": "claude-to-mistral-delegation",
+  "owner": {
+    "name": "Collin Kasbergen"
+  },
+  "plugins": [
+    {
+      "name": "mistral-delegate",
+      "source": "./plugins/mistral-delegate",
+      "description": "Let Claude Code hand self-contained tasks to Mistral's Vibe CLI (vibe --prompt) with budget limits and worktree isolation."
+    }
+  ]
+}
