@@ -147,6 +147,10 @@ FAKE_VIBE = textwrap.dedent('''\
     if os.environ.get("FAKE_VIBE_UNFINISHED") and "You stopped before finishing" not in prompt:
         turn.append(dict(entry, id=f"t{len(calls)}", type="effect", title="Read file",
                          detail={"toolName": "read_file", "input": {"path": "app.py"}}, state={"status": "completed"}))
+    if os.environ.get("FAKE_VIBE_REWRITE_NOTICES"):
+        for i in range(3):
+            turn.append(dict(entry, id=f"n{len(calls)}{i}", type="notice", level="warning", detail={},
+                             message="Rewrote tool_input for 'bash'"))
     if os.environ.get("FAKE_VIBE_CANCEL"):
         turn[-1] = dict(turn[-1], content=[{"type": "text", "text": "<user_cancellation>User cancelled the operation.</user_cancellation>"}])
     # Like the real CLI, a resumed session prints the whole history, earlier turns included.
@@ -185,7 +189,7 @@ class DelegateTestBase(unittest.TestCase):
                     "MISTRAL_DELEGATE_MAX_TURNS", "MISTRAL_DELEGATE_WORKTREES", "FAKE_VIBE_STORAGE",
                     "FAKE_VIBE_TOUCH_APP", "FAKE_VIBE_HOOK_CALLS", "FAKE_VIBE_NO_WRITE", "FAKE_VIBE_CANCEL",
                     "FAKE_VIBE_MODEL", "FAKE_VIBE_EXPERIMENT_PRICE", "FAKE_VIBE_SPEND", "FAKE_VIBE_EFFECTS",
-                    "FAKE_VIBE_UNFINISHED", "FAKE_VIBE_CACHED", "FAKE_VIBE_CACHED_COMPLETION"):
+                    "FAKE_VIBE_UNFINISHED", "FAKE_VIBE_CACHED", "FAKE_VIBE_CACHED_COMPLETION", "FAKE_VIBE_REWRITE_NOTICES"):
             self.env.pop(var, None)
 
     def tearDown(self):
@@ -572,6 +576,44 @@ class WriteModeTest(DelegateTestBase):
         self.run_delegate("--adopt", self.value(out, "run_id"))
         stats = self.run_delegate("--stats").stdout
         self.assertRegex(stats, r"tests .* x\d")
+
+    def test_autofix_entries_can_be_limited_to_paths(self):
+        (self.repo / ".mistral-delegate.toml").write_text(textwrap.dedent("""\
+            autofix = [
+              { cmd = "touch frontend_fixed", paths = ["frontend/"] },
+              { cmd = "touch backend_fixed", paths = ["backend/"] },
+            ]
+        """))
+        out = self.run_delegate("--mode", "write", "--scope", "frontend/src/**", "--fix-attempts", "0",
+                                "--verify", "test ! -f test_app.py", "Task")
+        self.assertIn("autofix: ran touch frontend_fixed", out.stdout)
+        self.assertNotIn("backend_fixed", out.stdout)
+
+    def test_no_paid_continuation_when_changes_pass_the_checks(self):
+        out = self.run_delegate("--mode", "write", "--verify", "true", "Task", FAKE_VIBE_UNFINISHED="1")
+        self.assertEqual(len(self.calls()), 1)
+        self.assertIn("wasn't asked to finish", out.stdout)
+        self.assertNotIn("final_message_warning", out.stdout)
+
+    def test_continuation_when_checks_fail(self):
+        out = self.run_delegate("--mode", "write", "--fix-attempts", "0", "--verify", "test ! -f test_app.py",
+                                "Task", FAKE_VIBE_UNFINISHED="1")
+        self.assertEqual(len(self.calls()), 2)
+        self.assertIn("You stopped before finishing", self.calls()[1]["prompt"])
+
+    def test_full_diff_is_saved_and_outlives_the_worktree(self):
+        out = self.run_delegate("--mode", "write", "--diff-lines", "0", "Task")
+        self.assertIn("diff: ", out.stdout)
+        self.assertIn("too long to show here. Read it from ", out.stdout)
+        diff_file = Path(out.stdout.split("Read it from ")[1].split("\n")[0])
+        self.assertIn("+def test_app():", diff_file.read_text())
+        self.run_delegate("--adopt", self.value(out, "run_id"))
+        self.assertTrue(diff_file.exists())
+
+    def test_guard_rewrite_notices_are_collapsed(self):
+        out = self.run_delegate("Task", FAKE_VIBE_REWRITE_NOTICES="1")
+        self.assertNotIn("Rewrote tool_input for 'bash'", out.stdout)
+        self.assertIn("3 tool-input rewrite notice(s)", out.stdout)
 
     def test_no_changes_is_its_own_status(self):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_NO_WRITE="1")
@@ -1057,6 +1099,8 @@ class UnfinishedRunTest(unittest.TestCase):
         self.assertIn("mid-sentence", f([msg("AppLayout triggers advisors.load()…")], "AppLayout triggers advisors.load()…"))
         self.assertEqual(f([msg("Added tests in src/a.test.ts.")], "Added tests in src/a.test.ts."), "")
         self.assertEqual(f([msg("- src/a.test.ts: new tests")], "- src/a.test.ts: new tests"), "")
+        summary = "Added tests for the shop list: paused shops, renamed shops, and the empty state. Files: a.test.ts."
+        self.assertEqual(f([msg(summary), tool], summary), "")  # a trailing read after a real summary is fine
 
 
 class CostStatsTest(unittest.TestCase):

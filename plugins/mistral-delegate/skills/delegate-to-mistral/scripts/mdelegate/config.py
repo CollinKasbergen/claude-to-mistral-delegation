@@ -72,7 +72,7 @@ def _as_list(value) -> list[str]:
 
 
 def _as_checks(value, warnings: list[str]) -> list[dict]:
-    """verify entries: "cmd" or {cmd = "...", paths = ["frontend/", ...]} (run only when those paths are involved)."""
+    """verify/autofix entries: "cmd" or {cmd = "...", paths = ["frontend/", ...]} (run only when those paths are involved)."""
     checks = []
     for item in value if isinstance(value, list) else [value]:
         if isinstance(item, str) and item.strip():
@@ -182,7 +182,7 @@ def load(repo_root: str | None) -> dict:
             except (TypeError, ValueError):
                 settings["warnings"].append(f"ignored token_weights.{key}: use a number")
     settings["token_weights"] = weights
-    settings["autofix"] = _as_list(settings["autofix"])
+    settings["autofix"] = _as_checks(settings["autofix"], settings["warnings"])
     settings["fix_after_cap"] = bool(settings["fix_after_cap"])
     try:
         settings["monthly_credit"] = float(settings["monthly_credit"]) if settings["monthly_credit"] else None
@@ -245,7 +245,7 @@ def describe(settings: dict) -> str:
         f"monthly_credit: " + (f"{settings['currency']}{settings['monthly_credit']:.2f}, resets on day {settings['credit_reset_day']}"
                                if settings['monthly_credit'] else "(not set)"),
         f"min_savings: {settings['min_savings'] or '(not set)'}",
-        f"autofix: {', '.join(settings['autofix']) or '(none)'}",
+        f"autofix: {'; '.join(check_label(c) for c in settings['autofix']) or '(none)'}",
         f"worktrees_dir: {settings['worktrees_dir'] or '(automatic: ~/.mistral-delegate/worktrees, or <repo parent>/.mistral-worktrees when the repo is on another disk)'}",
     ]
     for mode in ("read", "write"):
