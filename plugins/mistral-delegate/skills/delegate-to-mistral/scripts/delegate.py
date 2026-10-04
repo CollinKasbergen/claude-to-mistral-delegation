@@ -1,38 +1,34 @@
 #!/usr/bin/env python3
-"""Run one task through Mistral's Vibe CLI in programmatic mode and print a compact report.
+"""Hand a task to Mistral's Vibe CLI and print a compact report for Claude Code.
 
-The report is meant to be read by Claude Code: the final answer from Vibe, what
-the run cost, the session id (for follow-ups), any tool calls that did not
-complete, and, in write mode, the worktree and the changes Vibe made. The full
-message history stays out of Claude's context.
-
-Usage:
+Running a task:
   delegate.py --mode read  "Find every place that parses config.toml"
-  delegate.py --mode write "Add unit tests for utils/slugify.py"
+  delegate.py --mode write --kind tests --verify "npm test" "Add unit tests for src/slugify.ts"
+  delegate.py --mode write --kind feature --spec plan.md --context src/api/users.ts \\
+      --allow-command "npm test" --verify "npm test" --verify "npx tsc --noEmit" -
   delegate.py --mode write --worktree-name mistral-ab12cd34 --resume <session-id> "Also cover empty strings"
-  echo "long prompt" | delegate.py --mode read -
 
-Write mode creates its own git worktree from HEAD, copies your uncommitted and
-untracked files into it (so Vibe sees work you haven't committed), commits that
-copy as a snapshot inside the worktree, and symlinks dependency folders such as
-node_modules and .venv from your checkout. Vibe's changes are then reported
-relative to the snapshot, with a command to apply them to your checkout.
+Managing runs:
+  delegate.py --status             running and recent delegations
+  delegate.py --result ID          the full report of a run
+  delegate.py --adopt ID           apply a write run's changes to your checkout and remove its worktree
+  delegate.py --adopt ID --paths src/a.ts src/b.ts    apply only some files
+  delegate.py --discard ID --note "why"               drop a run's worktree
+  delegate.py --stats              track record per kind of task
+  delegate.py --show-config        effective policy, caps, model and commands
 
-Vibe behaviour this script relies on (checked against mistral-vibe 2.25.x):
-  * `--output json` prints a JSON list of history entries (camelCase keys).
-  * In programmatic mode, any tool call that needs approval is denied, not
-    prompted. `--auto-approve` lifts that.
-  * Hitting --max-turns / --max-price / --max-tokens exits 1 with the last
-    assistant text on stderr and nothing on stdout.
-  * Each session writes $VIBE_HOME/logs/session/<prefix>_<time>_<id[:8]>/meta.json
-    whose "stats" include session_cost, steps and token counts.
+Write mode works in its own git worktree that starts from your current code,
+uncommitted and untracked files included, with dependency folders such as
+node_modules symlinked in. With --verify, the wrapper runs your checks after
+Vibe finishes and, if one fails, sends the output back to the same Vibe session
+for a fix (--fix-attempts, default 1). With --allow-command, Vibe may run those
+commands itself while it works. Settings can live in ~/.mistral-delegate/config.toml
+or <repo>/.mistral-delegate.toml; see --show-config.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import os
 import re
 import shlex
@@ -43,384 +39,80 @@ import time
 import uuid
 from pathlib import Path
 
-READ_ONLY_TOOLS = ["read_file", "grep", "todo"]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# Ignored directories with these names are symlinked from the checkout into the worktree.
-DEPENDENCY_DIRS = {"node_modules", ".venv", "venv", "vendor", "bower_components"}
+from mdelegate import config, gitops, ledger, vibe  # noqa: E402
+from mdelegate.gitops import DelegateError, git  # noqa: E402
 
-STATE_FILE = "mistral-delegate.json"
-
-DEFAULTS = {
-    "read": {"max_turns": 15, "max_price": 0.25},
-    "write": {"max_turns": 30, "max_price": 1.00},
-}
-
+KINDS = ("tests", "feature", "bugfix", "refactor", "migration", "boilerplate", "docs", "search", "other")
 MAX_RESULT_CHARS = 12_000
-
-GIT_IDENTITY = ["-c", "user.name=mistral-delegate", "-c", "user.email=mistral-delegate@localhost",
-                "-c", "commit.gpgsign=false"]
-
-
-class DelegateError(Exception):
-    pass
-
-
-def env_float(name: str, fallback: float) -> float:
-    try:
-        return float(os.environ[name])
-    except (KeyError, ValueError):
-        return fallback
-
-
-def env_int(name: str, fallback: int) -> int:
-    try:
-        return int(os.environ[name])
-    except (KeyError, ValueError):
-        return fallback
+CHECK_OUTPUT_LINES = 60
+CHECK_OUTPUT_CHARS = 5_000
+SCRIPT = Path(__file__).resolve()
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("task", help="Task for Vibe. Use '-' to read it from stdin.")
-    p.add_argument("--mode", choices=["read", "write"], default="read",
-                   help="read: plan agent, read-only tools, runs in place. "
-                        "write: accept-edits agent, runs in an isolated git worktree.")
-    p.add_argument("--workdir", default=os.getcwd(), help="Project directory (default: cwd).")
-    p.add_argument("--max-turns", type=int)
-    p.add_argument("--max-price", type=float, help="Dollar cap for this run.")
-    p.add_argument("--max-tokens", type=int)
-    p.add_argument("--worktree-name",
-                   help="Worktree/branch name in write mode (default: mistral-<id>). "
-                        "An existing worktree with this name is reused, e.g. for follow-ups.")
-    p.add_argument("--in-place", action="store_true",
-                   help="Write mode only: edit the working tree directly instead of a worktree.")
-    p.add_argument("--no-snapshot", action="store_true",
-                   help="Write mode: start the worktree from HEAD only, without your uncommitted changes.")
-    p.add_argument("--no-link-deps", action="store_true",
-                   help="Write mode: don't symlink node_modules, .venv etc. into the worktree.")
-    p.add_argument("--link", action="append", default=[], metavar="PATH",
-                   help="Write mode: also symlink this path (relative to the repo root, e.g. .env) "
-                        "into the worktree. Repeatable.")
-    p.add_argument("--allow-shell", action="store_true",
-                   help="Pass --auto-approve so Vibe may run shell commands. Off by default.")
-    p.add_argument("--trust", action="store_true",
-                   help="Load the project's .vibe/ config and AGENTS.md for this run "
-                        "(always on for write-mode worktrees).")
-    p.add_argument("--resume", metavar="SESSION_ID", help="Continue an earlier Vibe session.")
-    p.add_argument("--agent", help="Override the Vibe agent profile.")
-    p.add_argument("--timeout", type=int, default=env_int("MISTRAL_DELEGATE_TIMEOUT", 900),
-                   help="Seconds before the run is killed (default 900).")
-    p.add_argument("--vibe-bin", default=os.environ.get("VIBE_BIN", "vibe"))
-    args = p.parse_args(argv)
+    p.add_argument("task", nargs="?", help="Task for Vibe. Use '-' to read it from stdin.")
 
-    if args.task == "-":
-        args.task = sys.stdin.read()
-    if not args.task.strip():
-        p.error("task is empty")
-    if args.in_place and args.mode != "write":
-        p.error("--in-place only applies to --mode write")
+    run = p.add_argument_group("running a task")
+    run.add_argument("--mode", choices=["read", "write"], default="read",
+                     help="read: read-only tools, runs in place. write: edits, in an isolated git worktree.")
+    run.add_argument("--kind", choices=KINDS, help="Kind of task, for the track record (default: search/other).")
+    run.add_argument("--workdir", default=os.getcwd(), help="Project directory (default: cwd).")
+    run.add_argument("--spec", metavar="FILE", help="Include this spec/plan file in the prompt.")
+    run.add_argument("--context", action="append", default=[], metavar="PATH",
+                     help="A file Vibe should read before starting. Repeatable.")
+    run.add_argument("--verify", action="append", default=[], metavar="CMD",
+                     help="Write mode: a check to run after Vibe finishes (e.g. 'npm test'). Repeatable. "
+                          "Replaces the configured checks.")
+    run.add_argument("--no-verify", action="store_true", help="Skip the configured checks.")
+    run.add_argument("--fix-attempts", type=int, help="Times to send a failing check back to Vibe (default 1).")
+    run.add_argument("--verify-timeout", type=int, default=600, help="Seconds per check (default 600).")
+    run.add_argument("--allow-command", action="append", default=[], metavar="CMD",
+                     help="Write mode: a command prefix Vibe may run itself (e.g. 'npm test'). Repeatable, "
+                          "added to the configured ones.")
+    run.add_argument("--allow-shell", action="store_true",
+                     help="Pass --auto-approve so Vibe may run any shell command. Off by default.")
+    run.add_argument("--model", help="Vibe model alias for this run (must exist in your Vibe config).")
+    run.add_argument("--policy", choices=config.POLICIES, help="Override the delegation policy for this run's caps.")
+    run.add_argument("--max-turns", type=int)
+    run.add_argument("--max-price", type=float, help="Dollar cap for Vibe's first pass.")
+    run.add_argument("--max-tokens", type=int)
+    run.add_argument("--worktree-name", help="Worktree/branch name (default: the run id). An existing "
+                                             "worktree with this name is reused, e.g. for follow-ups.")
+    run.add_argument("--in-place", action="store_true", help="Write mode: edit the checkout directly.")
+    run.add_argument("--no-snapshot", action="store_true",
+                     help="Write mode: start from HEAD, without your uncommitted changes.")
+    run.add_argument("--no-link-deps", action="store_true",
+                     help="Write mode: don't symlink node_modules, .venv etc. into the worktree.")
+    run.add_argument("--link", action="append", default=[], metavar="PATH",
+                     help="Write mode: also symlink this path (relative to the repo root, e.g. .env). Repeatable.")
+    run.add_argument("--trust", action="store_true",
+                     help="Load the project's .vibe/ config and AGENTS.md (always on in worktrees).")
+    run.add_argument("--resume", metavar="SESSION_ID", help="Continue an earlier Vibe session.")
+    run.add_argument("--agent", help="Use this Vibe agent profile instead of the generated one.")
+    run.add_argument("--timeout", type=int, default=int(os.environ.get("MISTRAL_DELEGATE_TIMEOUT", 900)),
+                     help="Seconds before a Vibe call is killed (default 900).")
+    run.add_argument("--diff-lines", type=int, default=300,
+                     help="Include the full diff in the report when it is at most this many lines (0: never).")
+    run.add_argument("--vibe-bin", default=os.environ.get("VIBE_BIN", "vibe"))
 
-    d = DEFAULTS[args.mode]
-    if args.max_turns is None:
-        args.max_turns = env_int("MISTRAL_DELEGATE_MAX_TURNS", d["max_turns"])
-    if args.max_price is None:
-        args.max_price = env_float("MISTRAL_DELEGATE_MAX_PRICE", d["max_price"])
-    if args.max_tokens is None and "MISTRAL_DELEGATE_MAX_TOKENS" in os.environ:
-        args.max_tokens = env_int("MISTRAL_DELEGATE_MAX_TOKENS", 0) or None
-    return args
-
-
-def build_command(args: argparse.Namespace, in_worktree: bool) -> list[str]:
-    cmd = [
-        args.vibe_bin,
-        "--prompt", args.task,
-        "--output", "json",
-        "--max-turns", str(args.max_turns),
-        "--max-price", str(args.max_price),
-    ]
-    if args.max_tokens:
-        cmd += ["--max-tokens", str(args.max_tokens)]
-
-    if args.mode == "read":
-        cmd += ["--agent", args.agent or "plan"]
-        for tool in READ_ONLY_TOOLS:
-            cmd += ["--enabled-tools", tool]
-    else:
-        cmd += ["--agent", args.agent or "accept-edits"]
-        if args.allow_shell:
-            cmd += ["--auto-approve"]
-
-    if args.trust or in_worktree:
-        cmd += ["--trust"]
-    if args.resume:
-        cmd += ["--resume", args.resume]
-    return cmd
+    manage = p.add_argument_group("managing runs")
+    manage.add_argument("--status", action="store_true", help="List running and recent delegations.")
+    manage.add_argument("--stats", action="store_true", help="Show the track record per kind of task.")
+    manage.add_argument("--result", metavar="ID", help="Print the full report of a run.")
+    manage.add_argument("--adopt", metavar="ID", help="Apply a write run's changes to your checkout.")
+    manage.add_argument("--discard", metavar="ID", help="Discard a write run and remove its worktree.")
+    manage.add_argument("--paths", nargs="+", metavar="PATH", help="With --adopt: only apply these paths.")
+    manage.add_argument("--note", help="With --discard/--adopt: why, for the track record.")
+    manage.add_argument("--keep-worktree", action="store_true", help="With --adopt: keep the worktree.")
+    manage.add_argument("--show-config", action="store_true", help="Print the effective settings.")
+    return p.parse_args(argv)
 
 
-# --- git helpers -------------------------------------------------------------
-
-def git(cwd: str | Path, *argv: str) -> str:
-    """Run git and return stdout, or "" on any failure."""
-    try:
-        out = subprocess.run(["git", "-C", str(cwd), *argv], capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return out.stdout if out.returncode == 0 else ""
-
-
-def git_checked(cwd: str | Path, *argv: str, input: bytes | None = None) -> bytes:
-    """Run git and return stdout bytes, raising DelegateError on failure."""
-    try:
-        out = subprocess.run(["git", "-C", str(cwd), *argv], capture_output=True, input=input, timeout=300)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise DelegateError(f"git {' '.join(argv[:2])} failed: {e}") from e
-    if out.returncode != 0:
-        msg = out.stderr.decode(errors="replace").strip()
-        raise DelegateError(f"git {' '.join(argv[:2])} failed: {msg}")
-    return out.stdout
-
-
-def find_worktree(repo: str | Path, branch: str) -> str | None:
-    path = None
-    for line in git(repo, "worktree", "list", "--porcelain").splitlines():
-        if line.startswith("worktree "):
-            path = line[len("worktree "):]
-        elif line == f"branch refs/heads/{branch}":
-            return path
-    return None
-
-
-def worktree_root(toplevel: str) -> Path:
-    custom = os.environ.get("MISTRAL_DELEGATE_WORKTREES")
-    base = Path(custom).expanduser() if custom else Path.home() / ".mistral-delegate" / "worktrees"
-    digest = hashlib.sha1(toplevel.encode()).hexdigest()[:8]
-    return base / f"{Path(toplevel).name}-{digest}"
-
-
-def state_path(worktree: str | Path) -> Path:
-    return Path(git(worktree, "rev-parse", "--absolute-git-dir").strip()) / STATE_FILE
-
-
-def load_state(worktree: str | Path) -> dict:
-    try:
-        return json.loads(state_path(worktree).read_text())
-    except (OSError, ValueError):
-        return {}
-
-
-def exclude_pathspecs(links: list[str]) -> list[str]:
-    return [f":(top,exclude){link}" for link in links]
-
-
-# --- worktree preparation ----------------------------------------------------
-
-def snapshot_uncommitted(toplevel: str, worktree: Path) -> dict | None:
-    """Copy tracked changes and untracked files from the checkout and commit them in the worktree."""
-    diff = git_checked(toplevel, "diff", "HEAD", "--binary")
-    untracked = [f for f in git_checked(toplevel, "ls-files", "--others", "--exclude-standard", "-z")
-                 .decode().split("\0") if f]
-    if not diff.strip() and not untracked:
-        return None
-    if diff.strip():
-        git_checked(worktree, "apply", "--binary", "--whitespace=nowarn", "-", input=diff)
-    for rel in untracked:
-        src, dst = Path(toplevel, rel), worktree / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if src.is_symlink():
-            os.symlink(os.readlink(src), dst)
-        elif src.is_file():
-            shutil.copy2(src, dst)
-    git_checked(worktree, "add", "-A")
-    git_checked(worktree, *GIT_IDENTITY, "commit", "-q", "--no-verify",
-                "-m", "mistral-delegate: snapshot of uncommitted work")
-    changed = len([line for line in git(toplevel, "diff", "HEAD", "--name-only").splitlines() if line])
-    return {"modified": changed, "untracked": len(untracked)}
-
-
-def link_dependencies(toplevel: str, worktree: Path, extra: list[str], auto: bool) -> list[str]:
-    candidates: list[str] = []
-    if auto:
-        listing = git(toplevel, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z")
-        for entry in listing.split("\0"):
-            entry = entry.rstrip("/")
-            if entry and Path(entry).name in DEPENDENCY_DIRS:
-                candidates.append(entry)
-    candidates += [e.strip("/") for e in extra]
-
-    linked = []
-    for rel in dict.fromkeys(candidates):
-        src, dst = Path(toplevel, rel), worktree / rel
-        if not src.exists() or dst.exists() or dst.is_symlink():
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(src, dst, target_is_directory=src.is_dir())
-        linked.append(rel)
-    return linked
-
-
-def prepare_worktree(args: argparse.Namespace, toplevel: str) -> dict:
-    name = args.worktree_name or f"mistral-{uuid.uuid4().hex[:8]}"
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
-        raise DelegateError(f"Invalid worktree name: {name!r} (use letters, digits, '.', '_' and '-')")
-
-    existing = find_worktree(toplevel, name)
-    if existing:
-        state = load_state(existing)
-        return {
-            "name": name,
-            "path": existing,
-            "base": state.get("base") or git(existing, "rev-parse", "HEAD").strip(),
-            "snapshot": state.get("snapshot"),
-            "links": state.get("links", []),
-            "reused": True,
-        }
-    if git(toplevel, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}").strip():
-        raise DelegateError(f"Branch {name!r} already exists without a worktree. Pick another --worktree-name.")
-
-    path = worktree_root(toplevel) / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    git_checked(toplevel, "worktree", "add", "-q", "-b", name, str(path), "HEAD")
-
-    snapshot = None if args.no_snapshot else snapshot_uncommitted(toplevel, path)
-    links = link_dependencies(toplevel, path, args.link, auto=not args.no_link_deps)
-    state = {
-        "base": git(path, "rev-parse", "HEAD").strip(),
-        "snapshot": snapshot,
-        "links": links,
-    }
-    state_path(path).write_text(json.dumps(state))
-    return {"name": name, "path": str(path), "reused": False, **state}
-
-
-# --- Vibe output and session stats -------------------------------------------
-
-def text_of(entry: dict) -> str:
-    return "\n\n".join(
-        block.get("text", "")
-        for block in entry.get("content") or []
-        if isinstance(block, dict) and block.get("type") == "text"
-    ).strip()
-
-
-def summarize_history(history: list) -> dict:
-    session_id = None
-    final_text = ""
-    tool_calls = 0
-    problems: list[str] = []
-    notices: list[str] = []
-
-    for entry in history:
-        if not isinstance(entry, dict):
-            continue
-        session_id = session_id or entry.get("sessionId")
-        kind = entry.get("type")
-        if kind == "message" and entry.get("role") == "assistant":
-            text = text_of(entry)
-            if text:
-                final_text = text
-        elif kind == "effect":
-            tool_calls += 1
-            state = entry.get("state") or {}
-            status = state.get("status")
-            if status not in ("completed", None):
-                reason = state.get("reason") or (state.get("error") or {}).get("message") or ""
-                problems.append(f"{entry.get('title', 'tool')}: {status}" + (f" ({reason})" if reason else ""))
-            elif status == "completed" and state.get("decision") == "skip":
-                problems.append(f"{entry.get('title', 'tool')}: skipped (not approved)")
-        elif kind == "notice" and entry.get("level") in ("warning", "error"):
-            notices.append(f"{entry.get('level')}: {entry.get('message', '')}")
-
-    return {
-        "session_id": session_id,
-        "final_text": final_text,
-        "tool_calls": tool_calls,
-        "problems": problems,
-        "notices": notices,
-    }
-
-
-def parse_output(stdout: str) -> list:
-    stdout = stdout.strip()
-    if not stdout:
-        return []
-    try:
-        data = json.loads(stdout)
-    except json.JSONDecodeError:
-        # Tolerate stray lines before the JSON payload.
-        start = stdout.find("[")
-        if start == -1:
-            return []
-        try:
-            data = json.loads(stdout[start:])
-        except json.JSONDecodeError:
-            return []
-    if isinstance(data, dict):
-        data = data.get("history", [])
-    return data if isinstance(data, list) else []
-
-
-def session_log_dir() -> Path:
-    home = os.environ.get("VIBE_HOME")
-    return (Path(home).expanduser() if home else Path.home() / ".vibe") / "logs" / "session"
-
-
-def read_session_stats(session_id: str | None, cwd: str, since: float | None = None) -> dict | None:
-    """Find a session's stats in Vibe's session log.
-
-    With a session id, match it exactly. Without one (e.g. when a limit stopped the
-    run and nothing was printed), take the newest session written since `since`
-    for the same working directory.
-    """
-    log_dir = session_log_dir()
-    if not log_dir.is_dir():
-        return None
-    if session_id:
-        metas = list(log_dir.glob(f"*_{session_id[:8]}/meta.json"))
-    else:
-        dirs = sorted((d for d in log_dir.iterdir() if d.is_dir()), key=lambda d: d.stat().st_mtime)[-50:]
-        metas = [d / "meta.json" for d in dirs]
-    for meta_path in sorted(metas, key=lambda m: m.stat().st_mtime if m.exists() else 0, reverse=True):
-        try:
-            if since is not None and meta_path.stat().st_mtime < since - 1:
-                continue
-            meta = json.loads(meta_path.read_text())
-        except (OSError, ValueError):
-            continue
-        if session_id and meta.get("session_id") != session_id:
-            continue
-        workdir = (meta.get("environment") or {}).get("working_directory")
-        if not session_id and workdir and Path(workdir).resolve() != Path(cwd).resolve():
-            continue
-        stats = meta.get("stats")
-        if isinstance(stats, dict):
-            return {"session_id": meta.get("session_id"), **stats}
-    return None
-
-
-def stats_cost(stats: dict) -> float:
-    if "session_cost" in stats:
-        return float(stats["session_cost"])
-    prompt = stats.get("session_prompt_tokens", 0)
-    cached = min(stats.get("session_cached_tokens", 0), prompt)
-    in_price = stats.get("input_price_per_million", 0.0)
-    cached_price = stats.get("cached_input_price_per_million")
-    cached_price = in_price if cached_price is None else cached_price
-    out = stats.get("session_completion_tokens", 0) * stats.get("output_price_per_million", 0.0)
-    return ((prompt - cached) * in_price + cached * cached_price + out) / 1_000_000
-
-
-def usage_line(after: dict | None, before: dict | None, max_price: float) -> str:
-    if not after:
-        return f"usage: cost unknown (Vibe session log not found), cap ${max_price:.2f}"
-    before = before or {}
-    cost = stats_cost(after) - (stats_cost(before) if before else 0.0)
-    steps = after.get("steps", 0) - before.get("steps", 0)
-    tokens = (after.get("session_prompt_tokens", 0) + after.get("session_completion_tokens", 0)
-              - before.get("session_prompt_tokens", 0) - before.get("session_completion_tokens", 0))
-    line = f"usage: cost ${cost:.4f} of ${max_price:.2f} cap, {steps} steps, {tokens:,} tokens"
-    if before:
-        line += f" (this run; session total ${stats_cost(after):.4f})"
-    return line
+def script_cmd(*argv: str) -> str:
+    return " ".join(shlex.quote(a) for a in ("python3", str(SCRIPT), *argv))
 
 
 def truncate(text: str, limit: int = MAX_RESULT_CHARS) -> str:
@@ -429,133 +121,336 @@ def truncate(text: str, limit: int = MAX_RESULT_CHARS) -> str:
     return text[:limit] + f"\n\n[... truncated {len(text) - limit} chars ...]"
 
 
-# --- report ------------------------------------------------------------------
-
-def vibe_changes(wt: dict) -> str:
-    """Stage everything Vibe did (except our symlinks) and return the diffstat against the base."""
-    git(wt["path"], "add", "-A", "--", ".", *exclude_pathspecs(wt.get("links", [])))
-    return git(wt["path"], "diff", "--cached", "--stat", wt["base"]).rstrip()
+def tail(text: str) -> str:
+    lines = text.rstrip().splitlines()[-CHECK_OUTPUT_LINES:]
+    out = "\n".join(lines)
+    return out[-CHECK_OUTPUT_CHARS:]
 
 
-def remove_worktree(wt: dict, toplevel: str) -> None:
-    git(toplevel, "worktree", "remove", "--force", wt["path"])
-    git(toplevel, "branch", "-D", wt["name"])
+# --- managing runs -------------------------------------------------------------
+
+def find_run(run_id: str) -> dict:
+    run = ledger.load_runs().get(run_id)
+    if not run:
+        raise DelegateError(f"No run with id {run_id!r}. See --status.")
+    return run
 
 
-def worktree_report(wt: dict, toplevel: str) -> list[str]:
-    path, base = wt["path"], wt["base"]
-    q = shlex.quote
-    lines = [f"worktree_name: {wt['name']}" + ("  (reused)" if wt["reused"] else ""),
-             f"worktree_path: {path}"]
-    snap = wt.get("snapshot")
-    if snap:
-        lines.append(f"worktree_base: snapshot of your uncommitted work ({snap['modified']} modified, "
-                     f"{snap['untracked']} untracked files) at {base[:12]}")
+def cmd_adopt(args: argparse.Namespace) -> int:
+    run = find_run(args.adopt)
+    if ledger.state(run) == "running":
+        raise DelegateError("That run is still going. Wait for it to finish.")
+    wt = run.get("worktree")
+    if not wt:
+        if run.get("mode") != "write":
+            raise DelegateError("Read-only runs have nothing to adopt.")
+        ledger.append({"event": "outcome", "id": run["id"], "outcome": "adopted", "note": args.note})
+        print(f"Marked {run['id']} as adopted (it edited your checkout directly).")
+        return 0
+    if not os.path.isdir(wt["path"]):
+        raise DelegateError(f"The worktree {wt['path']} no longer exists.")
+    try:
+        files = gitops.apply_to_checkout(wt, args.paths)
+    except DelegateError as e:
+        raise DelegateError(f"{e}\nNothing was applied; the worktree is still at {wt['path']}. "
+                            "Your checkout may have changed the same lines: apply by hand or use --paths.") from e
+    if not files:
+        print("Nothing to apply" + (" for those paths." if args.paths else ": the run made no changes."))
+        return 0
+    outcome = "adopted_partial" if args.paths else "adopted"
+    ledger.append({"event": "outcome", "id": run["id"], "outcome": outcome, "paths": args.paths, "note": args.note})
+    print(f"Applied {len(files)} file(s) from {run['id']} to {wt['toplevel']}:")
+    print("\n".join(f"  {f}" for f in files))
+    if args.keep_worktree:
+        print(f"Worktree kept at {wt['path']}.")
     else:
-        lines.append(f"worktree_base: your HEAD at {base[:12]}")
-    if wt.get("links"):
-        lines.append("linked_from_checkout (symlinks, shared with your checkout): " + ", ".join(wt["links"]))
-
-    stat = vibe_changes(wt)
-    lines.append("changes_by_vibe:\n" + (stat or "  (none)"))
-    if stat:
-        lines.append(f"review_with: git -C {q(path)} diff --cached {base[:12]}")
-        lines.append(f"apply_to_checkout_with: git -C {q(path)} diff --cached --binary {base[:12]} "
-                     f"| git -C {q(toplevel)} apply")
-    lines.append(f"cleanup_with: git -C {q(toplevel)} worktree remove --force {q(path)} "
-                 f"&& git -C {q(toplevel)} branch -D {wt['name']}")
-    return lines
+        gitops.remove_worktree(wt)
+        print("Worktree removed.")
+    print("The changes are uncommitted in your checkout; review and commit them as usual.")
+    return 0
 
 
-def main(argv: list[str]) -> int:
-    args = parse_args(argv)
+def cmd_discard(args: argparse.Namespace) -> int:
+    run = find_run(args.discard)
+    if ledger.state(run) == "running":
+        raise DelegateError("That run is still going. Wait for it to finish.")
+    wt = run.get("worktree")
+    if wt and os.path.isdir(wt["path"]):
+        gitops.remove_worktree(wt)
+    ledger.append({"event": "outcome", "id": run["id"], "outcome": "discarded", "note": args.note})
+    print(f"Discarded {run['id']}" + (" and removed its worktree." if wt else "."))
+    return 0
+
+
+# --- running a task ------------------------------------------------------------
+
+class Run:
+    """State of one delegation while it executes."""
+
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.status = "error"
+        self.tool_calls = 0
+        self.problems: list[str] = []
+        self.notices: list[str] = []
+        self.final_text = ""
+        self.stderr = ""
+        self.session_id: str | None = args.resume
+
+    def call_vibe(self, cmd: list[str], cwd: str) -> None:
+        try:
+            proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                                  timeout=self.args.timeout, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            self.status = "timeout"
+            self.stderr = f"Vibe did not finish within {self.args.timeout}s and was stopped."
+            return
+        info = vibe.summarize_history(vibe.parse_output(proc.stdout))
+        self.stderr = proc.stderr.strip()
+        self.session_id = info["session_id"] or self.session_id
+        self.tool_calls += info["tool_calls"]
+        self.problems += info["problems"]
+        self.notices += info["notices"]
+        if info["final_text"]:
+            self.final_text = info["final_text"]
+        if proc.returncode == 0:
+            self.status = "ok"
+        elif (proc.returncode == 1 and not proc.stdout.strip() and self.stderr
+              and not re.match(r"(Error|Teleport error):", self.stderr) and "Traceback" not in self.stderr):
+            # Vibe reports a hit limit by printing the last assistant text to stderr, unprefixed.
+            self.status = "limit_reached"
+            self.final_text = self.final_text or self.stderr
+        else:
+            self.status = "error"
+
+
+def run_checks(commands: list[str], cwd: str, timeout: int) -> tuple[list[str], tuple | None]:
+    """Run checks in order until one fails. Returns (lines for the report, failure or None)."""
+    lines = []
+    for command in commands:
+        try:
+            proc = subprocess.run(command, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+            code, output = proc.returncode, proc.stdout
+        except subprocess.TimeoutExpired as e:
+            code = 124
+            output = (e.output or "") if isinstance(e.output, str) else (e.output or b"").decode(errors="replace")
+            output += f"\n[timed out after {timeout}s]"
+        lines.append(f"  {'pass' if code == 0 else 'FAIL'}: {command}" + ("" if code == 0 else f" (exit {code})"))
+        if code != 0:
+            return lines, (command, code, tail(output))
+    return lines, None
+
+
+def run_task(args: argparse.Namespace) -> int:
     workdir = str(Path(args.workdir).resolve())
+    if args.task == "-":
+        args.task = sys.stdin.read()
+    spec = None
+    if args.spec:
+        try:
+            spec = Path(args.spec).read_text(encoding="utf-8")
+        except OSError as e:
+            raise DelegateError(f"Can't read --spec file: {e}") from e
+    task = (args.task or "").strip() or ("Implement the spec below." if spec else "")
+    if not task:
+        raise DelegateError("No task given. Pass it as an argument, '-' for stdin, or use --spec.")
+    if args.mode == "read" and (args.verify or args.in_place or args.allow_command):
+        raise DelegateError("--verify, --allow-command and --in-place only apply to --mode write.")
+
+    top = gitops.toplevel(workdir)
+    settings = config.load(top or workdir)
+    if args.policy:
+        settings["policy"] = args.policy
+    caps = config.caps(settings, args.mode)
+    for key in ("max_turns", "max_price", "max_tokens"):
+        if getattr(args, key) is not None:
+            caps[key] = getattr(args, key)
+    model = args.model or settings["model"]
+    write = args.mode == "write"
+    verify = [] if (args.no_verify or not write) else (args.verify or settings["verify"])
+    allow_commands = list(dict.fromkeys(settings["allow_commands"] + args.allow_command)) if write else []
+    fix_attempts = settings["fix_attempts"] if args.fix_attempts is None else max(0, args.fix_attempts)
+    kind = args.kind or ("search" if args.mode == "read" else "other")
 
     if shutil.which(args.vibe_bin) is None and not Path(args.vibe_bin).is_file():
         print("status: error\n\nVibe CLI not found. Install it with `uv tool install mistral-vibe` "
               "(or `pip install mistral-vibe`), then run `vibe --setup` once to store your API key.")
         return 2
 
-    run_dir = workdir
-    wt = None
-    toplevel = ""
-    if args.mode == "write" and not args.in_place:
-        toplevel = git(workdir, "rev-parse", "--show-toplevel").strip()
-        if not toplevel:
+    active = ledger.running(ledger.load_runs())
+    if len(active) >= settings["max_parallel"]:
+        raise DelegateError(f"{len(active)} delegations are already running (max_parallel = "
+                            f"{settings['max_parallel']}): {', '.join(r['id'] for r in active)}. "
+                            "Wait for one to finish (see --status) or raise max_parallel in the config.")
+
+    prefix = "read" if not write else ("inplace" if args.in_place else "mistral")
+    run_id = f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+    run_dir, wt = workdir, None
+    if write and not args.in_place:
+        if not top:
             print("status: error\n\nWrite mode needs a git repository for worktree isolation. "
                   "Pass --in-place to let Vibe edit the directory directly.")
             return 2
         try:
-            wt = prepare_worktree(args, toplevel)
+            wt = gitops.prepare_worktree(top, args.worktree_name or run_id, snapshot=not args.no_snapshot,
+                                         link_deps=not args.no_link_deps, extra_links=args.link)
         except DelegateError as e:
             print(f"status: error\n\nCould not prepare the worktree: {e}")
             return 2
-        run_dir = str(Path(wt["path"]) / Path(workdir).relative_to(toplevel))
+        run_dir = str(Path(wt["path"]) / Path(workdir).relative_to(top))
 
-    stats_before = read_session_stats(args.resume, run_dir) if args.resume else None
-    cmd = build_command(args, in_worktree=wt is not None)
-    started_wall = time.time()
-    started = time.monotonic()
-    try:
-        proc = subprocess.run(cmd, cwd=run_dir, capture_output=True, text=True,
-                              timeout=args.timeout, stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired:
-        lines = ["status: timeout", f"Vibe did not finish within {args.timeout}s and was stopped."]
-        if wt:
-            lines += worktree_report(wt, toplevel)
-        print("\n".join(lines))
-        return 1
+    prompt = vibe.build_prompt(task, mode=args.mode, spec=spec, context=args.context, verify=verify,
+                               allow_commands=allow_commands, allow_shell=args.allow_shell)
+    agent = args.agent or vibe.write_agent_profile(args.mode, model, allow_commands)
+    trust = args.trust or wt is not None
+
+    ledger.append({"event": "start", "id": run_id, "pid": os.getpid(), "mode": args.mode, "kind": kind,
+                   "repo": Path(top or workdir).name, "workdir": workdir, "task": task[:500],
+                   "policy": settings["policy"], "model": model,
+                   "worktree": {k: wt[k] for k in ("name", "path", "toplevel", "base", "links")} if wt else None})
+
+    run = Run(args)
+    stats_before = vibe.read_session_stats(args.resume, run_dir) if args.resume else None
+    started_wall, started = time.time(), time.monotonic()
+    run.call_vibe(vibe.build_command(args.vibe_bin, prompt, mode=args.mode, agent=agent, caps=caps,
+                                     allow_shell=args.allow_shell, trust=trust, resume=args.resume), run_dir)
+
+    verification, check_lines, failure, attempts = "not_run", [], None, 0
+    if verify and run.status in ("ok", "limit_reached"):
+        check_lines, failure = run_checks(verify, run_dir, args.verify_timeout)
+        while failure and attempts < fix_attempts and run.status == "ok" and run.session_id:
+            attempts += 1
+            spent = vibe.stats_cost(vibe.read_session_stats(run.session_id, run_dir))
+            fix_caps = dict(caps, max_price=spent + caps["max_price"] * 0.5)
+            run.call_vibe(vibe.build_command(args.vibe_bin, vibe.fix_prompt(*failure), mode=args.mode, agent=agent,
+                                             caps=fix_caps, allow_shell=args.allow_shell, trust=trust,
+                                             resume=run.session_id), run_dir)
+            check_lines, failure = run_checks(verify, run_dir, args.verify_timeout)
+        verification = "failed" if failure else "passed"
     elapsed = time.monotonic() - started
 
-    history = parse_output(proc.stdout)
-    info = summarize_history(history)
-    stderr = proc.stderr.strip()
+    stats_after = vibe.read_session_stats(run.session_id, run_dir,
+                                          since=None if run.session_id else started_wall)
+    run.session_id = run.session_id or (stats_after or {}).get("session_id")
+    use = vibe.usage(stats_after, stats_before)
 
-    if proc.returncode == 0:
-        status = "ok"
-    elif (proc.returncode == 1 and not proc.stdout.strip() and stderr
-          and not re.match(r"(Error|Teleport error):", stderr) and "Traceback" not in stderr):
-        # Vibe reports a hit limit by printing the last assistant text to stderr, unprefixed.
-        status = "limit_reached"
+    lines = [f"run_id: {run_id}", f"status: {run.status}"]
+    if verify:
+        detail = f"after {attempts} fix attempt{'s' if attempts != 1 else ''}" if attempts else "first try"
+        if verification == "not_run":
+            lines.append("verification: not run (Vibe did not finish)")
+        else:
+            lines.append(f"verification: {verification} ({detail})\n" + "\n".join(check_lines))
+    lines.append(f"mode: {args.mode}, kind: {kind}, policy: {settings['policy']}" + (f", model: {model}" if model else ""))
+    if use:
+        line = f"usage: cost ${use['cost']:.4f} (first-pass cap ${caps['max_price']:.2f}), {use['steps']} steps, {use['tokens']:,} tokens"
+        if use["session_total"] is not None:
+            line += f" (this run; session total ${use['session_total']:.4f})"
+        lines.append(line)
     else:
-        status = "error"
+        lines.append(f"usage: cost unknown (Vibe session log not found), first-pass cap ${caps['max_price']:.2f}")
+    lines.append(f"elapsed: {elapsed:.0f}s, tool_calls: {run.tool_calls}, max_turns: {caps['max_turns']}")
+    model_warning = vibe.unknown_model_warning(model) if not args.agent else None
+    if model_warning:
+        lines.append(f"model_warning: {model_warning}")
+    if allow_commands:
+        lines.append("vibe_may_run: " + ", ".join(allow_commands))
+    if run.session_id:
+        lines.append(f"session_id: {run.session_id}  (follow up with: --resume {run.session_id}"
+                     + (f" --worktree-name {wt['name']})" if wt else ")"))
 
-    stats_after = read_session_stats(info["session_id"] or args.resume, run_dir,
-                                     since=None if (info["session_id"] or args.resume) else started_wall)
-    session_id = info["session_id"] or (stats_after or {}).get("session_id") or args.resume
+    files: list[str] = []
+    worktree_removed = False
+    if wt:
+        files = gitops.changed_files(wt)
+        if run.status in ("error", "timeout") and not wt["reused"] and not files:
+            gitops.remove_worktree(wt)
+            worktree_removed = True
+            lines.append(f"worktree: removed {wt['name']} (Vibe failed before changing anything)")
+        else:
+            lines += worktree_section(wt, run_id, files, args.diff_lines)
+    elif write:
+        status_out = git(workdir, "status", "--porcelain").rstrip()
+        files = [line[3:] for line in status_out.splitlines()]
+        lines.append("changed_files (in your checkout):\n" + (status_out or "  (none)"))
 
-    lines = [
-        f"status: {status}",
-        f"mode: {args.mode}",
-        usage_line(stats_after, stats_before, args.max_price),
-        f"elapsed: {elapsed:.0f}s, tool_calls: {info['tool_calls']}, max_turns: {args.max_turns}",
-    ]
-    if session_id:
-        follow_up = f"--resume {session_id}" + (f" --worktree-name {wt['name']}" if wt else "")
-        lines.append(f"session_id: {session_id}  (follow up with: {follow_up})")
+    if failure:
+        lines.append(f"failing_check_output ({failure[0]}):\n```\n{failure[2]}\n```")
+    if run.problems:
+        lines.append("tool_calls_not_completed:\n" + "\n".join(f"  - {p}" for p in run.problems[:20]))
+    if run.notices:
+        lines.append("vibe_notices:\n" + "\n".join(f"  - {n}" for n in run.notices[:10]))
+    if run.stderr and run.status != "ok" and run.stderr != run.final_text:
+        lines.append("stderr:\n" + truncate(run.stderr, 2000))
+    lines.append("\n--- result from Mistral Vibe ---\n" + (truncate(run.final_text) if run.final_text else "(no final message)"))
 
-    if wt and status == "error" and not wt["reused"] and not vibe_changes(wt):
-        remove_worktree(wt, toplevel)
-        lines.append(f"worktree: removed {wt['name']} (Vibe failed before changing anything)")
-    elif wt:
-        lines += worktree_report(wt, toplevel)
-    elif args.mode == "write":
-        lines.append("changed_files:\n" + (git(workdir, "status", "--porcelain").rstrip() or "  (none)"))
+    report = "\n".join(lines)
+    ledger.save_report(run_id, report)
+    ledger.append({"event": "end", "id": run_id, "status": run.status, "verification": verification,
+                   "fix_attempts_used": attempts, "cost": use["cost"] if use else None,
+                   "steps": use["steps"] if use else None, "tokens": use["tokens"] if use else None,
+                   "files_changed": len(files), "session_id": run.session_id,
+                   "worktree_removed": worktree_removed})
+    print(report)
+    return 0 if run.status == "ok" and verification != "failed" else 1
 
-    if info["problems"]:
-        lines.append("tool_calls_not_completed:\n" + "\n".join(f"  - {p}" for p in info["problems"][:20]))
-    if info["notices"]:
-        lines.append("vibe_notices:\n" + "\n".join(f"  - {n}" for n in info["notices"][:10]))
 
-    result = info["final_text"]
-    if not result and status != "ok":
-        result = stderr
-    elif stderr and status != "ok":
-        lines.append("stderr:\n" + truncate(stderr, 2000))
+def worktree_section(wt: dict, run_id: str, files: list[str], diff_lines: int) -> list[str]:
+    lines = [f"worktree_name: {wt['name']}" + ("  (reused)" if wt["reused"] else ""),
+             f"worktree_path: {wt['path']}"]
+    snap = wt.get("snapshot")
+    if snap:
+        lines.append(f"worktree_base: snapshot of your uncommitted work ({snap['modified']} modified, "
+                     f"{snap['untracked']} untracked files) at {wt['base'][:12]}")
+    else:
+        lines.append(f"worktree_base: your HEAD at {wt['base'][:12]}")
+    if wt.get("links"):
+        lines.append("linked_from_checkout (symlinks, shared with your checkout): " + ", ".join(wt["links"]))
+    stat = gitops.changes_stat(wt)
+    lines.append("changes_by_vibe:\n" + (stat or "  (none)"))
+    if files:
+        diff = gitops.changes_diff(wt)
+        n = diff.count("\n")
+        if 0 < n <= diff_lines:
+            lines.append(f"diff:\n```diff\n{diff.rstrip()}\n```")
+        else:
+            lines.append(f"diff: {n} lines, not shown. Review with: git -C {shlex.quote(wt['path'])} diff --cached {wt['base'][:12]}")
+        lines.append(f"adopt_with: {script_cmd('--adopt', run_id)}   (add --paths ... to take only some files)")
+    lines.append(f"discard_with: {script_cmd('--discard', run_id, '--note', 'why')}")
+    return lines
 
-    lines.append("\n--- result from Mistral Vibe ---\n" + (truncate(result) if result else "(no final message)"))
-    print("\n".join(lines))
-    return 0 if status == "ok" else 1
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    try:
+        if args.status:
+            print(ledger.format_status(ledger.load_runs()))
+            return 0
+        if args.stats:
+            print(ledger.format_stats(ledger.load_runs()))
+            return 0
+        if args.result:
+            report = ledger.read_report(args.result)
+            if report is None:
+                run = find_run(args.result)
+                print(f"{run['id']} is {ledger.state(run)}; no report yet.")
+                return 0 if ledger.state(run) == "running" else 1
+            print(report)
+            return 0
+        if args.show_config:
+            top = gitops.toplevel(str(Path(args.workdir).resolve()))
+            print(config.describe(config.load(top or args.workdir)))
+            return 0
+        if args.adopt:
+            return cmd_adopt(args)
+        if args.discard:
+            return cmd_discard(args)
+        return run_task(args)
+    except DelegateError as e:
+        print(f"status: error\n\n{e}")
+        return 2
 
 
 if __name__ == "__main__":
