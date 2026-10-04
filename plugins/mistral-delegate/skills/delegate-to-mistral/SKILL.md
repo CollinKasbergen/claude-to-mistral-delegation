@@ -23,13 +23,27 @@ The session context may also show:
 - **A track record** per kind of task: adoption rate, checks passed, and **savings**, meaning the Claude work that adopted runs replaced per token you spent delegating. Delegate more of the kinds that pay off. A kind listed under "hasn't paid off" (below the user's `min_savings`) is one to keep yourself unless its spec is tiny.
 - **Mistral credit:** how much of the month's subscription credit is used. Delegate freely while plenty is left. Near the end, delegate only the clearest, best-paying kinds, and when it's nearly gone, keep work yourself unless the user says otherwise.
 
+## Documents: what lives where
+
+| Document | Where | Written by | Read by |
+|---|---|---|---|
+| Plan (several steps) | `<repo>/.mistral-delegate/plans/<name>.md` | you | the wrapper; each Mistral run sees only its own step |
+| Spec (one step) | `<repo>/.mistral-delegate/specs/<name>.md` | you | the wrapper, into Mistral's prompt |
+| Standing rules for Mistral's code | the project's `AGENTS.md` | you or the user, committed | Mistral, on every run (Vibe loads it) |
+| Settings | `<repo>/.mistral-delegate.toml` | the user | the wrapper |
+| Run records: `report.md`, `spec.md`, `changes.diff`, `guard.jsonl`, a plan's `plan.md` and step specs and logs | `~/.mistral-delegate/runs/<run or plan id>/` | the wrapper | you, through `--result <id>` or the `diff:` line |
+
+- **Plans and specs go in `.mistral-delegate/`**, never in a scratch or temp folder: they survive a session restart, git ignores the folder, and it's never copied into Mistral's worktrees, so no run reads another run's instructions. Pass the name: `--plan teams`, `--spec teams-endpoint` (a path works too). Name them after the change, e.g. `teams-page.md`.
+- **Don't write plans, specs or notes anywhere else in the repo.** A stray file is copied into every worktree, and Mistral may take it for instructions. Mistral's prompt tells it that only the prompt and `AGENTS.md` are instructions.
+- **A recurring problem in Mistral's code** (wordy queries, filtering in Python instead of SQL, loose assertions) is a rule for `AGENTS.md`, written once, rather than a line repeated in every spec. Suggest it to the user when you see it twice.
+
 ## Running a task
 
 The wrapper path is in the session context (or `scripts/delegate.py` in this skill's base directory).
 
 ```bash
 python3 <wrapper> --mode write --kind feature \
-  --spec /tmp/spec.md --context src/api/users.ts --context src/api/users.test.ts \
+  --spec teams-endpoint --context src/api/users.ts --context src/api/users.test.ts \
   --scope "src/api/teams.ts" --scope "src/api/teams.test.ts" \
   --verify "npm test" --verify "npx tsc --noEmit" \
   --allow-command "npm test" \
@@ -40,7 +54,7 @@ python3 <wrapper> --mode write --kind feature \
 - `--mode write`: a new worktree starting from the current code (uncommitted and untracked files included). Ignored `node_modules`, `.venv` and similar folders come in as real folders by default (copy-on-write clones where the disk supports it, else hard links shared with the checkout), so tools like Vite accept them. `--deps-mode copy|symlink|none` changes that, and `--link .env` adds a symlink to another path. `--in-place` edits the checkout directly; use it only when the user asks.
 - `--scope GLOB` (repeatable, relative to the repo root): the files Mistral may create or change. **Always set it for write tasks.** Mistral is told to stay inside it, and changes outside it are flagged near the top of the report as `out_of_scope_changes`. `--adopt` then stops and lists them until you choose `--include-out-of-scope` or `--skip-out-of-scope`. A tests-only task gets only the test files as scope. `*` also matches `/`. New files named literally in the scope must exist when the run ends: a missing one gets Mistral one request to create it, and otherwise the run is `incomplete`. A resume may use a narrower scope for its fix; the worktree's scope is then the combination of its runs' scopes, so the earlier run's files aren't treated as out of scope.
 - `--kind`: one of `tests feature bugfix refactor migration boilerplate docs search other`. It feeds the track record, so always set it.
-- `--spec FILE`: the plan, included in the prompt. Write it to a temp file outside the repo. `--context PATH` (repeatable) names files Mistral should read first.
+- `--spec NAME`: the spec, included in the prompt. Write it to `.mistral-delegate/specs/<name>.md` and pass the name (see Documents). `--context PATH` (repeatable) names files Mistral should read first.
 - `--verify CMD` (repeatable): checks the wrapper runs after Mistral finishes. On a failure, the output goes back to the same Mistral session for a fix (`--fix-attempts N`, default 1). **Always pass the project's real checks when they exist.** Configured checks apply automatically (see below).
   - Before Mistral starts, the checks also run once on the untouched worktree (the baseline; `--no-baseline` turns it off). Checks that already fail there are reported as `already failing before Mistral changed anything`. Mistral is told not to work around them, and they never trigger a fix round.
   - When the worktree is on a different disk than the repo, `node_modules` can't be hard-linked and becomes a symlink, which breaks some tools (Vite, vitest mocks). By default the plugin then puts worktrees in `<repo parent>/.mistral-worktrees`. `worktrees_dir` in the config sets the location explicitly.
@@ -86,7 +100,7 @@ What to build in this step.
 
 - **Format:** `# Title`, then optional plan settings (`verify:` checks for the merged result, `kind:` default kind), then the shared context. Each `## step: <id> - <title>` starts with its settings: `scope`, `context`, `depends` (comma-separated), `verify`, `allow` (one command per line, may repeat), `kind`. The rest is that step's instructions. A step gets the shared context, its own instructions, and one line about every other step; write each step as you'd write a spec.
 - **Split by file:** steps that change the same file conflict when merged (the report says so, and the later step isn't merged). Give each step its own files, and make a step that builds on another `depends` on it.
-- **Run it in the background:** `python3 <wrapper> --plan /tmp/plan-teams.md` (Bash `run_in_background`; it takes as long as its slowest chain of steps). `--steps api,ui` runs only some. Caps and flags (`--fix-attempts`, `--max-price`, ...) apply to each step. `--status` shows the plan and its steps while they run.
+- **Run it in the background:** write it to `.mistral-delegate/plans/teams-page.md`, then `python3 <wrapper> --plan teams-page` (Bash `run_in_background`; it takes as long as its slowest chain of steps). `--steps api,ui` runs only some. Caps and flags (`--fix-attempts`, `--max-price`, ...) apply to each step. `--status` shows the plan and its steps while they run.
 - **The report:** `status: ok` (every step merged), `partial` or `failed`. One line per step (`-> merged`, `not merged: conflicts with ... in <files>`, `skipped: needs <step>`, or how to resume it), `step_notes` (warnings from the steps' own reports), `verification` of the merged result, usage and credit, the combined diff, and `adopt_with`. `--result <step run id>` prints a step's own report when you need detail.
 - **Finishing a step that failed:** resume it with the `--resume <session> --worktree-name <name>` the report gives, then `--integrate <plan id>` to merge again and recheck. Its report comes back like the first.
 - **Adopt or discard the plan, never a step:** `--adopt <plan id>` applies the merged result; `--adopt <plan id> --steps api` only those steps (with what they depend on); `--discard <plan id>` drops it all. `--include-out-of-scope` / `--skip-out-of-scope` work as for a run.
@@ -145,6 +159,7 @@ Out of scope: <what not to touch>.
 
 - **Parallel runs on one file:** when two runs edit the same file, give each an exact insertion point (after which function or heading, or before which line) and keep their edits apart. Better still, split the work by file.
 - **New files:** name every new file literally in `--scope` (the wrapper creates its folders). When parallel runs both need a new shared file, such as an index or barrel, create an empty placeholder in the checkout before starting them, so each run adds to it instead of creating it.
+- **Ask for exact assertions.** Mistral's tests tend to check that a value is somewhere ("the row contains a 1 and a 0") instead of the exact value in the exact place, and to copy whole setups (a router, a store) instead of the existing helpers. Say which exact values each test must assert and which helper to use.
 - **Mistral copies the spec word for word,** mistakes included. Proofread names, paths and any prose it could paste into code or docs, and label examples as examples.
 
 **For tests, spell out the harness setup.** Name the existing test file to copy, how to mount or render the unit, which modules to stub and how (e.g. a parent layout, the clipboard, timers), and how to read the result (DOM queries, toasts, emitted events). Specs with this setup succeed first time; specs without it send Mistral guessing and often end empty.
@@ -155,7 +170,7 @@ The wrapper adds the rules itself: which commands may run, which checks must pas
 
 The report starts with `run_id`, `status` and `verification`, then `usage` (cost, steps, tokens), the change list, and the full diff when it is short.
 
-- **final_message_warning.** Mistral's last step was a tool call, or its summary stops mid-sentence: the run was likely cut short. Treat the result as unfinished even if checks pass, and resume or redo it.
+- **final_message_warning.** Mistral's last step was a tool call, it left no final message, or its summary stops mid-sentence: the run was likely cut short. Treat the result as unfinished even if checks pass, and resume or redo it.
 - **checks_skipped / flaky_checks.** Configured checks limited to paths this run doesn't touch are skipped. A check that failed and then passed on an immediate rerun before Mistral started is flaky, not broken.
 - **status: incomplete.** Files named literally in `--scope` were never created (`missing_files`), even after one request. Passing checks don't cover files that don't exist. Resume with a precise instruction, or write them yourself.
 - **status: no_changes.** Mistral finished without changing any file. Read its result to see why (a blocked task, a misunderstanding, or the work already existed) before retrying.
@@ -181,6 +196,8 @@ The report starts with `run_id`, `status` and `verification`, then `usage` (cost
 - **out_of_scope_changes.** Mistral edited files outside the scope of the worktree's runs. `--adopt` won't apply anything until you decide: look at them, then use `--include-out-of-scope` to take them too or `--skip-out-of-scope` to leave them out. Never take them just to make a check pass.
 - **baseline_warning.** Checks that failed before Mistral changed anything can come from the worktree environment (`deps_mode`) or from your own uncommitted changes, which the worktree starts from, such as a half-done regeneration.
 - **denied_commands.** Commands Mistral tried to run but wasn't allowed to. If one is a check it needs (e.g. `npx vitest run`), suggest adding it to `allow_commands`. `--stats` lists the most denied commands.
+- **refused_tool_calls.** Tool calls other than shell commands that Vibe's own permissions refused (an edit or a write). They aren't missing `allow_commands`; check whether Mistral tried to touch something outside its worktree.
+- **A check that already failed before Mistral:** its error lines are compared with the baseline's. `FAIL ... with N new error line(s) now` means Mistral added errors to it: that counts as a new failure, gets a fix round, and the fix prompt lists the new lines. Only an unchanged failure is `already failing`. Judge a check by its exit code, never by grepping its output.
 - **usage.** The cost is estimated from token counts at list prices (`~$…`). If it keeps saying "cost unknown", suggest `vibe_args = ["--legacy-harness"]` in the config.
 - **Not worth keeping.** `--discard <id> --note "why"`. The note feeds the track record.
 - Always adopt or discard, so worktrees don't pile up. The session context lists runs still awaiting a decision.

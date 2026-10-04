@@ -23,6 +23,38 @@ DEPENDENCY_DIRS = {"node_modules", ".venv", "venv", "vendor", "bower_components"
 
 STATE_FILE = "mistral-delegate.json"
 
+# The project's folder for Claude's plans and specs: kept across sessions, ignored by git, and never
+# copied into Mistral's worktrees (a step sees only its own instructions, not every plan in the folder).
+WORK_DIR = ".mistral-delegate"
+WORK_KINDS = {"plan": "plans", "spec": "specs"}
+
+
+def work_dir(top: str, kind: str | None = None) -> Path:
+    """<repo>/.mistral-delegate (or its plans/ or specs/ folder), made and git-ignored on first use."""
+    base = Path(top, WORK_DIR)
+    try:
+        base.mkdir(exist_ok=True)
+        ignore = base / ".gitignore"
+        if not ignore.exists():
+            ignore.write_text("# Plans and specs for Mistral delegations; see the mistral-delegate plugin.\n*\n")
+        if kind:
+            (base / WORK_KINDS[kind]).mkdir(exist_ok=True)
+    except OSError:
+        pass
+    return base / WORK_KINDS[kind] if kind else base
+
+
+def find_document(name: str, top: str | None, kind: str) -> Path:
+    """A plan or spec: a path, or a name in the project's plans/ or specs/ folder (".md" optional)."""
+    path = Path(name).expanduser()
+    if path.is_file() or not top:
+        return path
+    folder = work_dir(top, kind)
+    for candidate in (folder / name, folder / f"{name}.md"):
+        if candidate.is_file():
+            return candidate
+    return path
+
 GIT_IDENTITY = ["-c", "user.name=mistral-delegate", "-c", "user.email=mistral-delegate@localhost",
                 "-c", "commit.gpgsign=false"]
 # Settings that would change git's output format or run the user's programs are overridden for every call:
@@ -129,8 +161,10 @@ def snapshot_uncommitted(top: str, worktree: Path) -> dict | None:
         return None
     if diff.strip():
         git_checked(worktree, "apply", "--binary", "--whitespace=nowarn", "-", input=diff)
-    # Untracked folders that git lists whole (a nested repository) and dependency folders aren't copied.
-    untracked = [f for f in untracked if not f.endswith("/") and not set(Path(f).parts) & DEPENDENCY_DIRS]
+    # Untracked folders that git lists whole (a nested repository), dependency folders and the plans
+    # and specs folder aren't copied.
+    untracked = [f for f in untracked if not f.endswith("/") and not set(Path(f).parts) & DEPENDENCY_DIRS
+                 and not f.startswith(WORK_DIR + "/")]
     for rel in untracked:
         src, dst = Path(top, rel), worktree / rel
         dst.parent.mkdir(parents=True, exist_ok=True)

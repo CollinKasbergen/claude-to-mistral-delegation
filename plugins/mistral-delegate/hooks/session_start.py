@@ -45,6 +45,11 @@ def build_context(cwd: str) -> str:
         "a plain run.",
         f"Wrapper: python3 {wrapper}  (pass this path to mistral-worker subagents)",
     ]
+    if top:
+        lines.append(f"Write plans to {top}/.mistral-delegate/plans/<name>.md and specs to "
+                     f"{top}/.mistral-delegate/specs/<name>.md (kept across sessions, ignored by git, never shown "
+                     "to Mistral), and pass the name: --plan <name>, --spec <name>. Standing rules for Mistral's "
+                     "code go in the project's AGENTS.md.")
     if settings["verify"] or settings["allow_commands"]:
         lines.append(f"Configured checks: {'; '.join(config.check_label(c) for c in settings['verify']) or '(none)'}; "
                      f"commands Mistral may run: {', '.join(settings['allow_commands']) or '(none)'}.")
