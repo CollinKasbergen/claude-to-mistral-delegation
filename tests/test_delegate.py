@@ -61,6 +61,13 @@ FAKE_VIBE = textwrap.dedent('''\
         if os.path.exists(journal):
             prev = len(open(journal).read().splitlines())
         usage = {"inputTokens": tokens_in * (prev + 1), "outputTokens": tokens_out * (prev + 1), "totalTokens": 0}
+        if os.environ.get("FAKE_VIBE_CACHED"):
+            usage["cachedInputTokens"] = 900 * (prev + 1)
+        if os.environ.get("FAKE_VIBE_CACHED_COMPLETION"):
+            with open(journal, "a") as f:
+                f.write(json.dumps({"type": "core_input", "payload": {"input": {"completion": {"usage": {
+                    "input_tokens": 1000, "output_tokens": 200, "total_tokens": 1200,
+                    "cached_input_tokens": 900}}}}}) + "\\n")
         with open(journal, "a") as f:
             f.write(json.dumps({"type": "projection_delta", "payload": {"delta": [
                 {"op": "set_envelope", "state": {"session": {"id": session_id, "tokenUsage": usage}}}]}}) + "\\n")
@@ -178,7 +185,7 @@ class DelegateTestBase(unittest.TestCase):
                     "MISTRAL_DELEGATE_MAX_TURNS", "MISTRAL_DELEGATE_WORKTREES", "FAKE_VIBE_STORAGE",
                     "FAKE_VIBE_TOUCH_APP", "FAKE_VIBE_HOOK_CALLS", "FAKE_VIBE_NO_WRITE", "FAKE_VIBE_CANCEL",
                     "FAKE_VIBE_MODEL", "FAKE_VIBE_EXPERIMENT_PRICE", "FAKE_VIBE_SPEND", "FAKE_VIBE_EFFECTS",
-                    "FAKE_VIBE_UNFINISHED"):
+                    "FAKE_VIBE_UNFINISHED", "FAKE_VIBE_CACHED", "FAKE_VIBE_CACHED_COMPLETION"):
             self.env.pop(var, None)
 
     def tearDown(self):
@@ -229,20 +236,19 @@ class ReadModeTest(DelegateTestBase):
 
     def test_usage_reports_cost_steps_and_tokens(self):
         out = self.run_delegate("--max-price", "0.5", "Task")
-        self.assertIn("usage: cost $0.0125, first-pass cap $0.50, 1,200 tokens", out.stdout)
-        self.assertIn("turns: 4 (max_turns 15), tool calls: 2", out.stdout)
+        self.assertIn("usage: 2,000 effective tokens (input 1,000 fresh + 0 cached, output 200)", out.stdout)
+        self.assertIn("tool calls: 2, model steps: 4 (max_turns 15)", out.stdout)
 
     def test_cost_estimated_from_unified_harness_journal(self):
         out = self.run_delegate("Task", FAKE_VIBE_STORAGE="unified")
         # 1000 input tokens at $1.5/M + 200 output tokens at $7.5/M
-        self.assertIn("usage: cost ~$0.0030 (estimated from tokens at mistral-medium-3.5 list prices)", out.stdout)
-        self.assertIn("1,200 tokens", out.stdout)
+        self.assertIn("usage: 2,000 effective tokens (input 1,000 fresh + 0 cached, output 200); "
+                      "~$0.0030 at mistral-medium-3.5 list prices", out.stdout)
 
     def test_unified_follow_up_reports_this_runs_tokens(self):
         self.run_delegate("Task", FAKE_VIBE_STORAGE="unified")
         out = self.run_delegate("--resume", "sess-1234567890", "More", FAKE_VIBE_STORAGE="unified")
-        self.assertIn("usage: cost ~$0.0030", out.stdout)
-        self.assertIn("session total $0.0060", out.stdout)
+        self.assertIn("~$0.0030 at mistral-medium-3.5 list prices (session total ~$0.0060)", out.stdout)
 
     def test_result_text_is_not_duplicated(self):
         out = self.run_delegate("Task")
@@ -291,7 +297,7 @@ class ReadModeTest(DelegateTestBase):
         self.assertEqual(out.returncode, 1)
         self.assertIn("status: limit_reached", out.stdout)
         self.assertIn("I got halfway through.", out.stdout)
-        self.assertIn("usage: cost $0.0125", out.stdout)
+        self.assertIn("usage: 2,000 effective tokens", out.stdout)
         self.assertIn("session_id: sess-1234567890", out.stdout)
 
     def test_vibe_error(self):
@@ -361,9 +367,8 @@ class WriteModeTest(DelegateTestBase):
         self.assertIn("failed (exit code 3)", fix["prompt"])
         self.assertIn("missing fixed.txt", fix["prompt"])
         self.assertEqual(fix["cwd"], calls[0]["cwd"])
-        # The fix round gets half the first-pass cap on top of what was spent.
-        self.assertEqual(float(fix["argv"][fix["argv"].index("--max-price") + 1]), 0.0125 + 0.5)
-        self.assertIn("usage: cost $0.0250", out.stdout)
+        self.assertNotIn("--max-price", fix["argv"])
+        self.assertIn("usage: 4,000 effective tokens", out.stdout)  # both calls
 
     def test_check_still_failing_is_reported(self):
         check = "test ! -f test_app.py || (echo boom; exit 1)"
@@ -426,22 +431,22 @@ class WriteModeTest(DelegateTestBase):
         out = self.run_delegate("Task", FAKE_VIBE_STORAGE="unified", FAKE_VIBE_MODEL="glm-5-3")
         self.assertIn("model: glm-5-3 (Vibe's default; not pinned)", out.stdout)
         self.assertIn("model_note: Vibe's server-side default routed this run to 'glm-5-3'", out.stdout)
-        self.assertIn('add model_prices = { "glm-5-3" = [input, output] }', out.stdout)
+        self.assertIn('add model_prices = { "glm-5-3" = [input, output, cached] }', out.stdout)
 
     def test_price_from_session_experiments(self):
         out = self.run_delegate("Task", FAKE_VIBE_STORAGE="unified", FAKE_VIBE_MODEL="glm-5-3",
                                 FAKE_VIBE_EXPERIMENT_PRICE="1")
         # 1000 in at $2/M + 200 out at $10/M
-        self.assertIn("cost ~$0.0040", out.stdout)
+        self.assertIn("~$0.0040 at glm-5-3 list prices", out.stdout)
 
     def test_model_prices_setting_prices_new_and_old_runs(self):
         self.run_delegate("Task", FAKE_VIBE_STORAGE="unified", FAKE_VIBE_MODEL="glm-5-3")
-        self.assertIn("1 run(s) without cost data", self.run_delegate("--stats").stdout)
+        self.assertIn("1 run(s) without a price", self.run_delegate("--stats").stdout)
         (self.repo / ".mistral-delegate.toml").write_text('model_prices = { "glm-5-3" = [1.0, 4.0] }\n')
         out = self.run_delegate("Task", FAKE_VIBE_STORAGE="unified", FAKE_VIBE_MODEL="glm-5-3")
-        self.assertIn("cost ~$0.0018", out.stdout)  # 1000 * 1 + 200 * 4 per million
+        self.assertIn("~$0.0018 at glm-5-3 list prices", out.stdout)  # 1000 * 1 + 200 * 4 per million
         stats = self.run_delegate("--stats").stdout
-        self.assertNotIn("without cost data", stats)  # the earlier run is priced from its tokens now
+        self.assertNotIn("without a price", stats)  # the earlier run is priced from its tokens now
         self.assertIn("$0.0", stats)
 
     def test_command_spellings_are_expanded(self):
@@ -470,9 +475,9 @@ class WriteModeTest(DelegateTestBase):
         out = self.run_delegate("--mode", "write", "--max-price", "0.5", "Task",
                                 FAKE_VIBE_STORAGE="unified", FAKE_VIBE_MODEL="glm-5-3", FAKE_VIBE_SPEND="1")
         self.assertIn("status: budget_exceeded", out.stdout)
-        self.assertIn("over this call's cap of $0.50", out.stdout)
+        self.assertIn("over this call's max_price of $0.50", out.stdout)
         self.assertIn("priced at mistral-medium-3.5 rates", out.stdout)
-        spent = float(out.stdout.split("budget: ~$")[1].split(" ")[0])
+        spent = float(out.stdout.split("stopped Mistral at ~$")[1].split(",")[0])
         self.assertLess(spent, 1.0)  # stopped soon after crossing $0.50, not after $30
 
     def test_tool_call_cap_is_enforced_by_the_wrapper(self):
@@ -515,6 +520,58 @@ class WriteModeTest(DelegateTestBase):
     def test_runners_are_allowed_in_the_profile_with_the_guard(self):
         self.run_delegate("--mode", "write", "--allow-command", "uv run pytest", "Task")
         self.assertIn('"uv run"', self.profile(self.last()["argv"]))
+
+    def test_cached_tokens_are_priced_at_the_cached_rate(self):
+        for env in ({"FAKE_VIBE_CACHED": "1"}, {"FAKE_VIBE_CACHED_COMPLETION": "1"}):
+            with self.subTest(env=env):
+                out = self.run_delegate("Task", FAKE_VIBE_STORAGE="unified", **env)
+                # 100 fresh * 1.5 + 900 cached * 0.15 + 200 out * 7.5, per million
+                self.assertIn("usage: 1,190 effective tokens (input 100 fresh + 900 cached, output 200); "
+                              "~$0.0018 at mistral-medium-3.5", out.stdout)
+
+    def test_token_budget_is_enforced(self):
+        out = self.run_delegate("--mode", "write", "--token-budget", "300000", "Task",
+                                FAKE_VIBE_STORAGE="unified", FAKE_VIBE_SPEND="1", FAKE_VIBE_EFFECTS="1")
+        self.assertIn("status: budget_exceeded", out.stdout)
+        self.assertIn("over this call's budget of 300,000", out.stdout)
+        calls = int(out.stdout.split("tool calls: ")[1].split(",")[0].split("\n")[0])
+        self.assertGreater(calls, 0)  # counted live, although Vibe printed nothing
+
+    def test_autofix_runs_before_a_fix_round(self):
+        (self.repo / ".mistral-delegate.toml").write_text('autofix = ["touch fixed.txt"]\n')
+        out = self.run_delegate("--mode", "write", "--verify", "test ! -f test_app.py || test -f fixed.txt", "Task")
+        self.assertIn("verification: passed", out.stdout)
+        self.assertIn("autofix: ran touch fixed.txt", out.stdout)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_fix_round_after_a_cap_stop(self):
+        out = self.run_delegate("--mode", "write", "--token-budget", "300000", "--verify", "test -f never.txt",
+                                "--no-baseline", "Task", FAKE_VIBE_STORAGE="unified", FAKE_VIBE_SPEND="1")
+        self.assertIn("status: budget_exceeded", out.stdout)
+        self.assertEqual(len(self.calls()), 2)
+        self.assertIn("failed (exit code", self.calls()[1]["prompt"])
+
+    def test_monthly_credit_is_tracked(self):
+        (self.repo / ".mistral-delegate.toml").write_text('monthly_credit = 10\ncurrency = "€"\n')
+        out = self.run_delegate("Task", FAKE_VIBE_STORAGE="unified")
+        self.assertIn("credit: ~€0.00 of €10.00 used since", out.stdout)
+        second = self.run_delegate("Task", FAKE_VIBE_STORAGE="unified").stdout
+        self.assertIn("credit: ~€0.01 of €10.00", second)  # both runs: 2 x 0.0030, shown in cents
+        self.assertIn("credit: ~€", self.run_delegate("--stats").stdout)
+
+    def test_follow_up_is_listed_under_the_original_task(self):
+        self.run_delegate("--mode", "write", "--worktree-name", "mistral-lbl", "Add the teams endpoint")
+        self.run_delegate("--mode", "write", "--worktree-name", "mistral-lbl", "--resume", "sess-1234567890",
+                          "You were stopped before finishing, continue")
+        status = self.run_delegate("--status").stdout
+        self.assertIn("Add the teams endpoint [follow-up]", status)
+        self.assertNotIn("You were stopped", status)
+
+    def test_savings_are_recorded_and_shown(self):
+        out = self.run_delegate("--mode", "write", "--kind", "tests", "Task")
+        self.run_delegate("--adopt", self.value(out, "run_id"))
+        stats = self.run_delegate("--stats").stdout
+        self.assertRegex(stats, r"tests .* x\d")
 
     def test_no_changes_is_its_own_status(self):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_NO_WRITE="1")
@@ -666,8 +723,8 @@ class WriteModeTest(DelegateTestBase):
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertEqual(self.value(second, "worktree_path"), path)
         self.assertIn("worktree_name: mistral-fu  (reused)", second.stdout)
-        self.assertIn("usage: cost $0.0125", second.stdout)
-        self.assertIn("session total $0.0250", second.stdout)
+        self.assertIn("usage: 2,000 effective tokens", second.stdout)
+        self.assertIn("(session total ~$0.0060)", second.stdout)
 
     def test_subdirectory_workdir_maps_into_worktree(self):
         sub = self.repo / "pkg"
@@ -719,7 +776,8 @@ class ConfigTest(DelegateTestBase):
         self.assertEqual(out.returncode, 0, out.stdout)
         argv = self.last()["argv"]
         self.assertEqual(argv[argv.index("--max-turns") + 1], "50")
-        self.assertEqual(float(argv[argv.index("--max-price") + 1]), 2.5)
+        self.assertNotIn("--max-price", argv)  # no money cap unless one is configured
+        self.assertIn("caps the first pass at 2,500,000 effective tokens and 150 tool calls", out.stdout)
         self.assertIn("verification: passed", out.stdout)
         self.assertIn('"make test"', self.profile(argv))
         self.assertIn("policy: aggressive", out.stdout)
@@ -749,7 +807,7 @@ class ConfigTest(DelegateTestBase):
         out = self.run_delegate("--show-config")
         self.assertIn("policy: conservative", out.stdout)
         self.assertIn("model: mistral-small", out.stdout)
-        self.assertIn("write_caps: max_price=$0.50 max_tool_calls=50 max_turns=20", out.stdout)
+        self.assertIn("write_caps: token_budget=400,000 effective tokens, max_tool_calls=50, max_turns=20", out.stdout)
         self.assertIn("source of policy: project", out.stdout)
 
     def test_max_parallel_is_enforced(self):
@@ -780,6 +838,21 @@ class HookTest(DelegateTestBase):
         self.assertIn("Configured checks: npm test", context)
         self.assertIn("tests: 1 runs", context)
         self.assertIn(f"Awaiting --adopt or --discard: {run_id}", context)
+
+    def test_session_start_credit_and_low_savings(self):
+        (self.repo / ".mistral-delegate.toml").write_text('monthly_credit = 225\ncurrency = "€"\nmin_savings = 2\n')
+        self.home.mkdir(parents=True, exist_ok=True)
+        with open(self.home / "ledger.jsonl", "w") as f:
+            for i in range(3):
+                f.write(json.dumps({"event": "start", "id": f"d{i}", "kind": "docs", "mode": "write", "pid": 0,
+                                    "time": time.time()}) + "\n")
+                f.write(json.dumps({"event": "end", "id": f"d{i}", "status": "ok", "cost": 1.0, "tokens": 10,
+                                    "claude_overhead": 1000, "claude_equivalent": 1500, "time": time.time()}) + "\n")
+                f.write(json.dumps({"event": "outcome", "id": f"d{i}", "outcome": "discarded", "time": time.time()}) + "\n")
+        context = self.run_hook()
+        self.assertIn("Delegation hasn't paid off for: docs (x0.0)", context)
+        self.assertIn("Mistral credit: ~€3.00 of €225.00 used since", context)
+        self.assertIn("plenty left", context)
 
     def test_session_start_without_vibe(self):
         env = dict(self.env, PATH="/usr/bin:/bin")
@@ -995,8 +1068,8 @@ class CostStatsTest(unittest.TestCase):
             "c": {"id": "c", "kind": "tests", "status": "ok", "started": time.time(), "cost": 0.0, "tokens": 0},
         }
         self.assertIn("$0.200", ledger.format_stats(runs))
-        self.assertIn("2 run(s) without cost data", ledger.format_stats(runs))
-        self.assertIn("$0.200 avg", ledger.compact_stats(runs))
+        self.assertIn("2 run(s) without a price", ledger.format_stats(runs))
+        self.assertIn("~$0.20 avg", ledger.compact_stats(runs))
 
 
 class CommandFormsTest(unittest.TestCase):

@@ -63,7 +63,7 @@ If something small is wrong, you may follow up once with `--resume <session_id> 
 ## 5. Report back
 
 Reply with, in this order:
-- `run_id`, status, verification result, cost;
+- `run_id`, status, verification result, usage (effective tokens, cost) and credit if shown;
 - the files changed (one line each);
 - your recommendation: **adopt** (with the `adopt_with` command), **adopt only some paths**, or **discard** (and why);
 - anything the main agent must check or finish itself.

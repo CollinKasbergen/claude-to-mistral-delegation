@@ -58,7 +58,7 @@ Claude delegates on its own, following the active policy. You can also ask ("hav
 5. **Vibe runs** with a generated agent profile that auto-approves file edits and only the commands you allowed (`--allow-command` / `allow_commands`). Each part of a chained command must be allowed, and everything else is refused.
 6. **Checks.** The wrapper runs each `--verify` command in the worktree. If one fails, its output goes back to the same Vibe session for a fix (`--fix-attempts`, default 1), and the checks run again.
 7. **Resumes.** `--resume <session> --worktree-name <name>` continues in the same worktree under a new run id. The report shows which run it continues, and adopting or discarding either id settles both. Its baseline is the one stored before Mistral's first changes. A check that wasn't measured then runs on a clean copy of the original snapshot, so Mistral's own failures are never counted as already failing.
-8. **Report.** It shows status, verification, cost, turns and tokens, the change list, files changed outside the scope, commands Mistral was refused, the diff when short, and `adopt_with` / `discard_with` commands.
+8. **Report.** It shows status, verification, usage (effective tokens and cost) and month-to-date credit, the change list, files changed outside the scope, commands Mistral was refused, the diff when short, and `adopt_with` / `discard_with` commands.
 9. **Adopt or discard.** `--adopt <id>` applies Mistral's changes inside the scope to your checkout (your own uncommitted work is left alone) and removes the worktree. `--paths` takes only some files, `--include-out-of-scope` also takes changes outside the scope, and `--discard <id> --note "why"` drops the run.
 
 Read tasks (`--mode read`) run in place with read-only tools.
@@ -86,28 +86,40 @@ baseline = true              # run the checks on the untouched worktree first
 # worktrees_dir = "/Volumes/SSD/.mistral-worktrees"  # default: ~/.mistral-delegate/worktrees, or
 #                                                    # <repo parent>/.mistral-worktrees if the repo is on another disk
 
+monthly_credit = 225         # your Vibe credit per month (e.g. Mistral Pro's), tracked in reports
+currency = "€"
+credit_reset_day = 1         # day of the month the credit renews
+min_savings = 2              # stop delegating kinds of task whose measured savings fall below this
+autofix = ["ruff format ."]  # run these when checks fail, before asking Mistral to fix
+# token_weights = { input = 1.0, cached = 0.1, output = 5.0 }  # what counts as an effective token
+
 [write]
-max_price = 1.00      # stop Mistral when a run has spent this much (enforced by the wrapper)
-max_tool_calls = 80   # stop Mistral after this many tool calls (enforced by the wrapper)
-max_turns = 30        # passed to Vibe
+token_budget = 1000000  # stop Mistral after this many effective tokens (enforced by the wrapper)
+max_tool_calls = 80     # stop Mistral after this many tool calls (enforced by the wrapper)
+# max_price = 2.00      # optional money cap on top, in the model's price units
+max_turns = 30          # passed to Vibe
 
 [read]
-max_price = 0.25
+token_budget = 300000
 ```
 
 | Policy | What Claude delegates | Default write cap | Default read cap |
 |---|---|---|---|
-| conservative | tests, docs, boilerplate, read-only searches | $0.50, 50 tool calls | $0.15, 25 tool calls |
-| balanced | any step with a short spec and an automatic check | $1.00, 80 tool calls | $0.25, 40 tool calls |
-| aggressive | every such step by default, in parallel | $2.50, 150 tool calls | $0.50, 60 tool calls |
+| conservative | tests, docs, boilerplate, read-only searches | 400k effective tokens, 50 tool calls | 150k, 25 tool calls |
+| balanced | any step with a short spec and an automatic check | 1M effective tokens, 80 tool calls | 300k, 40 tool calls |
+| aggressive | every such step by default, in parallel | 2.5M effective tokens, 150 tool calls | 600k, 60 tool calls |
 
-**Caps are enforced by the wrapper.** Vibe's own `--max-price` only works when it knows the model's price, and its turn limit doesn't limit tool calls. So the wrapper watches each run's token usage and tool calls while Vibe works, and stops it at `max_price` or `max_tool_calls` (`status: budget_exceeded` / `tool_call_limit`). Without a known price, usage is priced at mistral-medium-3.5 rates for this. A continuation, when a run stops without a closing summary, or a fix round gets half of each cap.
+**Effective tokens.** Runs are measured and capped in effective tokens rather than money: fresh input tokens count in full, cached input tokens at a tenth, output tokens five times. These are Mistral Medium's price ratios, adjustable with `token_weights`. Agents re-send their context on every step, so most input is cached; at Mistral Medium's prices, 1M effective tokens is about $1.50. The wrapper watches each run's usage and tool calls while Vibe works and stops it at `token_budget` or `max_tool_calls` (`status: budget_exceeded` / `tool_call_limit`). `max_price` adds an optional money cap. A continuation, when a run stops without a closing summary, or a fix round gets half of each cap. A run stopped at a cap still gets its fix round (`fix_after_cap = false` turns that off), and `autofix` commands run first, so a formatting failure costs no Mistral round at all.
+
+**Credit and costs.** Reports show each run's usage (fresh, cached and output tokens), its cost at the model's list prices with cached input at the cached rate, and, with `monthly_credit` set, how much of the month's credit is used. The session-start reminder tells Claude how much credit is left, so it delegates freely early in the month and selectively near the end. For a model with no known price, add it to `model_prices` as `[input, output, cached]` per million tokens; earlier runs are then priced from their recorded tokens.
+
+**Savings.** Each run records an estimate of what delegating cost Claude (writing the task and spec, reading the report) and of the Claude work it replaced (Mistral's effective tokens × `claude_relative_effort`, 0.5 by default). `--stats` shows the ratio per kind of task, counting adopted runs as saved and discarded ones as wasted overhead. With `min_savings` set, the session-start reminder tells Claude which kinds haven't paid off, so it keeps those itself.
 
 **Model.** The report's `model:` line says which model ran. With no `model` set, Vibe uses its own default, and a server-side experiment can route that to a non-Mistral model (e.g. `glm-5-3`); `model_note` flags it. Pin `model = "mistral-medium-3.5"` to always use Mistral.
 
-**Cost reporting.** Vibe stores sessions in one of two formats. With its older engine, the session log contains the exact cost. With the newer Unified Harness, it records only token counts, so the report estimates the cost from the model's list prices and marks it `~$`. For a model with no known price, the report says so; add it to `model_prices` and runs are priced from their recorded tokens, earlier ones included. If the report keeps saying "cost unknown" for another reason, add `vibe_args = ["--legacy-harness"]`. The model must be an alias Vibe knows: the built-ins are `mistral-medium-3.5` and `local`, and you add others under `[[models]]` in `~/.vibe/config.toml`. The report warns when Vibe would fall back to its default model.
+The model must be an alias Vibe knows: the built-ins are `mistral-medium-3.5` and `local`, and you add others under `[[models]]` in `~/.vibe/config.toml`. The report warns when Vibe would fall back to its default model.
 
-Environment variables: `MISTRAL_DELEGATE_POLICY`, `MISTRAL_DELEGATE_MODEL`, `MISTRAL_DELEGATE_MAX_TURNS`, `MISTRAL_DELEGATE_MAX_PRICE`, `MISTRAL_DELEGATE_MAX_TOKENS`, `MISTRAL_DELEGATE_TIMEOUT`, `MISTRAL_DELEGATE_HOME` (default `~/.mistral-delegate`), `MISTRAL_DELEGATE_WORKTREES` (same as `worktrees_dir`), `VIBE_BIN`.
+Environment variables: `MISTRAL_DELEGATE_POLICY`, `MISTRAL_DELEGATE_MODEL`, `MISTRAL_DELEGATE_MAX_TURNS`, `MISTRAL_DELEGATE_TOKEN_BUDGET`, `MISTRAL_DELEGATE_MAX_TOOL_CALLS`, `MISTRAL_DELEGATE_MAX_PRICE`, `MISTRAL_DELEGATE_MAX_TOKENS`, `MISTRAL_DELEGATE_TIMEOUT`, `MISTRAL_DELEGATE_HOME` (default `~/.mistral-delegate`), `MISTRAL_DELEGATE_WORKTREES` (same as `worktrees_dir`), `VIBE_BIN`.
 
 ## Parallel runs and the track record
 

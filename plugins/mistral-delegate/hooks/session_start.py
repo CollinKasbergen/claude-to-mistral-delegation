@@ -46,9 +46,23 @@ def build_context(cwd: str) -> str:
     runs = ledger.load_runs()
     from mdelegate import vibe
     vibe.EXTRA_PRICES.update(settings["model_prices"])
-    record = ledger.compact_stats(runs, prices=vibe.model_prices())
+    record = ledger.compact_stats(runs, prices=vibe.model_prices(), currency=settings["currency"])
     if record:
         lines.append(f"Track record (90 days): {record}.")
+    if settings["min_savings"]:
+        low = ledger.low_savings_kinds(runs, settings["min_savings"])
+        if low:
+            lines.append(f"Delegation hasn't paid off for: {', '.join(low)} (below min_savings "
+                         f"x{settings['min_savings']:g}). Keep those kinds of task yourself unless the spec is tiny.")
+    if settings["monthly_credit"]:
+        spent, _unpriced, since = ledger.month_spend(runs, settings["credit_reset_day"], vibe.model_prices())
+        share = spent / settings["monthly_credit"]
+        c = settings["currency"]
+        advice = ("plenty left: delegate freely" if share < 0.6 else
+                  "getting low: delegate the clearest, best-paying kinds only" if share < 0.9 else
+                  "nearly used up: keep work yourself unless the user says otherwise")
+        lines.append(f"Mistral credit: ~{c}{spent:.2f} of {c}{settings['monthly_credit']:.2f} used since {since} "
+                     f"({share:.0%}), {advice}.")
     pending = ledger.pending_review(runs)
     if pending:
         lines.append("Awaiting --adopt or --discard: " + ", ".join(f"{r['id']} ({r.get('kind')})" for r in pending[:5]) + ".")

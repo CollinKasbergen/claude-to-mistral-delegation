@@ -155,15 +155,46 @@ def run_cost(r: dict, prices: dict | None = None) -> float | None:
         return float(cost)
     price = (prices or {}).get(r.get("model") or "")
     if price and (r.get("tokens_in") or r.get("tokens_out")):
-        return ((r.get("tokens_in") or 0) * price[0] + (r.get("tokens_out") or 0) * price[1]) / 1_000_000
+        tokens_in, cached = r.get("tokens_in") or 0, min(r.get("cached") or 0, r.get("tokens_in") or 0)
+        cached_price = price[2] if len(price) > 2 and price[2] is not None else price[0] * 0.1
+        return ((tokens_in - cached) * price[0] + cached * cached_price + (r.get("tokens_out") or 0) * price[1]) / 1e6
     return None
+
+
+def month_start(reset_day: int, now: float | None = None) -> time.struct_time:
+    t = time.localtime(now or time.time())
+    year, month = t.tm_year, t.tm_mon
+    if t.tm_mday < reset_day:
+        year, month = (year - 1, 12) if month == 1 else (year, month - 1)
+    return time.strptime(f"{year}-{month:02d}-{reset_day:02d}", "%Y-%m-%d")
+
+
+def month_spend(runs: dict[str, dict], reset_day: int = 1, prices: dict | None = None) -> tuple[float, int, str]:
+    """(spent, runs without a price, 'Mon DD') since the credit's last reset."""
+    start = month_start(reset_day)
+    cutoff = time.mktime(start)
+    spent, unpriced = 0.0, 0
+    for r in runs.values():
+        if (r.get("started") or 0) < cutoff or not r.get("status"):
+            continue
+        cost = run_cost(r, prices)
+        if cost is None:
+            unpriced += 1 if (r.get("tokens_in") or r.get("tokens")) else 0
+        else:
+            spent += cost
+    return spent, unpriced, time.strftime("%b %d", start)
+
+
+def savings(s: dict) -> float | None:
+    """Claude-equivalent work of adopted runs per Claude token spent delegating (all decided runs)."""
+    return s["saved"] / s["overhead"] if s["overhead"] else None
 
 
 def compute_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = None) -> dict:
     cutoff = time.time() - days * 86400
     by_kind: dict[str, dict] = defaultdict(lambda: {"runs": 0, "ok": 0, "verified": 0, "passed": 0,
                                                     "adopted": 0, "partial": 0, "discarded": 0, "cost": 0.0,
-                                                    "costed": 0})
+                                                    "costed": 0, "effective": 0, "saved": 0, "overhead": 0})
     for r in runs.values():
         if (r.get("started") or 0) < cutoff or not r.get("status"):
             continue
@@ -184,6 +215,13 @@ def compute_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = N
         if cost is not None:
             s["cost"] += cost
             s["costed"] += 1
+        s["effective"] += r.get("effective") or 0
+        # Savings count decided runs only: adopted work saves Claude its equivalent (half for a partial
+        # adopt); discarded work saves nothing, but its overhead still counts.
+        if r.get("outcome") and r.get("claude_overhead"):
+            s["overhead"] += r["claude_overhead"]
+            share = {"adopted": 1.0, "adopted_partial": 0.5}.get(r["outcome"], 0.0)
+            s["saved"] += int((r.get("claude_equivalent") or 0) * share)
     return dict(by_kind)
 
 
@@ -208,22 +246,29 @@ def top_denied(runs: dict[str, dict], days: int = 90, limit: int = 5) -> list[tu
     return counts.most_common(limit)
 
 
-def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = None) -> str:
+def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = None, currency: str = "$",
+                 min_savings: float | None = None) -> str:
     stats = compute_stats(runs, days, prices)
     if not stats:
         return f"No finished delegations in the last {days} days."
     lines = [f"Delegations in the last {days} days:",
-             "kind          runs  ok   verify-pass  adopted/decided       avg-cost  total-cost"]
+             "kind          runs  ok   verify-pass  adopted/decided       avg-eff-tokens  avg-cost   savings"]
     total_runs, total_cost = 0, 0.0
     for kind, s in sorted(stats.items(), key=lambda kv: -kv[1]["runs"]):
         verify = f"{s['passed']}/{s['verified']}" if s["verified"] else "-"
+        ratio = savings(s)
+        flag = "  (below min_savings)" if min_savings and ratio is not None and ratio < min_savings else ""
+        avg_cost = f"{currency}{s['cost'] / s['costed']:.3f}" if s["costed"] else "?"
         lines.append(f"{kind:<13} {s['runs']:<5} {s['ok']:<4} {verify:<12} {_adopted(s):<21} "
-                     f"{_avg_cost(s):<9} ${s['cost']:.2f}")
+                     f"{s['effective'] // max(s['runs'], 1):<15,} {avg_cost:<10} "
+                     + (f"x{ratio:.1f}" if ratio is not None else "-") + flag)
         total_runs += s["runs"]
         total_cost += s["cost"]
     uncosted = sum(s["runs"] - s["costed"] for s in stats.values())
-    lines.append(f"total: {total_runs} runs, ${total_cost:.2f}"
-                 + (f" ({uncosted} run(s) without cost data are left out of costs and averages)" if uncosted else ""))
+    lines.append(f"total: {total_runs} runs, ~{currency}{total_cost:.2f}"
+                 + (f" ({uncosted} run(s) without a price are left out of costs)" if uncosted else ""))
+    lines.append("savings: Claude-equivalent work of adopted runs per token Claude spent delegating "
+                 "(writing specs, reading reports); x1 means delegating saved nothing.")
     denied = top_denied(runs, days)
     if denied:
         lines.append("most denied commands (add to allow_commands if Mistral needs them):")
@@ -231,7 +276,7 @@ def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = No
     return "\n".join(lines)
 
 
-def compact_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = None) -> str:
+def compact_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = None, currency: str = "$") -> str:
     stats = compute_stats(runs, days, prices)
     parts = []
     for kind, s in sorted(stats.items(), key=lambda kv: -kv[1]["runs"]):
@@ -240,7 +285,19 @@ def compact_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = N
             bit += f", {_adopted(s)} adopted"
         if s["verified"]:
             bit += f", {s['passed']}/{s['verified']} passed checks"
+        if (ratio := savings(s)) is not None:
+            bit += f", savings x{ratio:.1f}"
         if s["costed"]:
-            bit += f", {_avg_cost(s)} avg"
+            bit += f", ~{currency}{s['cost'] / s['costed']:.2f} avg"
         parts.append(bit)
     return "; ".join(parts)
+
+
+def low_savings_kinds(runs: dict[str, dict], min_savings: float, days: int = 90, min_decided: int = 3) -> list[str]:
+    """Kinds whose measured savings are below min_savings, once enough runs were adopted or discarded."""
+    out = []
+    for kind, s in compute_stats(runs, days).items():
+        ratio = savings(s)
+        if ratio is not None and s["adopted"] + s["partial"] + s["discarded"] >= min_decided and ratio < min_savings:
+            out.append(f"{kind} (x{ratio:.1f})")
+    return out

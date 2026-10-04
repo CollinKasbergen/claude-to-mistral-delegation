@@ -18,7 +18,10 @@ If both are yes, delegate it, even if you know exactly how you'd write it. Writi
 
 **Habit:** after planning a change, label each step "mine" or "Mistral's". Start Mistral's steps in the background first, then do yours, then review and adopt.
 
-The session context may also show a **track record** per kind of task (adoption rate, checks passed, average cost). Delegate more of the kinds that do well. For kinds that are often discarded, write tighter specs, or keep them yourself.
+The session context may also show:
+
+- **A track record** per kind of task: adoption rate, checks passed, and **savings**, meaning the Claude work that adopted runs replaced per token you spent delegating. Delegate more of the kinds that pay off. A kind listed under "hasn't paid off" (below the user's `min_savings`) is one to keep yourself unless its spec is tiny.
+- **Mistral credit:** how much of the month's subscription credit is used. Delegate freely while plenty is left. Near the end, delegate only the clearest, best-paying kinds, and when it's nearly gone, keep work yourself unless the user says otherwise.
 
 ## Running a task
 
@@ -49,7 +52,7 @@ python3 <wrapper> --mode write --kind feature \
   - `sed` calls that only print are allowed alongside Vibe's read-only commands (`sed -n '1,40p' f`, `sed -nE '/a/,/b/p' f`, `sed 's/x/y/g' f`). `-i`, script files, and `w`/`r`/`e` commands are refused. `read_file` and `grep` are still better.
   - The report's `guard:` line shows what it checked, and `refused_by_guard` lists the refusals.
 - `--model ALIAS`: a Vibe model alias from the user's Vibe config, for this run. Without `model` in the config or this flag, Vibe uses its own default, which a server-side experiment may route to a non-Mistral model (the report's `model:` line says which ran, and `model_note` flags it). Suggest pinning `model = "mistral-medium-3.5"` when the user wants Mistral.
-- Caps come from the policy (`--show-config` shows them). The wrapper itself enforces `--max-price` and `--max-tool-calls` while Mistral runs: it watches the session's usage and stops it when either is exceeded. Vibe can't do this for a model whose price it doesn't know, and its own turn limit doesn't limit tool calls. Without a known price, spend is counted at mistral-medium-3.5 rates. A continuation or fix round gets half of each cap. Raise caps only when the task clearly needs it, and tell the user.
+- Caps come from the policy (`--show-config` shows them), in **effective tokens**: fresh input in full, cached input at a tenth, output five times. The wrapper enforces `--token-budget` and `--max-tool-calls` while Mistral runs, by watching the session's usage, and `--max-price` too if one is set. A continuation or fix round gets half of each cap. A run stopped at a cap still gets one fix round, and configured `autofix` commands (formatters) run before that. Raise caps only when the task clearly needs it, and tell the user.
 - Follow-up on the same work: `--resume <session_id> --worktree-name <name>`, both from the report. The follow-up gets a new run id but keeps the same worktree, and the report shows `continues: <earlier id>`. Both ids refer to everything in the worktree, and `--adopt` or `--discard` with either settles both. Its baseline comes from before Mistral's first changes, so Mistral's own failures are never counted as already failing.
 - Allowed commands may carry their runner's options: `uv run --directory . --no-sync pytest` counts as `uv run pytest`, and `npm --prefix frontend test` as `npm test`. Paths in those options must still be inside the project.
 
@@ -75,7 +78,10 @@ deps_mode = "hardlink"                      # hardlink | copy | symlink | none
 baseline = true                             # run checks on the untouched worktree first
 # worktrees_dir = "/Volumes/SSD/.mistral-worktrees"  # keep worktrees on the repo's disk
 # model = "mistral-medium-3.5"              # pin Mistral; otherwise Vibe's default may route elsewhere
-# model_prices = { "glm-5-3" = [1.0, 4.0] }  # $ per million tokens (input, output) for unpriced models
+# model_prices = { "glm-5-3" = [1.0, 4.0, 0.1] }  # per million tokens (input, output, cached) for unpriced models
+# monthly_credit = 225                       # subscription credit per month, shown in reports
+# min_savings = 2                            # flag kinds of task whose delegation doesn't pay off
+# autofix = ["ruff format ."]                # run before a fix round when checks fail
 [write]
 max_price = 1.50
 ```
@@ -115,7 +121,8 @@ The report starts with `run_id`, `status` and `verification`, then `usage` (cost
 - **verification: passed_except_preexisting.** Mistral broke nothing new, but some checks were already failing. Treat it like passed for Mistral's work, and look at the `baseline_warning`.
 - **verification: passed.** Review the diff for scope and quality, then run `adopt_with`. That applies only Mistral's changes to the checkout, leaves the user's uncommitted work alone, and removes the worktree. Use `--paths` to take part of it.
 - **verification: failed.** Read `failing_check_output`. Either follow up with `--resume … --worktree-name …` and a precise instruction, fix it yourself after adopting, or discard.
-- **status: budget_exceeded / tool_call_limit.** The wrapper stopped Mistral at a cap (`note:` says which, and the `budget:` line shows what was spent). The work so far is in the worktree: review it, resume with a higher cap, or discard it.
+- **status: budget_exceeded / tool_call_limit.** The wrapper stopped Mistral at a cap (`note:` says which, and the `budget:` line shows what was used). The work so far is in the worktree and has been checked, with one fix round. Review it, resume with a higher cap, or discard it.
+- **usage / credit.** Effective tokens (fresh, cached and output), the cost at list prices, and the month's credit used so far. Mention the credit when it's getting low.
 - **continued.** Mistral stopped without a closing summary and was asked once to finish. A remaining `final_message_warning` means it still didn't.
 - **status: limit_reached / timeout.** Resume with a higher cap, or finish it yourself.
 - **out_of_scope_changes.** Mistral edited files outside the scope. `--adopt` leaves them out. Look at them before deciding whether to add `--include-out-of-scope`, and never take them just to make a check pass.
