@@ -3,6 +3,9 @@
   "owner": {
     "name": "Collin Kasbergen"
   },
+  "metadata": {
+    "description": "Claude Code plugins for delegating tasks to Mistral's Vibe CLI."
+  },
   "plugins": [
     {
       "name": "mistral-delegate",
