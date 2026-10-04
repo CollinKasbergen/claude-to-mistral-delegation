@@ -80,11 +80,13 @@ model = "mistral-medium-3.5"
 
 # Commands that fix formatting-type check failures. They run before a
 # Mistral fix round, so a formatting failure costs no extra Mistral round.
-# Like checks, entries can be limited to paths so they only run when the task
-# touches them.
+# {files} is replaced by the files the run changed ({files:*.py} only those
+# matching), so existing code isn't reformatted; a command whose pattern matches
+# no changed file is skipped. Entries can also be limited to paths.
 # autofix = [
-#   { cmd = "ruff format .", paths = ["backend/"] },
-#   { cmd = "npm --prefix frontend run lint:fix", paths = ["frontend/"] },
+#   "uv run ruff format {files:*.py}",
+#   "uv run ruff check --fix {files:*.py}",
+#   { cmd = "npx prettier --write {files:*.ts,*.vue}", paths = ["frontend/"] },
 # ]
 
 # When a run changes both code and tests, also run its tests against the

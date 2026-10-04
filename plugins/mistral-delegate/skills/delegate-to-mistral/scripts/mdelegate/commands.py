@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
+from fnmatch import fnmatch
 
 from .guard import normalize_command
 
@@ -102,3 +105,26 @@ def expand(allowed: list[str], root: str) -> list[str]:
         if (py := _python_tool(words)):
             out += [form.format(tool=py) for form in PYTHON_FORMS]
     return list(dict.fromkeys(out))
+
+
+FILES = re.compile(r"\{files(?::([^}]+))?\}")
+
+
+def with_files(command: str, changed: list[str], run_dir: str = ".") -> str | None:
+    """An autofix command with {files} (or {files:*.py}) replaced by the changed files, relative to the folder
+    the command runs in. None when it names files and none of the changed files match: nothing to fix."""
+    if not FILES.search(command):
+        return command
+    missing = False
+
+    def fill(match: re.Match) -> str:
+        nonlocal missing
+        patterns = [p.strip() for p in (match.group(1) or "*").split(",")]
+        files = [f for f in changed if any(fnmatch(f, p) or fnmatch(os.path.basename(f), p) for p in patterns)]
+        files = [os.path.relpath(f, run_dir) for f in files if not os.path.relpath(f, run_dir).startswith("..")]
+        if not files:
+            missing = True
+        return " ".join(shlex.quote(f) for f in files)
+
+    filled = FILES.sub(fill, command)
+    return None if missing else filled

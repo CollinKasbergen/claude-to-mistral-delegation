@@ -171,7 +171,9 @@ def select(plan: Plan, wanted: list[str]) -> list[Step]:
         raise PlanError("no such step: " + ", ".join(unknown))
     missing = sorted({d for w in wanted for d in plan.step(w).depends if d not in wanted})
     if missing:
-        raise PlanError("the chosen steps depend on steps you left out: " + ", ".join(missing))
+        raise PlanError("the chosen steps depend on steps you left out: " + ", ".join(missing)
+                        + " (to finish a plan that already ran, use --integrate <plan id>: it runs the steps "
+                          "that didn't run)")
     return [s for s in plan.order() if s.id in wanted]
 
 

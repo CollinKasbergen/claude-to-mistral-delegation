@@ -346,6 +346,8 @@ def prepare_worktree(top: str, name: str, *, snapshot: bool, link_deps: bool, ex
             "links": state.get("links", []),
             "deps_mode": state.get("deps_mode"),
             "deps_methods": state.get("deps_methods") or {},
+            "start": state.get("start"),
+            "merged": state.get("merged") or [],
             "notes": [],
             "reused": True,
         }
@@ -364,7 +366,9 @@ def prepare_worktree(top: str, name: str, *, snapshot: bool, link_deps: bool, ex
         methods: dict = {}
         links, notes = prepare_dependencies(top, path, extra_links, auto=link_deps, mode=deps_mode, methods=methods)
         state = {"base": git(path, "rev-parse", "HEAD").strip(), "snapshot": snap, "links": links,
-                 "deps_mode": deps_mode if link_deps else "none", "deps_methods": methods}
+                 "deps_mode": deps_mode if link_deps else "none", "deps_methods": methods,
+                 # Where it started, when not from HEAD: a plan's starting code, plus the steps merged in.
+                 "start": None if start == "HEAD" else start, "merged": list(merge)}
         state_path(path).write_text(json.dumps(state))
     except (DelegateError, OSError, shutil.Error) as e:
         remove_worktree({"toplevel": top, "path": str(path), "name": name})
