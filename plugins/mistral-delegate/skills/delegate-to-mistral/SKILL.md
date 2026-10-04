@@ -1,75 +1,90 @@
 ---
 name: delegate-to-mistral
-description: Hand a self-contained coding task to Mistral's Vibe CLI (`vibe --prompt`) and get back a compact report. Use when the user asks to delegate to Mistral or Vibe, or for well-specified, low-risk, mechanical work that does not need this conversation's context (writing tests for existing code, boilerplate, docstrings, bulk renames, read-only searches and summaries of the codebase). Do not use for design decisions, data models, security-sensitive code, or anything you already hold most of the context for.
+description: Hand implementation steps to Mistral's Vibe CLI and get back checked results. Use whenever a step can be described in a short spec and checked automatically (tests, type check, lint, or a small diff): features that follow existing patterns, endpoints, refactors, multi-file migrations, bug fixes with a reproducing test, tests, fixtures, boilerplate, docs, and read-only codebase questions. Use it even when you hold the context: write that context into the spec. Also when the user asks to delegate to Mistral or Vibe. Keep for yourself: design decisions, visual judgement, and steps whose spec would be longer than the code.
 ---
 
 # Delegate to Mistral Vibe
 
-This skill runs one task through Vibe's programmatic mode with a hard turn and price cap. It returns Vibe's final answer, what the run cost, its session id and, for write tasks, the changes it made. You stay responsible for the result: review what comes back before you rely on it or adopt it.
+Mistral runs cost cents to about a dollar, take one to a few minutes, and work in an isolated git worktree while you keep going. The wrapper runs the project's checks on the result and sends failures back to Mistral for a fix, so what reaches you is already tested. Your job is to split the work, write good specs, review, and adopt.
 
-**Good fits:** tests for code that already exists (committed or not), boilerplate, docstrings and mechanical edits, and read-only questions about the codebase.
+## When to delegate
 
-**Keep for yourself:** design decisions, data models and migrations, rules that need judgement, anything visual, and anything that depends on this conversation.
+The session context names the active **policy** (`conservative`, `balanced` or `aggressive`); follow it. Under `balanced`, the default, the test is:
 
-## Before the first run
+1. **Can I write the spec in a few lines?** Goal, files, a pattern to follow, cases to cover.
+2. **Can it be checked automatically?** Tests, type check, lint, or a diff small enough to read.
 
-Check `vibe --version`. If Vibe is missing, tell the user to run `uv tool install mistral-vibe` (or `pip install mistral-vibe`) and then `vibe --setup` to store their Mistral API key. Don't install it yourself unless they ask.
+If both are yes, delegate it, even if you know exactly how you'd write it. Writing the code yourself is the expensive path. Keep design decisions, data-model choices, anything visual, and anything you can't check.
+
+**Habit:** after planning a change, label each step "mine" or "Mistral's". Start Mistral's steps in the background first, then do yours, then review and adopt.
+
+The session context may also show a **track record** per kind of task (adoption rate, checks passed, average cost). Delegate more of the kinds that do well. For kinds that are often discarded, write tighter specs, or keep them yourself.
 
 ## Running a task
 
-The wrapper is `scripts/delegate.py` in this skill's base directory. Call it with Bash:
+The wrapper path is in the session context (or `scripts/delegate.py` in this skill's base directory).
 
 ```bash
-python3 "<skill base dir>/scripts/delegate.py" --mode read  "<task>"
-python3 "<skill base dir>/scripts/delegate.py" --mode write "<task>"
+python3 <wrapper> --mode write --kind feature \
+  --spec /tmp/spec.md --context src/api/users.ts --context src/api/users.test.ts \
+  --verify "npm test" --verify "npx tsc --noEmit" \
+  --allow-command "npm test" \
+  "Add the /api/teams endpoint as described in the spec"
 ```
 
-For long prompts, pass `-` as the task and pipe the text through stdin with a heredoc. Runs usually take one to a few minutes. Run longer ones in the background and keep working.
+- `--mode read` (default): read-only tools, runs in place. Use it for codebase questions.
+- `--mode write`: a new worktree starting from the current code (uncommitted and untracked files included), with `node_modules`, `.venv` and similar folders linked from the checkout. `--link .env` adds others. `--in-place` edits the checkout directly; use it only when the user asks.
+- `--kind`: one of `tests feature bugfix refactor migration boilerplate docs search other`. It feeds the track record, so always set it.
+- `--spec FILE`: the plan, included in the prompt. Write it to a temp file outside the repo. `--context PATH` (repeatable) names files Mistral should read first.
+- `--verify CMD` (repeatable): checks the wrapper runs after Mistral finishes. On a failure, the output goes back to the same Mistral session for a fix (`--fix-attempts N`, default 1). **Always pass the project's real checks when they exist.** Configured checks apply automatically (see below).
+- `--allow-command CMD` (repeatable): command prefixes Mistral may run itself while working, e.g. the test command, so it can iterate. Each part of a chained command must match. Anything else stays refused. `--allow-shell` allows every command; use it only with the user's OK.
+- `--model ALIAS`: a Vibe model alias from the user's Vibe config, for this run.
+- Caps come from the policy (`--show-config` shows them). Override with `--max-turns`, `--max-price` or `--max-tokens` and tell the user when you raise them. Fix rounds add half the price cap each.
+- Follow-up on the same work: `--resume <session_id> --worktree-name <name>`, both from the report.
 
-### Read mode (default)
+### Parallel work
 
-Vibe's `plan` agent, restricted to `read_file`, `grep` and `todo`. It runs in place and can't change anything. Default cap is 15 turns and $0.25.
+Split a change into independent steps that touch different files, and start each as its own background run (Bash `run_in_background`) or its own `mistral-worker` subagent. Several can run at once (`max_parallel`, default 3). `python3 <wrapper> --status` lists them, and `--result <id>` prints a finished report. Adopt them one at a time.
 
-### Write mode
+### Project settings
 
-Vibe's `accept-edits` agent in a new git worktree on branch `mistral-<id>`, so the user's checkout isn't touched. Default cap is 30 turns and $1.00. The wrapper prepares the worktree so Vibe works on the current state of the code:
+`<repo>/.mistral-delegate.toml` (or `~/.mistral-delegate/config.toml` for all projects) sets defaults:
 
-- **Uncommitted work is included.** Modified and untracked (non-ignored) files are copied in and committed as a snapshot inside the worktree. You don't need to commit before delegating. `--no-snapshot` starts from HEAD instead.
-- **Dependencies are linked.** Ignored `node_modules`, `.venv`, `venv`, `vendor` and `bower_components` folders, including nested ones, are symlinked from the checkout. Add others with `--link PATH` (repeatable, relative to the repo root, e.g. `--link .env`), or turn this off with `--no-link-deps`. The links point at the user's real folders, so tell Vibe not to install or upgrade packages.
-- **Vibe changes are reported against the snapshot,** so the change list holds only what Vibe did.
+```toml
+policy = "balanced"                         # conservative | balanced | aggressive
+verify = ["npm test", "npx tsc --noEmit"]   # checks after every write run
+allow_commands = ["npm test", "npx vitest"] # commands Mistral may run itself
+fix_attempts = 1
+max_parallel = 3
+# model = "mistral-medium-3.5"
+[write]
+max_price = 1.50
+```
 
-`--in-place` skips the worktree and lets Vibe edit the checkout directly. Use it only when the user asks.
+If the project has tests but no config, suggest creating one to the user. In an unfamiliar repository, check the commands in an existing `.mistral-delegate.toml` before the first run, because they get executed.
 
-### Options
+## Writing the spec
 
-- `--max-turns N`, `--max-price DOLLARS`, `--max-tokens N`: override the caps. Raise them only when the task clearly needs more, and say so to the user.
-- `--allow-shell`: passes `--auto-approve`. Without it, Vibe's shell commands are denied, because programmatic mode refuses every tool call that needs approval. That means Vibe can't run the tests it writes. Use it in write mode when the task needs a test run and the user is fine with that, or run the tests yourself afterwards.
-- `--trust`: in read mode, loads the project's `.vibe/` config and `AGENTS.md`. Write-mode worktrees are always trusted.
-- **Follow-ups:** `--resume <session_id> --worktree-name <name>`, both copied from the earlier report. Vibe then keeps its memory of the task and the same worktree is reused.
-- `--timeout SECONDS` (default 900).
-
-## Writing the task prompt
-
-Vibe starts with none of your context. Write the prompt like a ticket for a capable contractor:
+Mistral starts with none of your context. The spec carries it:
 
 ```
 Goal: <one sentence>.
 Files: <paths to read>, <paths to create or change>.
-Follow: <existing file whose style to match>.
-Cases to cover: <bulleted list>.
-Don't: change files outside <paths>; install or upgrade packages.
-Finish with: each file you changed and one line on why; anything you couldn't do.
+Follow: <existing file whose patterns and style to match>.
+Requirements / cases: <bulleted, exhaustive list>.
+Out of scope: <what not to touch>.
 ```
 
-A precise list of cases matters most: Vibe covers what you list and seldom more.
+The wrapper adds the rules itself: which commands may run, which checks must pass, no package installs, no weakened tests, and a final summary. Mistral covers what you list and seldom more, so the cases list matters most.
 
 ## After the run
 
-Read the report:
+The report starts with `run_id`, `status` and `verification`, then `usage` (cost, steps, tokens), the change list, and the full diff when it is short.
 
-- `status`: `ok`, `limit_reached`, `timeout` or `error`. On `limit_reached`, decide whether to resume with a higher cap or finish the work yourself.
-- `usage`: what this run cost, against its cap, plus the number of steps and tokens. Mention the cost when you report back.
-- `tool_calls_not_completed`: denied or failed tool calls. If shell calls were denied, the tests haven't been run, so say so rather than presenting the work as verified.
-- **Write mode:** read the diff with the `review_with` command. Run the tests in `worktree_path`. To adopt the result, run the `apply_to_checkout_with` command, which applies only Vibe's changes to the user's checkout and leaves their uncommitted work as it is. Then run `cleanup_with`. If Vibe failed before changing anything, the wrapper has already removed the worktree.
+- **verification: passed.** Review the diff for scope and quality, then run `adopt_with`. That applies only Mistral's changes to the checkout, leaves the user's uncommitted work alone, and removes the worktree. Use `--paths` to take part of it.
+- **verification: failed.** Read `failing_check_output`. Either follow up with `--resume … --worktree-name …` and a precise instruction, fix it yourself after adopting, or discard.
+- **status: limit_reached / timeout.** Resume with a higher cap, or finish it yourself.
+- **Not worth keeping.** `--discard <id> --note "why"`. The note feeds the track record.
+- Always adopt or discard, so worktrees don't pile up. The session context lists runs still awaiting a decision.
 
-Tell the user, briefly, that the task went to Mistral, what came back, what it cost, and what you checked. Never present Vibe's output as verified when you haven't checked it.
+Tell the user briefly what went to Mistral, what came back, what it cost, and what you checked. Never present unchecked output as verified.

@@ -1,10 +1,9 @@
 ---
-description: Delegate a task to Mistral's Vibe CLI
-argument-hint: "[read|write] <task description>"
+description: Delegate a task to Mistral's Vibe CLI, or show delegation status and stats
+argument-hint: "[read|write] <task> | status | stats | config"
 ---
 
-Delegate this task to Mistral Vibe using the `delegate-to-mistral` skill:
+Arguments: $ARGUMENTS
 
-$ARGUMENTS
-
-If the first word is `read` or `write`, use it as the mode and treat the rest as the task. Otherwise choose the mode yourself: `read` unless the task asks for files to be created or changed. Turn the task into a self-contained prompt for Vibe, run it, review the result, and report back.
+- If the arguments are `status`, `stats` or `config`, run the delegate-to-mistral wrapper with `--status`, `--stats` or `--show-config` and show the output.
+- Otherwise delegate this task using the `delegate-to-mistral` skill. If the first word is `read` or `write`, use it as the mode and treat the rest as the task. If not, choose: `read` unless the task asks for files to be created or changed. Write a spec, pass the project's checks with `--verify`, set `--kind`, run it, review the result, and report back with the run id, cost and your adopt/discard recommendation.
