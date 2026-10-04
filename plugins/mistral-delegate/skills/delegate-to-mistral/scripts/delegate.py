@@ -52,7 +52,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mdelegate import commands as cmdforms, config, gitops, guard, ledger, vibe  # noqa: E402
-from mdelegate.checks import (EDITABLE_SOURCES, check_lines, measure_baseline, new_failures,  # noqa: E402
+from mdelegate.checks import (EDITABLE_SOURCES, CheckResult, check_lines, measure_baseline, new_failures,  # noqa: E402
                               python_path_env, run_checks, stop_process_group)
 from mdelegate.gitops import DelegateError  # noqa: E402
 
@@ -436,6 +436,8 @@ CONTINUE_PROMPT = ("You stopped before finishing. Continue the task from where y
 
 READ_ONLY_TOOL = re.compile(r"read|grep|glob|search|todo|list|view", re.I)
 
+SHELL_TOOLS = {"bash", "shell", "sh", "run command", "run_command", "terminal", "exec"}
+
 CANCELLED = re.compile(r"<user_cancellation>|User cancelled the operation")
 
 
@@ -469,7 +471,9 @@ def unfinished_reason(turn: list, final_text: str) -> str:
     if last and last.get("type") == "effect":
         return "Vibe's last step was a tool call, not a closing summary; the run may have stopped early."
     text = final_text.rstrip()
-    if text and (text.endswith(("…", "...", ":", ",", ";", "(")) or re.search(r"\b(and|the|to)$", text)):
+    if not text:
+        return "Mistral ended without a final message, so there's no summary of what it did; read the diff."
+    if text.endswith(("…", "...", ":", ",", ";", "(")) or re.search(r"\b(and|the|to)$", text):
         return "Mistral's final message stops mid-sentence; the run may have been cut short."
     return ""
 
@@ -579,7 +583,7 @@ def run_task(args: argparse.Namespace) -> int:
     spec = None
     if args.spec:
         try:
-            spec = Path(args.spec).read_text(encoding="utf-8")
+            spec = gitops.find_document(args.spec, gitops.toplevel(workdir), "spec").read_text(encoding="utf-8")
         except OSError as e:
             raise DelegateError(f"Can't read --spec file: {e}") from e
     task = (args.task or "").strip() or ("Implement the spec below." if spec else "")
@@ -591,6 +595,8 @@ def run_task(args: argparse.Namespace) -> int:
     if not Path(workdir).is_dir():
         raise DelegateError(f"--workdir {workdir} doesn't exist.")
     top = gitops.toplevel(workdir)
+    if top:
+        gitops.work_dir(top)  # keeps the plans and specs folder out of git from the first run on
     settings = config.load(top or workdir)
     if settings["errors"]:
         # Running without the project's settings would also run without its checks and caps.
@@ -699,8 +705,10 @@ def run_task(args: argparse.Namespace) -> int:
     # The guard hook refuses disallowed tool calls with an error Mistral can work around,
     # instead of letting Vibe's approval prompt cancel the session.
     guard_root = os.path.realpath(wt["path"] if wt else (top or workdir))
-    guard_log = ledger.runs_dir() / f"{run_id}.guard.jsonl"
-    guard_log.parent.mkdir(parents=True, exist_ok=True)
+    guard_log = ledger.run_file(run_id, "guard.jsonl")
+    # What Mistral was asked, kept with the run: a spec written to a scratch folder may not survive.
+    ledger.run_file(run_id, "spec.md").write_text(f"# Task\n\n{task}\n" + (f"\n# Spec\n\n{spec}\n" if spec else ""),
+                                               encoding="utf-8")
     guard_warning = guard.install(vibe.vibe_home(), config.home())
     run = Run(args)
     run.run_id = run_id
@@ -755,7 +763,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     # A failing check is rerun once, so a flaky one isn't reported as broken.
     baseline, flaky, baseline_source = {}, [], ""
     if commands and baseline_on:
-        stored = {c: tuple(v) for c, v in (gitops.load_state(wt["path"]).get("baseline") or {}).items()} if wt else {}
+        stored = {c: CheckResult.load(v) for c, v in (gitops.load_state(wt["path"]).get("baseline") or {}).items()} \
+            if wt else {}
         if wt and wt["reused"]:
             # This worktree already holds Mistral's earlier changes. Use the baseline from before them,
             # and run any check missing from it on a clean copy of the original snapshot.
@@ -772,7 +781,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         else:
             baseline = measure_baseline(commands, run_dir, args.verify_timeout, flaky)
         if wt:
-            gitops.save_state(wt["path"], {"baseline": {**stored, **{c: list(v) for c, v in baseline.items()}}})
+            gitops.save_state(wt["path"], {"baseline": {c: v.stored() for c, v in {**stored, **baseline}.items()}})
     preexisting = [cmd for cmd, (code, _out) in baseline.items() if code != 0]
 
     prompt = vibe.build_prompt(task, mode=args.mode, spec=spec, context=args.context, verify=commands,
@@ -1034,12 +1043,19 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                      + "\n".join(f"  - {d}" for d in guard_denied[:15]))
     guard_targets = {str(e.get("target")) for e in guard_events if e.get("action") == "deny"}
     vibe_denied = [d for d in run.denied if d.split(": ", 1)[-1] not in guard_targets]
-    if vibe_denied:
-        counts = Counter(vibe_denied)
+    # Shell commands are refused for not being allowed; other tools (an edit, a write) for other reasons.
+    denied_shell = [d for d in vibe_denied if d.split(":", 1)[0].strip().lower() in SHELL_TOOLS]
+    denied_other = [d for d in vibe_denied if d not in denied_shell]
+    if denied_shell:
+        counts = Counter(denied_shell)
         why = ("refused because they aren't in allow_commands; add them if Mistral needs them" if write
                else "read mode runs no commands")
         lines.append(f"denied_commands ({why}):\n"
                      + "\n".join(f"  - {cmd}" + (f"  ({n}x)" if n > 1 else "") for cmd, n in counts.most_common(15)))
+    if denied_other:
+        counts = Counter(denied_other)
+        lines.append("refused_tool_calls (Vibe's own permissions refused these; they aren't shell commands):\n"
+                     + "\n".join(f"  - {call}" + (f"  ({n}x)" if n > 1 else "") for call, n in counts.most_common(15)))
     if run.problems:
         lines.append("tool_calls_failed:\n" + "\n".join(f"  - {p}" for p in run.problems[:20]))
     notices = [n for n in run.notices if "Rewrote tool_input" not in n]
@@ -1153,7 +1169,7 @@ def worktree_section(wt: dict, run_id: str, files: list[str], out_of_scope: list
         diff = gitops.changes_diff(wt)
         n = diff.count("\n")
         # The full diff is kept with the run's report, so it can still be read after --adopt removes the worktree.
-        diff_file = ledger.runs_dir() / f"{run_id}.diff"
+        diff_file = ledger.run_file(run_id, "changes.diff")
         try:
             diff_file.parent.mkdir(parents=True, exist_ok=True)
             diff_file.write_text(diff, encoding="utf-8")

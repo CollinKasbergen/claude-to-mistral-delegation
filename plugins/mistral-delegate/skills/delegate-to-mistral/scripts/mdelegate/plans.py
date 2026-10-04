@@ -22,14 +22,15 @@ import uuid
 from pathlib import Path
 
 from . import config, gitops, ledger, vibe
-from .checks import check_lines, measure_baseline, new_failures, run_checks, stop_process_group
+from .checks import CheckResult, check_lines, measure_baseline, new_failures, run_checks, stop_process_group
 from .gitops import DelegateError
 from .plan import Plan, PlanError, Step, parse, select, step_spec
 
 POLL = max(0.05, min(1.0, float(os.environ.get("MISTRAL_DELEGATE_WATCH_INTERVAL") or 1.0)))
 # Report lines from a step worth repeating in the plan's report.
 STEP_NOTE_PREFIXES = ("out_of_scope_changes", "test_strength_warning", "final_message_warning", "missing_files",
-                      "baseline_warning", "budget_warning", "note:", "denied_commands", "checks_skipped")
+                      "baseline_warning", "budget_warning", "note:", "denied_commands", "refused_tool_calls",
+                      "checks_skipped")
 SUCCESS_VERIFICATIONS = ("passed", "passed_except_preexisting", "not_run")
 
 
@@ -97,7 +98,7 @@ class PlanRun:
         return cmd + [task]
 
     def spawn(self, key: str, cmd: list[str]) -> None:
-        log_path = ledger.runs_dir() / f"{self.plan_id}.{key}.log"
+        log_path = ledger.run_file(self.plan_id, f"{key}.log")
         log = log_path.open("w", encoding="utf-8")
         proc = subprocess.Popen(cmd, cwd=self.workdir, stdout=log, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
@@ -151,7 +152,7 @@ class PlanRun:
         self.step_wts[step.id] = wt
         ledger.append({"event": "update", "id": self.plan_id, "step_worktrees": {
             k: {f: v[f] for f in ("name", "path", "toplevel", "base", "links")} for k, v in self.step_wts.items()}})
-        spec = ledger.runs_dir() / f"{self.plan_id}.{step.id}.spec.md"
+        spec = ledger.run_file(self.plan_id, f"{step.id}.spec.md")
         spec.write_text(step_spec(self.plan, step), encoding="utf-8")
         kind = step.kind or self.plan.kind or "other"
         task = f"{self.plan.title} [{step.id}]: {step.summary()}"
@@ -254,12 +255,13 @@ class PlanRun:
 
     def baseline_for(self, commands: list[str]) -> dict:
         """Check results on the plan's starting code: from steps that started there, else a clean copy."""
-        baseline = {c: tuple(v) for c, v in (gitops.load_state(self.int_wt["path"]).get("baseline") or {}).items()}
+        baseline = {c: CheckResult.load(v) for c, v in
+                    (gitops.load_state(self.int_wt["path"]).get("baseline") or {}).items()}
         for step in self.steps:
             wt = self.step_wts.get(step.id)
             if not step.depends and wt and os.path.isdir(wt["path"]):
                 for command, value in (gitops.load_state(wt["path"]).get("baseline") or {}).items():
-                    baseline.setdefault(command, tuple(value))
+                    baseline.setdefault(command, CheckResult.load(value))
         missing = [c for c in commands if c not in baseline]
         if missing and self.settings["baseline"] and not self.args.no_baseline:
             try:
@@ -267,7 +269,7 @@ class PlanRun:
                     baseline.update(measure_baseline(missing, str(clean / self.rel), self.args.verify_timeout, []))
             except DelegateError:
                 pass
-        gitops.save_state(self.int_wt["path"], {"baseline": {c: list(v) for c, v in baseline.items()}})
+        gitops.save_state(self.int_wt["path"], {"baseline": {c: v.stored() for c, v in baseline.items()}})
         return baseline
 
     def fix_integration(self, failures: list, commands: list[str], merged: list[str]) -> dict:
@@ -278,7 +280,7 @@ class PlanRun:
             lines.append("## Shared context\n\n" + self.plan.shared)
         lines.append("## What's wrong\n\nEach step passed its own checks, but together they don't:\n\n"
                      + vibe.fix_prompt(failures))
-        spec = ledger.runs_dir() / f"{self.plan_id}.integration.spec.md"
+        spec = ledger.run_file(self.plan_id, "integration.spec.md")
         spec.write_text("\n\n".join(lines) + "\n", encoding="utf-8")
         # The merged steps' scope: files named by steps that didn't merge aren't expected to exist.
         scope = [] if not all(self.plan.step(s).scope for s in merged) else list(dict.fromkeys(
@@ -414,7 +416,7 @@ class PlanRun:
         lines.append("changes (all merged steps):\n" + (stat or "  (none)"))
         diff = gitops.changes_diff(self.int_wt)
         n = diff.count("\n")
-        diff_file = ledger.runs_dir() / f"{self.plan_id}.diff"
+        diff_file = ledger.run_file(self.plan_id, "changes.diff")
         try:
             diff_file.write_text(diff, encoding="utf-8")
         except OSError:
@@ -456,6 +458,7 @@ def _setup(args) -> tuple[str, str, dict]:
     top = gitops.toplevel(workdir)
     if not top:
         raise DelegateError("Plans need a git repository: each step runs in its own worktree.")
+    gitops.work_dir(top)
     settings = config.load(top)
     if settings["errors"]:
         raise DelegateError("Fix the config first (nothing was run):\n" + "\n".join(f"  {e}" for e in settings["errors"]))
@@ -469,8 +472,9 @@ def _setup(args) -> tuple[str, str, dict]:
 def main(args, script: Path, kinds: tuple, script_cmd) -> int:
     if args.integrate:
         return integrate_again(args, script, script_cmd)
+    top = gitops.toplevel(str(Path(args.workdir).resolve()))
     try:
-        plan_text = Path(args.plan).read_text(encoding="utf-8")
+        plan_text = gitops.find_document(args.plan, top, "plan").read_text(encoding="utf-8")
     except OSError as e:
         raise DelegateError(f"Can't read the plan file: {e}") from e
     try:
@@ -487,8 +491,7 @@ def main(args, script: Path, kinds: tuple, script_cmd) -> int:
         raise DelegateError("Vibe CLI not found. Install it with `uv tool install mistral-vibe`, then run "
                             "`vibe --setup` once.")
     plan_id = f"plan-{uuid.uuid4().hex[:8]}"
-    ledger.runs_dir().mkdir(parents=True, exist_ok=True)
-    (ledger.runs_dir() / f"{plan_id}.plan.md").write_text(plan_text, encoding="utf-8")
+    ledger.run_file(plan_id, "plan.md").write_text(plan_text, encoding="utf-8")
     run = PlanRun(args, script, settings, top, workdir, plan, steps, plan_id, script_cmd)
     ledger.append({"event": "start", "id": plan_id, "time": time.time(), "pid": os.getpid(),
                    "pid_started": ledger.process_started(os.getpid()), "mode": "plan", "kind": "plan",
@@ -544,9 +547,16 @@ def _refuse_while_running(plan_record: dict) -> None:
 
 def _load_plan(plan_record: dict) -> Plan:
     try:
-        return parse((ledger.runs_dir() / f"{plan_record['id']}.plan.md").read_text(encoding="utf-8"))
+        return parse(_plan_text(plan_record["id"]))
     except (OSError, PlanError) as e:
         raise DelegateError(f"Can't read plan {plan_record['id']}'s saved plan file: {e}") from e
+
+
+def _plan_text(plan_id: str) -> str:
+    for path in (ledger.runs_dir() / plan_id / "plan.md", ledger.runs_dir() / f"{plan_id}.plan.md"):
+        if path.is_file():
+            return path.read_text(encoding="utf-8")
+    raise OSError(f"no saved plan for {plan_id}")
 
 
 def _latest_on(path: str) -> dict | None:
@@ -594,7 +604,7 @@ def integrate_again(args, script: Path, script_cmd) -> int:
             run.results[step.id] = result
         integration = run.integrate()
         report, end = run.report(integration)
-        run.record_end(report, end, (ledger.runs_dir() / f"{record['id']}.plan.md").read_text(encoding="utf-8"))
+        run.record_end(report, end, _plan_text(record["id"]))
     except BaseException as e:
         ledger.append({"event": "end", "id": record["id"], "verification": "not_run",
                        "status": "interrupted" if isinstance(e, (SystemExit, KeyboardInterrupt)) else "error",

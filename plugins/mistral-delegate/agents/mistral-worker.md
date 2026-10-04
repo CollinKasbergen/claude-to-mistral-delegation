@@ -16,7 +16,7 @@ find ~/.claude/plugins -path '*delegate-to-mistral/scripts/delegate.py' 2>/dev/n
 
 ## 2. Write the spec
 
-Read just enough of the relevant files to write a precise spec, then save it to a temporary file outside the repo (e.g. `/tmp/mistral-spec-<something>.md`):
+Read just enough of the relevant files to write a precise spec, then save it as `<repo>/.mistral-delegate/specs/<name>.md` (kept across sessions, ignored by git, never copied into Mistral's worktree; don't put specs anywhere else in the repo):
 
 ```
 Goal: <one sentence>.
@@ -34,7 +34,7 @@ Proofread the spec before running: Mistral copies names, paths and wording from 
 
 ```bash
 python3 <wrapper> --via-worker --mode write --kind <tests|feature|bugfix|refactor|migration|boilerplate|docs|other> \
-  --spec /tmp/mistral-spec-....md --context <file> --context <file> \
+  --spec <name> --context <file> --context <file> \
   --scope "<file or glob Mistral may change>" [--scope "..."] \
   --verify "<check command>" [--verify "<another>"] \
   [--allow-command "<test command>"] \

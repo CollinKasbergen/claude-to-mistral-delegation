@@ -162,6 +162,10 @@ FAKE_VIBE = textwrap.dedent('''\
     if os.environ.get("FAKE_VIBE_UNFINISHED") and "You stopped before finishing" not in prompt:
         turn.append(dict(entry, id=f"t{len(calls)}", type="effect", title="Read file",
                          detail={"toolName": "read_file", "input": {"path": "app.py"}}, state={"status": "completed"}))
+    if os.environ.get("FAKE_VIBE_DENIED_EDIT"):
+        turn.insert(2, dict(entry, id=f"e{len(calls)}", type="effect", title="Edit",
+                            detail={"kind": "file_edit", "toolName": "search_replace", "input": {"file_path": "app.py"}},
+                            state={"status": "skipped", "reason": "denied", "display": {}}))
     if os.environ.get("FAKE_VIBE_REWRITE_NOTICES"):
         for i in range(3):
             turn.append(dict(entry, id=f"n{len(calls)}{i}", type="notice", level="warning", detail={},
@@ -208,7 +212,8 @@ class DelegateTestBase(unittest.TestCase):
                     "FAKE_VIBE_TOUCH_APP", "FAKE_VIBE_HOOK_CALLS", "FAKE_VIBE_NO_WRITE", "FAKE_VIBE_CANCEL",
                     "FAKE_VIBE_MODEL", "FAKE_VIBE_EXPERIMENT_PRICE", "FAKE_VIBE_SPEND", "FAKE_VIBE_EFFECTS",
                     "FAKE_VIBE_UNFINISHED", "FAKE_VIBE_CACHED", "FAKE_VIBE_CACHED_COMPLETION", "FAKE_VIBE_REWRITE_NOTICES",
-                    "FAKE_VIBE_CHILD", "FAKE_VIBE_OLD_CANCEL", "GIT_CONFIG_GLOBAL", "FAKE_VIBE_UNIQUE_SESSION"):
+                    "FAKE_VIBE_CHILD", "FAKE_VIBE_OLD_CANCEL", "GIT_CONFIG_GLOBAL", "FAKE_VIBE_UNIQUE_SESSION",
+                    "FAKE_VIBE_DENIED_EDIT"):
             self.env.pop(var, None)
 
     def tearDown(self):
@@ -811,6 +816,47 @@ class WriteModeTest(DelegateTestBase):
         self.assertIn("config_warning: ignored unknown setting [write] 'max-price'", report)
         self.assertIn("first pass at 500,000 effective tokens", report)
 
+    def test_new_errors_in_an_already_failing_check_count(self):
+        check = ('echo "src/a.ts(1,1): error TS1: old"; '
+                 'test -f test_app.py && echo "src/b.test.ts(3,4): error TS2: global.Date is new"; exit 1')
+        out = self.run_delegate("--mode", "write", "--verify", check, "Task")
+        self.assertIn("verification: failed (after 1 fix attempt)", out.stdout)
+        self.assertIn("it failed before Mistral too, but with 1 new error line(s) now", out.stdout)
+        fix_prompt = self.calls()[-1]["prompt"]
+        self.assertIn("these errors are new:\nsrc/b.test.ts(N,N): error TSN: global.Date is new", fix_prompt)
+
+    def test_an_already_failing_check_with_the_same_errors_stays_preexisting(self):
+        check = 'echo "\033[31msrc/a.ts($(ls | wc -l),1): error TS1: old\033[0m"; exit 1'  # line moves, colour
+        out = self.run_delegate("--mode", "write", "--verify", check, "Task")
+        self.assertIn("verification: passed_except_preexisting", out.stdout)
+        self.assertIn("already failing before Mistral changed anything", out.stdout)
+
+    def test_refused_edits_arent_listed_as_commands(self):
+        out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_DENIED_EDIT="1")
+        commands = out.stdout.split("denied_commands")[1].split("\n\n")[0].split("refused_tool_calls")[0]
+        self.assertIn("bash: npx vitest run", commands)
+        self.assertNotIn("search_replace", commands)
+        self.assertIn("refused_tool_calls (Vibe's own permissions refused these; they aren't shell commands):\n"
+                      "  - search_replace: app.py", out.stdout)
+
+    def test_a_spec_by_name_and_the_run_folder(self):
+        specs = self.repo / ".mistral-delegate" / "specs"
+        specs.mkdir(parents=True)
+        (specs / "teams.md").write_text("Add the teams endpoint.\n")
+        out = self.run_delegate("--mode", "write", "--spec", "teams", "Task")
+        prompt = self.last()["prompt"]
+        self.assertIn("Add the teams endpoint.", prompt)
+        self.assertIn("Other plans, specs or notes you come across in the project are background", prompt)
+        run = self.home / "runs" / self.value(out, "run_id")
+        self.assertIn("Add the teams endpoint.", (run / "spec.md").read_text())
+        for name in ("report.md", "changes.diff"):
+            self.assertTrue((run / name).exists(), name)
+        self.assertIn("status: ok", self.run_delegate("--result", self.value(out, "run_id")).stdout)
+        (self.home / "runs" / "mistral-old00001.txt").write_text("status: ok (an old report)\n")
+        with open(self.home / "ledger.jsonl", "a") as f:
+            f.write(json.dumps({"event": "start", "id": "mistral-old00001", "time": 1}) + "\n")
+        self.assertIn("an old report", self.run_delegate("--result", "mistral-old00001").stdout)
+
     def test_no_changes_is_its_own_status(self):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_NO_WRITE="1")
         self.assertEqual(out.returncode, 1)
@@ -1340,6 +1386,19 @@ class PlanRunTest(DelegateTestBase):
         self.assertEqual(out.returncode, 0, out.stdout)
         self.assertEqual(list((self.home / "worktrees").glob("*/plan-*")), [])
 
+    def test_plans_and_specs_live_in_the_project_folder(self):
+        plans = self.repo / ".mistral-delegate" / "plans"
+        plans.mkdir(parents=True)
+        (plans / "two-files.md").write_text("# Two\n## step: a\nscope: a.txt, test_app.py\nFAKE_FILE a.txt A\n")
+        out = self.run_delegate("--plan", "two-files")
+        self.assertIn("status: ok", out.stdout)
+        self.assertNotIn(".mistral-delegate", self.calls()[0]["files"])  # never copied into a worktree
+        self.assertEqual(self.git("status", "--porcelain"), "")  # ignored by git
+        plan_id = self.value(out, "plan_id")
+        self.assertTrue((self.home / "runs" / plan_id / "plan.md").is_file())
+        self.assertTrue((self.home / "runs" / plan_id / "report.md").is_file())
+        self.assertTrue((self.home / "runs" / plan_id / "a.spec.md").is_file())
+
     def test_steps_wait_for_free_slots(self):
         (self.home).mkdir(parents=True, exist_ok=True)
         (self.home / "config.toml").write_text("max_parallel = 2\n")
@@ -1429,6 +1488,11 @@ class HookTest(DelegateTestBase):
         (self.repo / ".mistral-delegate.toml").write_text("policy = balanced\n")
         context = self.run_hook(self.env)
         self.assertIn("Config problem", context)
+
+    def test_session_start_names_the_plans_folder(self):
+        context = self.run_hook(self.env)
+        self.assertIn(".mistral-delegate/plans/<name>.md", context)
+        self.assertFalse((self.repo / ".mistral-delegate").exists())  # nothing is created at session start
 
 
 
@@ -1731,6 +1795,7 @@ class UnfinishedRunTest(unittest.TestCase):
         for text in ("Added a test for the export command", "Added the `export` subcommand", "Set it to auto"):
             self.assertEqual(f([msg(text)], text), "", text)
         self.assertIn("mid-sentence", f([msg("Then I updated the")], "Then I updated the"))
+        self.assertIn("without a final message", f([msg("")], ""))
         summary = "Added tests for the shop list: paused shops, renamed shops, and the empty state. Files: a.test.ts."
         self.assertEqual(f([msg(summary), tool], summary), "")  # a trailing read after a real summary is fine
 
@@ -1778,6 +1843,14 @@ class GitOpsTest(unittest.TestCase):
             while time.time() < deadline and _alive(pid):
                 time.sleep(0.05)
             self.assertFalse(_alive(pid))
+
+    def test_checks_run_without_colour(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import delegate
+        results = delegate.run_checks(["printf '\\033[31merror\\033[0m '; echo $NO_COLOR $FORCE_COLOR; exit 1"],
+                                      tempfile.gettempdir(), 10)
+        code, out = next(iter(results.values()))
+        self.assertEqual((code, out), (1, "error 1 0"))
 
     def test_checks_with_non_utf8_output_dont_crash(self):
         sys.path.insert(0, str(SCRIPT.parent))

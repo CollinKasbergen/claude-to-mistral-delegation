@@ -15,6 +15,7 @@ import os
 import subprocess
 import time
 from collections import Counter, defaultdict
+from pathlib import Path
 
 from . import config
 
@@ -127,17 +128,29 @@ def running(runs: dict[str, dict]) -> list[dict]:
     return [r for r in runs.values() if state(r) == "running"]
 
 
+def run_file(run_id: str, name: str) -> Path:
+    """A file in a run's (or plan's) own folder: ~/.mistral-delegate/runs/<id>/<name>.
+
+    report.md   the report the wrapper printed       spec.md     the task and spec Mistral got
+    changes.diff  everything the run changed         guard.jsonl  the guard's decisions
+    plan.md     a plan as it was run                  <step>.spec.md, <step>.log  a plan step's spec and output
+    """
+    folder = runs_dir() / run_id
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / name
+
+
 def save_report(run_id: str, text: str) -> None:
-    d = runs_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    (d / f"{run_id}.txt").write_text(text, encoding="utf-8")
+    run_file(run_id, "report.md").write_text(text, encoding="utf-8")
 
 
 def read_report(run_id: str) -> str | None:
-    try:
-        return (runs_dir() / f"{run_id}.txt").read_text(encoding="utf-8")
-    except OSError:
-        return None
+    for path in (runs_dir() / run_id / "report.md", runs_dir() / f"{run_id}.txt"):  # before 0.15: flat files
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+    return None
 
 
 def _age(seconds: float) -> str:
