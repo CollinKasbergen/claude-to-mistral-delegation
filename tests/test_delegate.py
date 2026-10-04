@@ -1247,6 +1247,16 @@ class ConfigTest(DelegateTestBase):
         self.assertIn("write_caps: token_budget=400,000 effective tokens, max_tool_calls=50, max_turns=20", out.stdout)
         self.assertIn("source of policy: project", out.stdout)
 
+    def test_status_shows_this_projects_runs(self):
+        self.run_delegate("Task")
+        with open(self.home / "ledger.jsonl", "a") as f:
+            f.write(json.dumps({"event": "start", "id": "read-elsewhere", "pid": 0, "mode": "read",
+                                "workdir": "/somewhere/else", "time": time.time()}) + "\n")
+        out = self.run_delegate("--status")
+        self.assertNotIn("read-elsewhere", out.stdout)
+        self.assertIn("1 run(s) in other projects not shown", out.stdout)
+        self.assertIn("read-elsewhere", self.run_delegate("--status", "--all-repos").stdout)
+
     def test_max_parallel_is_enforced(self):
         self.home.mkdir(parents=True)
         (self.home / "config.toml").write_text("max_parallel = 1\n")
@@ -1601,6 +1611,23 @@ class PlanRunTest(DelegateTestBase):
             """)
         out = self.run_delegate("--plan", str(plan))
         self.assertIn("(1 needed a fix round: a)", out.stdout)
+
+    def test_step_notes_are_whole_and_listed_once(self):
+        (self.repo / ".mistral-delegate.toml").write_text('verify = ["false"]\n')  # fails before Mistral, everywhere
+        plan = self.plan("""\
+            # Notes
+            ## step: a
+            FAKE_FILE tests/test_loose.py assert 1 in [1, 2]
+            ## step: b
+            FAKE_FILE b.txt B
+            """)
+        out = self.run_delegate("--plan", str(plan))
+        notes = out.stdout.split("step_notes")[1].split("\nverification")[0]
+        self.assertEqual(notes.count("baseline_warning"), 1)
+        self.assertIn("all steps: baseline_warning", notes)
+        self.assertIn("a: assertion_hint", notes)
+        self.assertIn("tests/test_loose.py: assert 1 in [1, 2]", notes)  # the example, not cut off at "e.g"
+        self.assertIn("checks passed_except_preexisting first try", out.stdout)
 
     def test_steps_wait_for_free_slots(self):
         (self.home).mkdir(parents=True, exist_ok=True)
@@ -2159,6 +2186,14 @@ class LedgerTest(unittest.TestCase):
                       "effective": 300_000}}
         row = next(line for line in ledger.format_stats(runs).splitlines() if line.startswith("docs"))
         self.assertIn("300,000", row)  # not 150,000: run a predates effective tokens
+
+    def test_denied_commands_say_when_they_were_last_seen(self):
+        from mdelegate import ledger
+        runs = {"a": {"id": "a", "kind": "tests", "status": "ok", "started": time.time(),
+                      "denied": ["bash: uv run mypy shelf", "tool"]}}
+        stats = ledger.format_stats(runs)
+        self.assertIn("1x  bash: uv run mypy shelf  (last ", stats)
+        self.assertNotIn("x  tool", stats)
 
     def test_status_uses_the_currency(self):
         from mdelegate import ledger

@@ -334,17 +334,21 @@ class PlanRun:
         lines.append("steps:")
         for step in self.steps:
             lines.append("  " + self.step_line(step, integration))
-        notes = []
+        notes: dict[str, list[str]] = {}  # note -> the steps that reported it
         for step in self.steps:
             report_lines = (self.results.get(step.id) or {}).get("report", "").splitlines()
             for n, line in enumerate(report_lines):
                 if line.startswith(STEP_NOTE_PREFIXES):
-                    # A note's first sentence, and the list items under it.
-                    first = line if line.startswith(("out_of_scope", "missing_files")) else line.split(". ")[0]
+                    # Notes whose example matters stay whole; others keep their first sentence and list items.
+                    whole = line.startswith(("out_of_scope", "missing_files", "assertion_hint", "test_strength"))
+                    first = line[:500] if whole else line.split(". ")[0][:300]
                     items = [ln.strip() for ln in report_lines[n + 1:n + 6] if ln.startswith("  - ")]
-                    notes.append(f"  {step.id}: {first[:300]}" + (" " + "; ".join(items) if items else ""))
+                    notes.setdefault(first + (" " + "; ".join(items) if items else ""), []).append(step.id)
         if notes:
-            lines.append("step_notes (from the steps' own reports):\n" + "\n".join(notes))
+            # The same note from several steps (a baseline warning every step sees) is listed once.
+            lines.append("step_notes (from the steps' own reports):\n" + "\n".join(
+                f"  {', '.join(steps) if len(steps) < len(self.steps) else 'all steps'}: {note}"
+                for note, steps in notes.items()))
         if integration["commands"]:
             fix = integration.get("fix")
             lines.append(f"verification: {verification} (the merged steps together"
@@ -390,7 +394,10 @@ class PlanRun:
             parts.append("no checks")
         elif result.get("verification"):
             used = record.get("fix_attempts_used")
-            parts.append(f"checks {result['verification']}" + (f" after {used} fix round(s)" if used else ""))
+            parts.append(f"checks {result['verification']}"
+                         + (f" after {used} fix round(s)" if used else " first try" if result.get("run_id") else ""))
+        if record.get("unfinished"):
+            parts.append("no closing summary (read its diff)")
         if record.get("files_changed") is not None:
             parts.append(f"{record['files_changed']} file(s)")
         # The step's cost over all its runs (a failed attempt and its follow-up), as in the plan's total.

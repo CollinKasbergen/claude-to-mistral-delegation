@@ -304,15 +304,25 @@ def _adopted(s: dict) -> str:
     return text + (f" (+{s['partial']} partial)" if s["partial"] else "")
 
 
-def top_denied(runs: dict[str, dict], days: int = 90, limit: int = 5) -> list[tuple[str, int]]:
+def in_repo(run: dict, top: str) -> bool:
+    """Whether a run was started in this repository (its workdir is inside it)."""
+    workdir = str(run.get("workdir") or "")
+    return workdir == top or workdir.startswith(top.rstrip("/") + "/")
+
+
+def top_denied(runs: dict[str, dict], days: int = 90, limit: int = 5) -> list[tuple[str, int, float]]:
+    """The most denied commands: (command, times, when it was last denied)."""
     cutoff = time.time() - days * 86400
     counts: Counter = Counter()
+    last: dict[str, float] = {}
     for r in runs.values():
         if (r.get("started") or 0) >= cutoff:
             # Unnamed entries ("tool") were guard refusals recorded twice by earlier versions: they say nothing.
-            counts.update(d for d in (r.get("denied") or []) if isinstance(d, str)
-                          and d not in ("tool", "a tool call Vibe didn't name"))
-    return counts.most_common(limit)
+            for d in r.get("denied") or []:
+                if isinstance(d, str) and d not in ("tool", "a tool call Vibe didn't name"):
+                    counts[d] += 1
+                    last[d] = max(last.get(d, 0), r.get("started") or 0)
+    return [(cmd, n, last[cmd]) for cmd, n in counts.most_common(limit)]
 
 
 def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = None, currency: str = "$",
@@ -347,7 +357,7 @@ def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = No
     denied = top_denied(runs, days)
     if denied:
         lines.append("most denied commands (add to allow_commands if Mistral needs them):")
-        lines += [f"  {n}x  {cmd}" for cmd, n in denied]
+        lines += [f"  {n}x  {cmd}  (last {time.strftime('%b %d', time.localtime(when))})" for cmd, n, when in denied]
     return "\n".join(lines)
 
 
