@@ -42,7 +42,7 @@ POLICY_GUIDANCE = {
 }
 
 KEYS = ("policy", "model", "verify", "allow_commands", "fix_attempts", "max_parallel", "deps_mode", "baseline",
-        "scope", "vibe_args", "worktrees_dir")
+        "scope", "vibe_args", "worktrees_dir", "model_prices")
 
 DEPS_MODES = ("hardlink", "copy", "symlink", "none")
 
@@ -104,6 +104,7 @@ def load(repo_root: str | None) -> dict:
         "scope": [],
         "vibe_args": [],
         "worktrees_dir": None,
+        "model_prices": {},
         "read": {},
         "write": {},
         "sources": {},
@@ -141,6 +142,16 @@ def load(repo_root: str | None) -> dict:
     settings["allow_commands"] = _as_list(settings["allow_commands"])
     settings["scope"] = _as_list(settings["scope"])
     settings["vibe_args"] = _as_list(settings["vibe_args"])
+    prices = {}
+    for alias, value in (settings["model_prices"] or {}).items() if isinstance(settings["model_prices"], dict) else []:
+        try:
+            if isinstance(value, dict):
+                prices[alias] = (float(value["input"]), float(value["output"]))
+            else:
+                prices[alias] = (float(value[0]), float(value[1]))
+        except (KeyError, IndexError, TypeError, ValueError):
+            settings["warnings"].append(f"ignored model_prices.{alias}: use [input, output] in $ per million tokens")
+    settings["model_prices"] = prices
     settings["model"] = settings["model"] or None
     if settings["deps_mode"] not in DEPS_MODES:
         settings["warnings"].append(f"unknown deps_mode {settings['deps_mode']!r}, using 'hardlink'")
@@ -184,6 +195,7 @@ def describe(settings: dict) -> str:
         f"baseline: {'on' if settings['baseline'] else 'off'} (run checks on the untouched worktree first)",
         f"scope: {', '.join(settings['scope']) or '(set per task with --scope)'}",
         f"vibe_args: {' '.join(settings['vibe_args']) or '(none)'}",
+        f"model_prices: {', '.join(f'{a} = ${i}/${o} per M' for a, (i, o) in settings['model_prices'].items()) or '(none)'}",
         f"worktrees_dir: {settings['worktrees_dir'] or '(automatic: ~/.mistral-delegate/worktrees, or <repo parent>/.mistral-worktrees when the repo is on another disk)'}",
     ]
     for mode in ("read", "write"):

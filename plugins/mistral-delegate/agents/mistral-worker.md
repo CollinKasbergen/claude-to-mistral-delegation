@@ -24,8 +24,11 @@ Files: <paths to read>, <paths to create or change>.
 Follow: <existing file whose patterns and style to match>.
 Requirements / cases: <bulleted list; be exhaustive, Mistral covers what you list and seldom more>.
 Test setup (for tests): <existing test file to copy; how to mount/render; what to stub and how; how to read results>.
+Insertion point (when other runs edit the same file): <exact place: after which function/heading>.
 Out of scope: <what not to touch>.
 ```
+
+Proofread the spec before running: Mistral copies names, paths and wording from it literally, mistakes included.
 
 ## 3. Run it
 

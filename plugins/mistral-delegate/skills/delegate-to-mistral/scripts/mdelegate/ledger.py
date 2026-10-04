@@ -105,31 +105,61 @@ def pending_review(runs: dict[str, dict]) -> list[dict]:
             and r.get("files_changed") and os.path.isdir(r["worktree"].get("path", ""))]
 
 
+def _when(ts: float | None, now: float) -> str:
+    if not ts:
+        return "?"
+    t = time.localtime(ts)
+    if time.strftime("%Y-%m-%d", t) == time.strftime("%Y-%m-%d", time.localtime(now)):
+        return time.strftime("today %H:%M", t)
+    return time.strftime("%b %d %H:%M", t)
+
+
+def _took(r: dict, now: float) -> str:
+    start = r.get("started") or now
+    end = r.get("finished") or (now if state(r) == "running" else start)
+    return _age(max(0.0, end - start))
+
+
 def format_status(runs: dict[str, dict], limit: int = 15) -> str:
     if not runs:
         return "No delegations recorded yet."
     now = time.time()
-    rows = sorted(runs.values(), key=lambda r: r.get("started") or 0, reverse=True)[:limit]
     pending = {r["id"] for r in pending_review(runs)}
-    lines = ["id                 state          verify   cost     outcome    age   kind/mode         task"]
+    rows = sorted(runs.values(), key=lambda r: r.get("started") or 0, reverse=True)[:limit]
+    lines = ["id                 state              verify     cost      outcome    started       took   kind/mode         task"]
     for r in rows:
         st = state(r)
-        cost = f"${r['cost']:.3f}" if isinstance(r.get("cost"), (int, float)) else "-"
-        task = " ".join((r.get("task") or "").split())[:60]
+        cost = r.get("cost")
+        cost = f"${cost:.3f}" if isinstance(cost, (int, float)) and (cost > 0 or r.get("tokens")) else "-"
+        task = " ".join((r.get("task") or "").split())[:50]
+        outcome = OUTCOME_LABELS.get(r.get("outcome"), r.get("outcome")) or ("pending" if r["id"] in pending else "-")
         lines.append(
-            f"{r['id']:<18} {st:<14} {r.get('verification') or '-':<8} {cost:<8} "
-            f"{OUTCOME_LABELS.get(r.get('outcome'), r.get('outcome')) or ('pending' if r['id'] in pending else '-'):<10} "
-            f"{_age(now - (r.get('started') or now)):<5} {r.get('kind', '?') + '/' + r.get('mode', '?'):<17} {task}")
+            f"{r['id']:<18} {st:<18} {(r.get('verification') or '-')[:10]:<10} {cost:<9} {outcome:<10} "
+            f"{_when(r.get('started'), now):<13} {_took(r, now):<6} "
+            f"{r.get('kind', '?') + '/' + r.get('mode', '?'):<17} {task}")
     active = running(runs)
+    lines.append("\nstarted: local time the run began; took: how long it ran (so far, if running); "
+                 "outcome 'pending': finished, waiting for --adopt or --discard.")
     if active:
-        lines.append(f"\n{len(active)} running. Results: delegate.py --result <id>")
+        lines.append(f"{len(active)} running. Results: delegate.py --result <id>")
     return "\n".join(lines)
 
 
 OUTCOME_LABELS = {"adopted_partial": "partial"}
 
 
-def compute_stats(runs: dict[str, dict], days: int = 90) -> dict:
+def run_cost(r: dict, prices: dict | None = None) -> float | None:
+    """A run's cost: recorded, or priced now from its tokens when the model's price is known."""
+    cost = r.get("cost")
+    if isinstance(cost, (int, float)) and (cost > 0 or r.get("tokens")):
+        return float(cost)
+    price = (prices or {}).get(r.get("model") or "")
+    if price and (r.get("tokens_in") or r.get("tokens_out")):
+        return ((r.get("tokens_in") or 0) * price[0] + (r.get("tokens_out") or 0) * price[1]) / 1_000_000
+    return None
+
+
+def compute_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = None) -> dict:
     cutoff = time.time() - days * 86400
     by_kind: dict[str, dict] = defaultdict(lambda: {"runs": 0, "ok": 0, "verified": 0, "passed": 0,
                                                     "adopted": 0, "partial": 0, "discarded": 0, "cost": 0.0,
@@ -150,8 +180,9 @@ def compute_stats(runs: dict[str, dict], days: int = 90) -> dict:
         elif r.get("outcome") == "discarded":
             s["discarded"] += 1
         # Runs without cost data (cost missing, or $0 with no tokens recorded) stay out of the averages.
-        if isinstance(r.get("cost"), (int, float)) and (r["cost"] > 0 or r.get("tokens")):
-            s["cost"] += r["cost"]
+        cost = run_cost(r, prices)
+        if cost is not None:
+            s["cost"] += cost
             s["costed"] += 1
     return dict(by_kind)
 
@@ -177,8 +208,8 @@ def top_denied(runs: dict[str, dict], days: int = 90, limit: int = 5) -> list[tu
     return counts.most_common(limit)
 
 
-def format_stats(runs: dict[str, dict], days: int = 90) -> str:
-    stats = compute_stats(runs, days)
+def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = None) -> str:
+    stats = compute_stats(runs, days, prices)
     if not stats:
         return f"No finished delegations in the last {days} days."
     lines = [f"Delegations in the last {days} days:",
@@ -200,8 +231,8 @@ def format_stats(runs: dict[str, dict], days: int = 90) -> str:
     return "\n".join(lines)
 
 
-def compact_stats(runs: dict[str, dict], days: int = 90) -> str:
-    stats = compute_stats(runs, days)
+def compact_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = None) -> str:
+    stats = compute_stats(runs, days, prices)
     parts = []
     for kind, s in sorted(stats.items(), key=lambda kv: -kv[1]["runs"]):
         bit = f"{kind}: {s['runs']} runs"

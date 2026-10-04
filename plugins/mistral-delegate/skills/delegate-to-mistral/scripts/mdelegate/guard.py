@@ -214,29 +214,87 @@ def correct_path(value: str, root: str, write: bool = False) -> str | None:
     return None
 
 
-SED_SAFE_FLAGS = {"-n", "-E", "-r", "-s", "--quiet", "--silent", "-e"}
-SED_SAFE_SCRIPT = re.compile(r"^(?:(?:\d+|\$)(?:,(?:\d+|\$))?p|\d+q|/[^/]*/p|(?:\d+|\$)(?:,(?:\d+|\$))?p;\d+q)$")
+SED_SAFE_LONG_FLAGS = {"--quiet", "--silent", "--regexp-extended", "--separate", "--null-data", "--posix",
+                       "--debug", "--sandbox"}
+SED_SAFE_SHORT = set("nErsz")
+_SED_ADDR = r"(?:\d+(?:~\d+)?|\$|/(?:[^/\\]|\\.)*/[IM]*|\\(.)(?:(?!\1)[^\\]|\\.)*\1[IM]*)"
+SED_ADDRESS = re.compile(rf"^{_SED_ADDR}(?:\s*,\s*(?:{_SED_ADDR}|[+~]\d+))?\s*!?\s*")
+SED_SUBST = re.compile(r"^s(.)(?:(?!\1)[^\\]|\\.)*\1(?:(?!\1)[^\\]|\\.)*\1([gpiImM0-9]*)$")
+SED_YANK = re.compile(r"^y(.)(?:(?!\1)[^\\]|\\.)*\1(?:(?!\1)[^\\]|\\.)*\1$")
+SED_SAFE_COMMANDS = {"", "p", "P", "=", "l", "q", "Q", "n", "N", "d", "D", "h", "H", "g", "G", "x", "z"}
+
+
+def _split_sed(script: str) -> list[str]:
+    """Split a sed script into commands at ; newlines and braces, skipping over /regex/ and s///, y/// parts."""
+    pieces, buf, i, delim, remaining = [], "", 0, "", 0
+    while i < len(script):
+        c = script[i]
+        if remaining:
+            buf += c
+            if c == "\\" and i + 1 < len(script):
+                buf += script[i + 1]
+                i += 2
+                continue
+            if c == delim:
+                remaining -= 1
+            i += 1
+            continue
+        if c in ";\n{}":
+            pieces.append(buf)
+            buf = ""
+        elif c == "/":
+            buf += c
+            delim, remaining = "/", 1
+        elif c in "sy" and i + 1 < len(script) and (not buf.strip() or SED_ADDRESS.fullmatch(buf.strip() + " ")):
+            buf += c + script[i + 1]
+            delim, remaining = script[i + 1], 2
+            i += 1
+        else:
+            buf += c
+        i += 1
+    pieces.append(buf)
+    return pieces
+
+
+def _sed_script_safe(script: str) -> bool:
+    """Whether a sed script only prints: no w/W/r/R/e commands and no s///w or s///e."""
+    for piece in _split_sed(script):
+        piece = piece.strip()
+        match = SED_ADDRESS.match(piece)
+        command = piece[match.end():].strip() if match else piece
+        if command in SED_SAFE_COMMANDS or re.fullmatch(r"[qQ]\s*\d*", command):
+            continue
+        if SED_SUBST.match(command) or SED_YANK.match(command):
+            continue
+        return False
+    return True
 
 
 def _sed_files(words: list[str]) -> list[str] | None:
-    """The file arguments of a print-only `sed -n` call, or None if it could do anything else."""
-    if "-n" not in words and "--quiet" not in words and "--silent" not in words:
-        return None
+    """The file arguments of a sed call that only prints (no -i, no writing commands), or None."""
     scripts, files, expect_script = [], [], False
     for word in words[1:]:
         if expect_script:
             scripts.append(word)
             expect_script = False
-        elif word == "-e":
+        elif word in ("-e", "--expression"):
             expect_script = True
-        elif word.startswith("-"):
-            if word not in SED_SAFE_FLAGS:
+        elif word.startswith("--expression="):
+            scripts.append(word.split("=", 1)[1])
+        elif word.startswith("--"):
+            if word not in SED_SAFE_LONG_FLAGS:
                 return None
+        elif word.startswith("-") and len(word) > 1:
+            letters = word[1:]
+            if letters.endswith("e") and set(letters[:-1]) <= SED_SAFE_SHORT:
+                expect_script = True  # e.g. -ne 'script'
+            elif not set(letters) <= SED_SAFE_SHORT:
+                return None  # -i, -f, -l, ... (in place, script files)
         elif not scripts:
             scripts.append(word)
         else:
             files.append(word)
-    if not scripts or not all(SED_SAFE_SCRIPT.match(s) for s in scripts):
+    if not scripts or not all(_sed_script_safe(s) for s in scripts):
         return None
     return files
 

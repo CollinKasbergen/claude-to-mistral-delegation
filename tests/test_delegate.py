@@ -45,12 +45,18 @@ FAKE_VIBE = textwrap.dedent('''\
         sdir = os.path.join(root, "unified", session_id)
         os.makedirs(os.path.join(sdir, "journal"), exist_ok=True)
         os.makedirs(os.path.join(sdir, "generations", "0001"), exist_ok=True)
-        json.dump({"session_id": session_id, "environment": {"working_directory": cwd}},
+        experiments = None
+        if os.environ.get("FAKE_VIBE_EXPERIMENT_PRICE"):
+            experiments = {"features": {"cli_model_routing": {"value": {"model_config": {
+                "alias": os.environ.get("FAKE_VIBE_MODEL"), "input_price": 2.0, "output_price": 10.0}}}}}
+        json.dump({"session_id": session_id, "environment": {"working_directory": cwd}, "experiments": experiments},
                   open(os.path.join(sdir, "meta.json"), "w"))
-        json.dump({"session_metadata": {"active_model": "mistral-medium-3.5"}},
+        json.dump({"session_metadata": {"active_model": os.environ.get("FAKE_VIBE_MODEL", "mistral-medium-3.5")}},
                   open(os.path.join(sdir, "generations", "0001", "runtime-state.json"), "w"))
         journal = os.path.join(sdir, "journal", "0001.jsonl")
         prev = 0
+        if os.path.exists(journal) and not resumed:
+            os.remove(journal)  # a new session starts a fresh journal
         if os.path.exists(journal):
             prev = len(open(journal).read().splitlines())
         usage = {"inputTokens": tokens_in * (prev + 1), "outputTokens": tokens_out * (prev + 1), "totalTokens": 0}
@@ -151,7 +157,8 @@ class DelegateTestBase(unittest.TestCase):
                         PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}")
         for var in ("MISTRAL_DELEGATE_POLICY", "MISTRAL_DELEGATE_MODEL", "MISTRAL_DELEGATE_MAX_PRICE",
                     "MISTRAL_DELEGATE_MAX_TURNS", "MISTRAL_DELEGATE_WORKTREES", "FAKE_VIBE_STORAGE",
-                    "FAKE_VIBE_TOUCH_APP", "FAKE_VIBE_HOOK_CALLS", "FAKE_VIBE_NO_WRITE", "FAKE_VIBE_CANCEL"):
+                    "FAKE_VIBE_TOUCH_APP", "FAKE_VIBE_HOOK_CALLS", "FAKE_VIBE_NO_WRITE", "FAKE_VIBE_CANCEL",
+                    "FAKE_VIBE_MODEL", "FAKE_VIBE_EXPERIMENT_PRICE"):
             self.env.pop(var, None)
 
     def tearDown(self):
@@ -390,7 +397,54 @@ class WriteModeTest(DelegateTestBase):
 
     def test_sed_is_allowed_in_the_profile_only_with_the_guard(self):
         self.run_delegate("--mode", "write", "Task")
-        self.assertIn('"sed -n"', self.profile(self.last()["argv"]))
+        self.assertIn('"sed"]', self.profile(self.last()["argv"]))
+        (self.tmpdir / "vibe-home" / "hooks.toml").write_text("[[hooks]\nbroken")  # guard can't install
+        self.run_delegate("--mode", "write", "Task")
+        self.assertNotIn('"sed"', self.profile(self.last()["argv"]))
+
+    def test_model_is_named_and_non_mistral_default_is_flagged(self):
+        out = self.run_delegate("Task", FAKE_VIBE_STORAGE="unified", FAKE_VIBE_MODEL="glm-5-3")
+        self.assertIn("model: glm-5-3 (Vibe's default; not pinned)", out.stdout)
+        self.assertIn("model_note: Vibe's server-side default routed this run to 'glm-5-3'", out.stdout)
+        self.assertIn('add model_prices = { "glm-5-3" = [input, output] }', out.stdout)
+
+    def test_price_from_session_experiments(self):
+        out = self.run_delegate("Task", FAKE_VIBE_STORAGE="unified", FAKE_VIBE_MODEL="glm-5-3",
+                                FAKE_VIBE_EXPERIMENT_PRICE="1")
+        # 1000 in at $2/M + 200 out at $10/M
+        self.assertIn("cost ~$0.0040", out.stdout)
+
+    def test_model_prices_setting_prices_new_and_old_runs(self):
+        self.run_delegate("Task", FAKE_VIBE_STORAGE="unified", FAKE_VIBE_MODEL="glm-5-3")
+        self.assertIn("1 run(s) without cost data", self.run_delegate("--stats").stdout)
+        (self.repo / ".mistral-delegate.toml").write_text('model_prices = { "glm-5-3" = [1.0, 4.0] }\n')
+        out = self.run_delegate("Task", FAKE_VIBE_STORAGE="unified", FAKE_VIBE_MODEL="glm-5-3")
+        self.assertIn("cost ~$0.0018", out.stdout)  # 1000 * 1 + 200 * 4 per million
+        stats = self.run_delegate("--stats").stdout
+        self.assertNotIn("without cost data", stats)  # the earlier run is priced from its tokens now
+        self.assertIn("$0.0", stats)
+
+    def test_command_spellings_are_expanded(self):
+        (self.repo / "package.json").write_text('{"scripts": {"test": "vitest run", "build": "rm -rf dist && vite build"}}')
+        out = self.run_delegate("--mode", "write", "--allow-command", "npm test", "Task")
+        profile = self.profile(self.last()["argv"])
+        for spelling in ('"npm run test"', '"npx vitest"', '"pnpm test"'):
+            self.assertIn(spelling, profile)
+        self.assertNotIn('"npx rm"', profile)
+        self.assertIn("vibe_may_run: npm test (also accepted:", out.stdout)
+
+    def test_missing_folders_for_literal_scope_paths_are_created(self):
+        out = self.run_delegate("--mode", "write", "--scope", "frontend/src/new/thing.test.ts", "Task")
+        wt = Path(self.value(out, "worktree_path"))
+        self.assertTrue((wt / "frontend/src/new").is_dir())
+        self.assertFalse((wt / "frontend/src/new/thing.test.ts").exists())
+
+    def test_status_shows_start_time_and_duration(self):
+        self.run_delegate("Task")
+        status = self.run_delegate("--status").stdout
+        self.assertIn("started", status.splitlines()[0])
+        self.assertIn("took", status.splitlines()[0])
+        self.assertIn("today ", status)
 
     def test_no_changes_is_its_own_status(self):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_NO_WRITE="1")
@@ -689,7 +743,10 @@ class GuardPolicyTest(unittest.TestCase):
         for command in ["cat frontend/src/router/index.ts | grep export", "npm test -- --run", "CI=1 npm test",
                         "grep -rn foo . 2>/dev/null", 'grep "a|b;c" frontend', "ls && git diff",
                         "npx vitest run src/x.test.ts 2>&1 | tail",
-                        "sed -n 1,20p frontend/src/router/index.ts | grep x", "sed -n '/export/p' frontend/src/router/index.ts", "cat " + self.root + "/frontend/src/router/index.ts"]:
+                        "sed -n 1,20p frontend/src/router/index.ts | grep x", "sed -n '/export/p' frontend/src/router/index.ts",
+                        "sed -nE '/^export/,/^}/p' frontend/src/router/index.ts", "sed -E -n '1,20p;40,60p' frontend/x.ts",
+                        "sed -n -e '1,5p' -e '$p' frontend/x.ts", "sed 's/export/EXPORT/g' frontend/x.ts",
+                        "sed -ne '10,20p' frontend/x.ts", "sed -n '2{p;q}' frontend/x.ts", "cat " + self.root + "/frontend/src/router/index.ts"]:
             with self.subTest(command=command):
                 self.assertIsNone(self.shell(command))
 
@@ -698,7 +755,11 @@ class GuardPolicyTest(unittest.TestCase):
             "node -e 'console.log(1)'": "`node` isn't allowed",
             "sed -i s/a/b/ frontend/src/router/index.ts": "`sed` isn't allowed",
             "sed -n 'w out.txt' frontend/src/router/index.ts": "`sed` isn't allowed",
-            "sed 1,20p frontend/src/router/index.ts": "`sed` isn't allowed",
+            "sed 's/a/b/w out.txt' frontend/src/router/index.ts": "`sed` isn't allowed",
+            "sed -n -f script.sed frontend/src/router/index.ts": "`sed` isn't allowed",
+            "sed -n '1e rm -rf x' frontend/src/router/index.ts": "`sed` isn't allowed",
+            "sed -ie 's/a/b/' frontend/src/router/index.ts": "`sed` isn't allowed",
+            "sed -n '1r /etc/passwd' frontend/src/router/index.ts": "`sed` isn't allowed",
             "ls; rm -rf frontend": "`rm` isn't allowed",
             "ls\nrm -rf frontend": "`rm` isn't allowed",
             "echo $(whoami)": "Command substitution",
@@ -848,6 +909,27 @@ class CostStatsTest(unittest.TestCase):
         self.assertIn("$0.200", ledger.format_stats(runs))
         self.assertIn("2 run(s) without cost data", ledger.format_stats(runs))
         self.assertIn("$0.200 avg", ledger.compact_stats(runs))
+
+
+class CommandFormsTest(unittest.TestCase):
+    def test_expansions(self):
+        from mdelegate import commands
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "frontend").mkdir()
+            Path(tmp, "frontend/package.json").write_text('{"scripts": {"test:unit": "cross-env CI=1 vitest run", "lint": "eslint ."}}')
+            forms = commands.expand(["npm run test:unit", "pytest -q"], tmp)
+        for form in ("npm run test:unit", "pnpm test:unit", "yarn run test:unit", "npx vitest", "pnpm exec vitest",
+                     "python -m pytest", "uv run pytest"):
+            self.assertIn(form, forms)
+        self.assertNotIn("npx eslint", forms)  # lint wasn't allowed
+
+    def test_denied_call_labels_come_from_any_detail_shape(self):
+        from mdelegate import vibe
+        entry = {"type": "effect", "detail": {"kind": "shell", "display": {"title": "Run"},
+                                              "input": {"argv": None, "cmd": "npm run test"}},
+                 "state": {"status": "skipped", "reason": "denied"}}
+        info = vibe.summarize_history([entry])
+        self.assertEqual(info["denied"], ["Run: npm run test"])
 
 
 class ManifestTest(unittest.TestCase):

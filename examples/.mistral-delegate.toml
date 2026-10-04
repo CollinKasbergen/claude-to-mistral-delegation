@@ -24,7 +24,9 @@ verify = [
 
 # Commands Mistral may run itself while it works, so it can fix its own
 # mistakes before handing back. These are prefixes: "npm test" also allows
-# "npm test -- src/foo.test.ts". Anything not listed is refused.
+# "npm test -- src/foo.test.ts", and common spellings are accepted too
+# ("npm run test", "pnpm test", "npx vitest" when the test script runs vitest).
+# Anything not listed is refused, with an explanation Mistral can act on.
 allow_commands = ["npm test", "npx tsc --noEmit"]
 # Tip: the report's denied_commands section (and --stats) shows commands Mistral
 # tried but wasn't allowed to run; add the useful ones here.
@@ -58,8 +60,14 @@ baseline = true
 # this one makes Vibe record exact costs:
 # vibe_args = ["--legacy-harness"]
 
-# Mistral model alias from your Vibe config. Leave unset for Vibe's default.
-# model = "mistral-medium-3.5"
+# Model for Mistral's runs: an alias from your Vibe config. If unset, Vibe uses
+# its own default, which a server-side experiment may route to a non-Mistral
+# model (the report's model: line shows which ran). Pin it to always use Mistral.
+model = "mistral-medium-3.5"
+
+# Prices ($ per million tokens: input, output) for models Vibe has no price for,
+# so their runs get a cost. Earlier runs are priced from their tokens too.
+# model_prices = { "glm-5-3" = [1.0, 4.0] }
 
 # Spending caps per Vibe call. Leave these out to use the policy's defaults
 # (balanced: write 30 turns / $1.00, read 15 turns / $0.25).

@@ -54,7 +54,7 @@ Claude delegates on its own, following the active policy. You can also ask ("hav
 1. **Worktree.** A new git worktree is made from your current code, including uncommitted and untracked files (committed there as a snapshot). Ignored dependency folders such as `node_modules` and `.venv` are hard-linked in. They are real folders inside the worktree whose files are shared with your checkout, so tools like Vite accept them. Cache folders (`.vite`, `.cache`, …) are skipped. Set `deps_mode` to `copy`, `symlink` or `none` to change this.
 2. **Baseline.** Your checks run once on the untouched worktree; checks limited to paths outside the run's scope are skipped, and a check that fails is rerun once so a flaky one isn't mistaken for a broken one. Checks that already fail there aren't blamed on Mistral: they're reported as pre-existing, Mistral is told not to work around them, and they never trigger a fix round.
 3. **Prompt.** The task, the spec (`--spec`), the files to read first (`--context`), and the rules: which files Mistral may change (`--scope`), which commands it may run, which checks must pass, no package installs, no weakened tests.
-4. **Guard.** A Vibe `pre_tool` hook checks every tool call during the run. Disallowed commands, paths outside the project, writes outside the scope, secrets and network tools are refused with an error Mistral sees and can work around. Paths that point to the right file under the wrong base (`/src/app.ts`, or a worktree path missing its run folder) are corrected to the project. Print-only `sed -n` is allowed alongside Vibe's read-only commands, and the prompt gives Mistral the absolute project root and steers it to the read_file and grep tools. Without it, Vibe's programmatic mode treats a refused approval as the user cancelling and ends the whole session.
+4. **Guard.** A Vibe `pre_tool` hook checks every tool call during the run. Disallowed commands, paths outside the project, writes outside the scope, secrets and network tools are refused with an error Mistral sees and can work around. Paths that point to the right file under the wrong base (`/src/app.ts`, or a worktree path missing its run folder) are corrected to the project. `sed` calls that only print are allowed alongside Vibe's read-only commands (no `-i`, script files or `w`/`r`/`e`), allowed commands are accepted in their common spellings (`npm test` = `npm run test` = `npx vitest` when that's the test script), and the prompt gives Mistral the absolute project root and steers it to the read_file and grep tools. Without it, Vibe's programmatic mode treats a refused approval as the user cancelling and ends the whole session.
 5. **Vibe runs** with a generated agent profile that auto-approves file edits and only the commands you allowed (`--allow-command` / `allow_commands`). Each part of a chained command must be allowed, and everything else is refused.
 6. **Checks.** The wrapper runs each `--verify` command in the worktree. If one fails, its output goes back to the same Vibe session for a fix (`--fix-attempts`, default 1), and the checks run again.
 7. **Report.** It shows status, verification, cost, turns and tokens, the change list, files changed outside the scope, commands Mistral was refused, the diff when short, and `adopt_with` / `discard_with` commands.
@@ -68,7 +68,9 @@ Settings come from `~/.mistral-delegate/config.toml` (all projects), then `<repo
 
 ```toml
 policy = "balanced"          # conservative | balanced | aggressive
-model = "mistral-medium-3.5" # a model alias from your Vibe config
+model = "mistral-medium-3.5" # a model alias from your Vibe config; unset = Vibe's default, which
+                             # a server-side experiment may route to a non-Mistral model
+model_prices = { "glm-5-3" = [1.0, 4.0] }  # $/M tokens (input, output) for models Vibe has no price for
 verify = [
   "npm run lint",                                     # always runs
   { cmd = "npx vitest run", paths = ["frontend/"] },  # only when the scope or changes touch frontend/
@@ -99,7 +101,9 @@ max_price = 0.25
 
 Each fix round may spend up to half the cap again.
 
-**Cost reporting.** Vibe stores sessions in one of two formats. With its older engine, the session log contains the exact cost. With the newer Unified Harness, it records only token counts, so the report estimates the cost from the model's list prices and marks it `~$`. If the report keeps saying "cost unknown", add `vibe_args = ["--legacy-harness"]`. The model must be an alias Vibe knows: the built-ins are `mistral-medium-3.5` and `local`, and you add others under `[[models]]` in `~/.vibe/config.toml`. The report warns when Vibe would fall back to its default model.
+**Model.** The report's `model:` line says which model ran. With no `model` set, Vibe uses its own default, and a server-side experiment can route that to a non-Mistral model (e.g. `glm-5-3`); `model_note` flags it. Pin `model = "mistral-medium-3.5"` to always use Mistral.
+
+**Cost reporting.** Vibe stores sessions in one of two formats. With its older engine, the session log contains the exact cost. With the newer Unified Harness, it records only token counts, so the report estimates the cost from the model's list prices and marks it `~$`. For a model with no known price, the report says so; add it to `model_prices` and runs are priced from their recorded tokens, earlier ones included. If the report keeps saying "cost unknown" for another reason, add `vibe_args = ["--legacy-harness"]`. The model must be an alias Vibe knows: the built-ins are `mistral-medium-3.5` and `local`, and you add others under `[[models]]` in `~/.vibe/config.toml`. The report warns when Vibe would fall back to its default model.
 
 Environment variables: `MISTRAL_DELEGATE_POLICY`, `MISTRAL_DELEGATE_MODEL`, `MISTRAL_DELEGATE_MAX_TURNS`, `MISTRAL_DELEGATE_MAX_PRICE`, `MISTRAL_DELEGATE_MAX_TOKENS`, `MISTRAL_DELEGATE_TIMEOUT`, `MISTRAL_DELEGATE_HOME` (default `~/.mistral-delegate`), `MISTRAL_DELEGATE_WORKTREES` (same as `worktrees_dir`), `VIBE_BIN`.
 

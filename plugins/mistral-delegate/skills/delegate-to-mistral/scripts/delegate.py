@@ -42,7 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mdelegate import config, gitops, guard, ledger, vibe  # noqa: E402
+from mdelegate import commands as cmdforms, config, gitops, guard, ledger, vibe  # noqa: E402
 from mdelegate.gitops import DelegateError, git  # noqa: E402
 
 KINDS = ("tests", "feature", "bugfix", "refactor", "migration", "boilerplate", "docs", "search", "other")
@@ -344,6 +344,7 @@ def run_task(args: argparse.Namespace) -> int:
 
     top = gitops.toplevel(workdir)
     settings = config.load(top or workdir)
+    vibe.EXTRA_PRICES.update(settings["model_prices"])
     if args.policy:
         settings["policy"] = args.policy
     caps = config.caps(settings, args.mode)
@@ -355,6 +356,9 @@ def run_task(args: argparse.Namespace) -> int:
     verify = [] if (args.no_verify or not write) else (
         [{"cmd": c, "paths": []} for c in args.verify] if args.verify else settings["verify"])
     allow_commands = list(dict.fromkeys(settings["allow_commands"] + args.allow_command)) if write else []
+    # `npm test` also covers `npm run test`, `npx vitest` (when that's the test script), etc.
+    settings["allow_commands_as_given"] = allow_commands
+    allow_commands = cmdforms.expand(allow_commands, top or workdir) if allow_commands else []
     scope = list(dict.fromkeys(args.scope or settings["scope"])) if write else []
     fix_attempts = settings["fix_attempts"] if args.fix_attempts is None else max(0, args.fix_attempts)
     baseline_on = settings["baseline"] and not args.no_baseline
@@ -389,6 +393,12 @@ def run_task(args: argparse.Namespace) -> int:
             print(f"status: error\n\nCould not prepare the worktree: {e}")
             return 2
         run_dir = str(Path(wt["path"]) / Path(workdir).relative_to(top))
+        # New files named literally in the scope get their folders up front, so writing them can't fail on that.
+        for entry in scope:
+            if not any(c in entry for c in "*?[") and not entry.endswith("/"):
+                target = Path(wt["path"], entry)
+                if not target.exists() and Path(wt["path"]) in target.parents:
+                    target.parent.mkdir(parents=True, exist_ok=True)
 
     ledger.append({"event": "start", "id": run_id, "pid": os.getpid(), "mode": args.mode, "kind": kind,
                    "repo": Path(top or workdir).name, "workdir": workdir, "task": task[:500],
@@ -436,11 +446,12 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     preexisting = [cmd for cmd, (code, _out) in baseline.items() if code != 0]
 
     prompt = vibe.build_prompt(task, mode=args.mode, spec=spec, context=args.context, verify=commands,
-                               allow_commands=allow_commands, allow_shell=args.allow_shell, scope=scope,
+                               allow_commands=settings.get("allow_commands_as_given") or allow_commands, allow_shell=args.allow_shell, scope=scope,
                                preexisting_failures=preexisting, root=guard_root,
                                cwd=os.path.realpath(run_dir))
-    # Print-only `sed -n` is safe once the guard vets its script; without the guard, keep Vibe's default.
-    vibe_allow = allow_commands + (["sed -n"] if write and not guard_warning else [])
+    # `sed` is safe once the guard vets each call (print-only scripts, no -i); Vibe matches allowlist
+    # entries as prefixes, so `sed -nE` or `sed -E -n` need the bare `sed`. Without the guard, keep Vibe's default.
+    vibe_allow = allow_commands + (["sed"] if write and not guard_warning else [])
     agent = args.agent or vibe.write_agent_profile(args.mode, model, vibe_allow)
     trust = args.trust or wt is not None
 
@@ -514,7 +525,13 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                      + ("worktree" if wt else "checkout") + " before Mistral changed anything: "
                      + ", ".join(preexisting) + ". Mistral was told not to work around them. If they pass "
                      "in your checkout, the cause is the worktree environment (see deps_mode).")
-    lines.append(f"mode: {args.mode}, kind: {kind}, policy: {settings['policy']}" + (f", model: {model}" if model else ""))
+    ran_model = (use or {}).get("model") or model
+    lines.append(f"mode: {args.mode}, kind: {kind}, policy: {settings['policy']}, model: "
+                 + (f"{ran_model}" if ran_model else "unknown")
+                 + ("" if model else " (Vibe's default; not pinned)"))
+    if ran_model and not model and not vibe.is_mistral_model(ran_model):
+        lines.append(f"model_note: Vibe's server-side default routed this run to {ran_model!r}, not a Mistral model. "
+                     "To use Mistral, set model = \"mistral-medium-3.5\" in .mistral-delegate.toml.")
     lines.append(usage_line(use, caps["max_price"]))
     turns = use["steps"] if use and use.get("steps") is not None else run.turns
     lines.append(f"elapsed: {elapsed:.0f}s, turns: {turns} (max_turns {caps['max_turns']}), "
@@ -524,7 +541,10 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     if model_warning:
         lines.append(f"model_warning: {model_warning}")
     if allow_commands:
-        lines.append("vibe_may_run: " + ", ".join(allow_commands))
+        given = settings["allow_commands_as_given"]
+        extra = [c for c in allow_commands if c not in given]
+        lines.append("vibe_may_run: " + ", ".join(given)
+                     + (f" (also accepted: {', '.join(extra[:8])}{', …' if len(extra) > 8 else ''})" if extra else ""))
     if scope:
         lines.append("scope: " + ", ".join(scope))
     if run.session_id:
@@ -579,6 +599,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     ledger.save_report(run_id, report)
     ledger.append({"event": "end", "id": run_id, "status": run.status, "verification": verification,
                    "fix_attempts_used": attempts, "cost": use["cost"] if use else None,
+                   "model": ran_model, "tokens_in": use["tokens_in"] if use else None,
+                   "tokens_out": use["tokens_out"] if use else None,
                    "cost_estimated": use["estimated"] if use else None,
                    "steps": turns, "tokens": use["tokens"] if use else None,
                    "files_changed": len(files), "out_of_scope": out_of_scope,
@@ -607,7 +629,9 @@ def usage_line(use: dict | None, max_price: float) -> str:
         return (f"usage: cost unknown (no token data in Vibe's session storage; if this keeps happening, set "
                 f"vibe_args = [\"--legacy-harness\"] in the config for exact costs), first-pass cap ${max_price:.2f}")
     if use["cost"] is None:
-        cost = f"cost unknown (no price for model {use.get('model')!r} in Vibe's config)"
+        cost = (f"cost unknown (no price for model {use.get('model')!r}; add model_prices = "
+                f"{{ \"{use.get('model')}\" = [input, output] }} in $ per million tokens to the config, "
+                f"and earlier runs are priced too)")
     elif use["estimated"]:
         cost = f"cost ~${use['cost']:.4f} (estimated from tokens at {use.get('model')} list prices)"
     else:
@@ -656,7 +680,9 @@ def main(argv: list[str]) -> int:
             print(ledger.format_status(ledger.load_runs()))
             return 0
         if args.stats:
-            print(ledger.format_stats(ledger.load_runs()))
+            settings = config.load(gitops.toplevel(str(Path(args.workdir).resolve())) or args.workdir)
+            vibe.EXTRA_PRICES.update(settings["model_prices"])
+            print(ledger.format_stats(ledger.load_runs(), prices=vibe.model_prices()))
             return 0
         if args.result:
             report = ledger.read_report(args.result)

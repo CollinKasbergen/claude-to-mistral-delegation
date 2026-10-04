@@ -42,13 +42,13 @@ python3 <wrapper> --mode write --kind feature \
   - Before Mistral starts, the checks also run once on the untouched worktree (the baseline; `--no-baseline` turns it off). Checks that already fail there are reported as `already failing before Mistral changed anything`. Mistral is told not to work around them, and they never trigger a fix round.
   - When the worktree is on a different disk than the repo, `node_modules` can't be hard-linked and becomes a symlink, which breaks some tools (Vite, vitest mocks). By default the plugin then puts worktrees in `<repo parent>/.mistral-worktrees`. `worktrees_dir` in the config sets the location explicitly.
   - A `baseline_warning` usually means the worktree environment differs from the checkout (dependencies, `.env`), or the checks were already broken. Check that before blaming Mistral's change.
-- `--allow-command CMD` (repeatable): command prefixes Mistral may run itself while working, e.g. the test command, so it can iterate. Each part of a chained command must match. Anything else stays refused. `--allow-shell` allows every command; use it only with the user's OK.
+- `--allow-command CMD` (repeatable): command prefixes Mistral may run itself while working, e.g. the test command, so it can iterate. Equivalent spellings are accepted too: `npm test` also allows `npm run test`, `pnpm test` and, when the test script runs vitest, `npx vitest`; `pytest` also allows `python -m pytest` and `uv run pytest`. Each part of a chained command must match. Anything else stays refused. `--allow-shell` allows every command; use it only with the user's OK.
 - **Guard hook.** During a run, a Vibe hook checks every tool call before Vibe would ask for approval:
   - Disallowed commands, paths outside the project, writes outside `--scope`, secrets and network tools are refused with an error message Mistral sees, so it can try another way. Without the hook, Vibe treats a refused approval as the user cancelling and ends the session.
   - A path that points to the right file under the wrong base (`/src/app.ts`, or a worktree path missing its run folder) is corrected to the project, in file tools and in shell commands.
-  - Print-only `sed -n` is allowed alongside Vibe's read-only commands, though `read_file` and `grep` are better.
+  - `sed` calls that only print are allowed alongside Vibe's read-only commands (`sed -n '1,40p' f`, `sed -nE '/a/,/b/p' f`, `sed 's/x/y/g' f`). `-i`, script files, and `w`/`r`/`e` commands are refused. `read_file` and `grep` are still better.
   - The report's `guard:` line shows what it checked, and `refused_by_guard` lists the refusals.
-- `--model ALIAS`: a Vibe model alias from the user's Vibe config, for this run.
+- `--model ALIAS`: a Vibe model alias from the user's Vibe config, for this run. Without `model` in the config or this flag, Vibe uses its own default, which a server-side experiment may route to a non-Mistral model (the report's `model:` line says which ran, and `model_note` flags it). Suggest pinning `model = "mistral-medium-3.5"` when the user wants Mistral.
 - Caps come from the policy (`--show-config` shows them). Override with `--max-turns`, `--max-price` or `--max-tokens` and tell the user when you raise them. Fix rounds add half the price cap each.
 - Follow-up on the same work: `--resume <session_id> --worktree-name <name>`, both from the report.
 
@@ -73,7 +73,8 @@ max_parallel = 3
 deps_mode = "hardlink"                      # hardlink | copy | symlink | none
 baseline = true                             # run checks on the untouched worktree first
 # worktrees_dir = "/Volumes/SSD/.mistral-worktrees"  # keep worktrees on the repo's disk
-# model = "mistral-medium-3.5"
+# model = "mistral-medium-3.5"              # pin Mistral; otherwise Vibe's default may route elsewhere
+# model_prices = { "glm-5-3" = [1.0, 4.0] }  # $ per million tokens (input, output) for unpriced models
 [write]
 max_price = 1.50
 ```
@@ -91,6 +92,12 @@ Follow: <existing file whose patterns and style to match>.
 Requirements / cases: <bulleted, exhaustive list>.
 Out of scope: <what not to touch>.
 ```
+
+**Lessons from real runs:**
+
+- **Parallel runs on one file:** when two runs edit the same file, give each an exact insertion point (after which function or heading, or before which line) and keep their edits apart. Better still, split the work by file.
+- **New files:** name every new file literally in `--scope` (the wrapper creates its folders). When parallel runs both need a new shared file, such as an index or barrel, create an empty placeholder in the checkout before starting them, so each run adds to it instead of creating it.
+- **Mistral copies the spec word for word,** mistakes included. Proofread names, paths and any prose it could paste into code or docs, and label examples as examples.
 
 **For tests, spell out the harness setup.** Name the existing test file to copy, how to mount or render the unit, which modules to stub and how (e.g. a parent layout, the clipboard, timers), and how to read the result (DOM queries, toasts, emitted events). Specs with this setup succeed first time; specs without it send Mistral guessing and often end empty.
 

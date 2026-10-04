@@ -66,12 +66,48 @@ def vibe_config() -> dict:
         return {}
 
 
+# Prices the user gave in the plugin config (model_prices), keyed by alias: (input, output) $/M tokens.
+EXTRA_PRICES: dict[str, tuple[float, float]] = {}
+
+MISTRAL_MODEL_PREFIXES = ("mistral", "devstral", "codestral", "magistral", "ministral", "pixtral", "leanstral", "local")
+
+
 def model_prices(config: dict | None = None) -> dict[str, tuple[float, float]]:
     prices = dict(BUILTIN_MODELS)
     for m in (config if config is not None else vibe_config()).get("models", []):
         if isinstance(m, dict) and m.get("alias"):
             prices[m["alias"]] = (float(m.get("input_price", 0.0)), float(m.get("output_price", 0.0)))
+    prices.update(EXTRA_PRICES)
     return prices
+
+
+def _find_model_price(data, alias: str) -> tuple[float, float] | None:
+    """Search a JSON structure (e.g. a session's experiments) for a model definition with prices."""
+    if isinstance(data, dict):
+        if data.get("alias") == alias and "input_price" in data and "output_price" in data:
+            try:
+                return float(data["input_price"]), float(data["output_price"])
+            except (TypeError, ValueError):
+                return None
+        values = data.values()
+    elif isinstance(data, list):
+        values = data
+    elif isinstance(data, str) and alias in data and data.lstrip().startswith(("{", "[")):
+        try:
+            return _find_model_price(json.loads(data), alias)
+        except ValueError:
+            return None
+    else:
+        return None
+    for value in values:
+        found = _find_model_price(value, alias)
+        if found:
+            return found
+    return None
+
+
+def is_mistral_model(alias: str | None) -> bool:
+    return not alias or alias.lower().startswith(MISTRAL_MODEL_PREFIXES)
 
 
 def unknown_model_warning(model: str | None) -> str | None:
@@ -147,8 +183,11 @@ def build_prompt(task: str, *, mode: str, spec: str | None, context: list[str], 
         if allow_shell:
             rules.append("You may run shell commands.")
         elif allow_commands:
-            rules.append("You may run these shell commands yourself (other commands will be refused): "
-                         + ", ".join(f"`{c}`" for c in allow_commands) + ".")
+            rules.append("You may run these shell commands yourself: "
+                         + ", ".join(f"`{c}`" for c in allow_commands)
+                         + ". Other spellings of them work too (e.g. `npm run test` for `npm test`). Read-only "
+                           "commands (`ls`, `cat`, `grep`, `find`, `sed -n`) are available as well, but prefer the "
+                           "read_file and grep tools. Anything else will be refused with an explanation.")
         else:
             rules.append("Shell commands will be refused, so don't try to run anything; just write the code.")
         if verify:
@@ -212,16 +251,42 @@ def text_of(entry: dict) -> str:
     return "\n\n".join(texts)
 
 
+TARGET_KEYS = ("command", "cmd", "file_path", "filePath", "path", "url", "pattern", "query")
+
+
+def _find_string(data, keys: tuple[str, ...], depth: int = 0) -> str:
+    if depth > 4:
+        return ""
+    if isinstance(data, dict):
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+            if isinstance(value, list) and value and all(isinstance(v, str) for v in value):
+                return " ".join(value)
+        for key, value in data.items():
+            if key in ("state", "output", "result", "content"):
+                continue
+            found = _find_string(value, keys, depth + 1)
+            if found:
+                return found
+    return ""
+
+
 def _effect_target(entry: dict) -> str:
     """The command or file a tool call was about, for reporting."""
+    return _find_string(entry.get("detail") or {}, TARGET_KEYS) or _find_string(
+        {k: v for k, v in entry.items() if k not in ("state",)}, TARGET_KEYS)
+
+
+def _effect_tool(entry: dict) -> str:
     detail = entry.get("detail") or {}
-    data = detail.get("input")
-    if isinstance(data, dict):
-        if data.get("command"):
-            return str(data["command"])
-        if data.get("filePath") or data.get("file_path"):
-            return str(data.get("filePath") or data.get("file_path"))
-    return ""
+    display = detail.get("display") if isinstance(detail.get("display"), dict) else {}
+    for value in (detail.get("toolName"), detail.get("tool_name"), detail.get("name"), entry.get("title"),
+                  display.get("title"), detail.get("kind"), entry.get("toolName")):
+        if isinstance(value, str) and value.strip():
+            return value
+    return "tool"
 
 
 def _is_denied(state: dict) -> bool:
@@ -254,7 +319,7 @@ def summarize_history(history: list) -> dict:
         elif kind == "effect":
             tool_calls += 1
             state = entry.get("state") or {}
-            tool = (entry.get("detail") or {}).get("toolName") or entry.get("title") or "tool"
+            tool = _effect_tool(entry)
             target = _effect_target(entry)
             if _is_denied(state):
                 denied.append(f"{tool}: {target}" if target else str(entry.get("title") or tool))
@@ -321,7 +386,8 @@ def _legacy_stats(root: Path, session_id: str | None, cwd: str, since: float | N
             continue
         stats = meta.get("stats")
         if isinstance(stats, dict):
-            return {"session_id": meta.get("session_id"), **stats}
+            model = (meta.get("config") or {}).get("active_model") if isinstance(meta.get("config"), dict) else None
+            return {"session_id": meta.get("session_id"), "model": model or None, **stats}
     return None
 
 
@@ -380,7 +446,10 @@ def _unified_stats(root: Path, session_id: str | None, cwd: str, since: float | 
         if usage is None:
             continue
         model = _unified_model(session_dir) or model_hint or DEFAULT_MODEL_ALIAS
-        price = model_prices(config).get(model)
+        # Prices: Vibe's config and the plugin's model_prices, then the model definition a
+        # server-side experiment supplied for this session (saved in its meta.json).
+        price = model_prices(config).get(model) or _find_model_price(
+            [meta.get("experiments"), meta.get("config")], model)
         stats = {
             "session_id": meta.get("session_id") or session_dir.name,
             "session_prompt_tokens": int(usage.get("inputTokens") or 0),
@@ -442,6 +511,8 @@ def usage(after: dict | None, before: dict | None) -> dict | None:
         "cost": None if cost_after is None or cost_before is None else cost_after - cost_before,
         "estimated": bool(after.get("estimated")),
         "model": after.get("model"),
+        "tokens_in": after.get("session_prompt_tokens", 0) - before.get("session_prompt_tokens", 0),
+        "tokens_out": after.get("session_completion_tokens", 0) - before.get("session_completion_tokens", 0),
         "steps": steps,
         "tokens": (after.get("session_prompt_tokens", 0) + after.get("session_completion_tokens", 0)
                    - before.get("session_prompt_tokens", 0) - before.get("session_completion_tokens", 0)),
