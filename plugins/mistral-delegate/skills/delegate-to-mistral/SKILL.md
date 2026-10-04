@@ -81,7 +81,7 @@ baseline = true                             # run checks on the untouched worktr
 # model_prices = { "glm-5-3" = [1.0, 4.0, 0.1] }  # per million tokens (input, output, cached) for unpriced models
 # monthly_credit = 225                       # subscription credit per month, shown in reports
 # min_savings = 2                            # flag kinds of task whose delegation doesn't pay off
-# autofix = ["ruff format ."]                # run before a fix round when checks fail
+# autofix = [{ cmd = "ruff format .", paths = ["backend/"] }]  # run before a fix round when checks fail
 [write]
 max_price = 1.50
 ```
@@ -102,6 +102,8 @@ Out of scope: <what not to touch>.
 
 **Lessons from real runs:**
 
+- **Generated code:** don't let Mistral hand-write what a generator produces (API types, schemas, clients). Name the generator command in the spec and allow it, or run it yourself after adopting. Don't assume what the generator outputs, such as whether doc comments carry over.
+
 - **Parallel runs on one file:** when two runs edit the same file, give each an exact insertion point (after which function or heading, or before which line) and keep their edits apart. Better still, split the work by file.
 - **New files:** name every new file literally in `--scope` (the wrapper creates its folders). When parallel runs both need a new shared file, such as an index or barrel, create an empty placeholder in the checkout before starting them, so each run adds to it instead of creating it.
 - **Mistral copies the spec word for word,** mistakes included. Proofread names, paths and any prose it could paste into code or docs, and label examples as examples.
@@ -119,11 +121,13 @@ The report starts with `run_id`, `status` and `verification`, then `usage` (cost
 - **status: no_changes.** Mistral finished without changing any file. Read its result to see why (a blocked task, a misunderstanding, or the work already existed) before retrying.
 - **status: stopped_by_refusal.** Vibe ended the session after a refused approval, which the guard normally prevents. Check the `guard:` line, then `--resume` to let Mistral continue.
 - **verification: passed_except_preexisting.** Mistral broke nothing new, but some checks were already failing. Treat it like passed for Mistral's work, and look at the `baseline_warning`.
-- **verification: passed.** Review the diff for scope and quality, then run `adopt_with`. That applies only Mistral's changes to the checkout, leaves the user's uncommitted work alone, and removes the worktree. Use `--paths` to take part of it.
+- **verification: passed.** Passing checks don't prove the tests check the right thing. For tests Mistral wrote, read each assertion and ask whether it would fail if the feature were broken; watch for setups that test the wrong object, or duplicated fixtures. Then review the rest of the diff for scope and fit with the surrounding code, and run `adopt_with`. That applies only Mistral's changes to the checkout, leaves the user's uncommitted work alone, and removes the worktree. Use `--paths` to take part of it.
 - **verification: failed.** Read `failing_check_output`. Either follow up with `--resume … --worktree-name …` and a precise instruction, fix it yourself after adopting, or discard.
 - **status: budget_exceeded / tool_call_limit.** The wrapper stopped Mistral at a cap (`note:` says which, and the `budget:` line shows what was used). The work so far is in the worktree and has been checked, with one fix round. Review it, resume with a higher cap, or discard it.
 - **usage / credit.** Effective tokens (fresh, cached and output), the cost at list prices, and the month's credit used so far. Mention the credit when it's getting low.
-- **continued.** Mistral stopped without a closing summary and was asked once to finish. A remaining `final_message_warning` means it still didn't.
+- **continued.** Mistral stopped without a closing summary while its work looked unfinished (checks failing, nothing changed, or no checks to tell), and was asked once to finish. When its changes are in and pass the checks, the report only notes the missing summary instead of paying for a round. A remaining `final_message_warning` means it still didn't finish.
+- **Diffs.** Short diffs are inline. Every run's full diff is saved next to its report (`diff_file:` / "Read it from …") and stays there after `--adopt` removes the worktree.
+- **Review before you adopt.** `--adopt` removes the worktree, which ends any chance to `--resume` Mistral. If you might want Mistral to fix something you spot later, review first or adopt with `--keep-worktree`.
 - **status: limit_reached / timeout.** Resume with a higher cap, or finish it yourself.
 - **out_of_scope_changes.** Mistral edited files outside the scope. `--adopt` leaves them out. Look at them before deciding whether to add `--include-out-of-scope`, and never take them just to make a check pass.
 - **denied_commands.** Commands Mistral tried to run but wasn't allowed to. If one is a check it needs (e.g. `npx vitest run`), suggest adding it to `allow_commands`. `--stats` lists the most denied commands.

@@ -58,7 +58,7 @@ Claude delegates on its own, following the active policy. You can also ask ("hav
 5. **Vibe runs** with a generated agent profile that auto-approves file edits and only the commands you allowed (`--allow-command` / `allow_commands`). Each part of a chained command must be allowed, and everything else is refused.
 6. **Checks.** The wrapper runs each `--verify` command in the worktree. If one fails, its output goes back to the same Vibe session for a fix (`--fix-attempts`, default 1), and the checks run again.
 7. **Resumes.** `--resume <session> --worktree-name <name>` continues in the same worktree under a new run id. The report shows which run it continues, and adopting or discarding either id settles both. Its baseline is the one stored before Mistral's first changes. A check that wasn't measured then runs on a clean copy of the original snapshot, so Mistral's own failures are never counted as already failing.
-8. **Report.** It shows status, verification, usage (effective tokens and cost) and month-to-date credit, the change list, files changed outside the scope, commands Mistral was refused, the diff when short, and `adopt_with` / `discard_with` commands.
+8. **Report.** It shows status, verification, usage (effective tokens and cost) and month-to-date credit, the path of the run's full diff (kept after the worktree is removed), the change list, files changed outside the scope, commands Mistral was refused, the diff when short, and `adopt_with` / `discard_with` commands.
 9. **Adopt or discard.** `--adopt <id>` applies Mistral's changes inside the scope to your checkout (your own uncommitted work is left alone) and removes the worktree. `--paths` takes only some files, `--include-out-of-scope` also takes changes outside the scope, and `--discard <id> --note "why"` drops the run.
 
 Read tasks (`--mode read`) run in place with read-only tools.
@@ -90,7 +90,10 @@ monthly_credit = 225         # your Vibe credit per month (e.g. Mistral Pro's), 
 currency = "€"
 credit_reset_day = 1         # day of the month the credit renews
 min_savings = 2              # stop delegating kinds of task whose measured savings fall below this
-autofix = ["ruff format ."]  # run these when checks fail, before asking Mistral to fix
+autofix = [                  # run these when checks fail, before asking Mistral to fix
+  { cmd = "ruff format .", paths = ["backend/"] },        # only when the run touches backend/
+  { cmd = "npm --prefix frontend run lint:fix", paths = ["frontend/"] },
+]
 # token_weights = { input = 1.0, cached = 0.1, output = 5.0 }  # what counts as an effective token
 
 [write]
@@ -109,7 +112,7 @@ token_budget = 300000
 | balanced | any step with a short spec and an automatic check | 1M effective tokens, 80 tool calls | 300k, 40 tool calls |
 | aggressive | every such step by default, in parallel | 2.5M effective tokens, 150 tool calls | 600k, 60 tool calls |
 
-**Effective tokens.** Runs are measured and capped in effective tokens rather than money: fresh input tokens count in full, cached input tokens at a tenth, output tokens five times. These are Mistral Medium's price ratios, adjustable with `token_weights`. Agents re-send their context on every step, so most input is cached; at Mistral Medium's prices, 1M effective tokens is about $1.50. The wrapper watches each run's usage and tool calls while Vibe works and stops it at `token_budget` or `max_tool_calls` (`status: budget_exceeded` / `tool_call_limit`). `max_price` adds an optional money cap. A continuation, when a run stops without a closing summary, or a fix round gets half of each cap. A run stopped at a cap still gets its fix round (`fix_after_cap = false` turns that off), and `autofix` commands run first, so a formatting failure costs no Mistral round at all.
+**Effective tokens.** Runs are measured and capped in effective tokens rather than money: fresh input tokens count in full, cached input tokens at a tenth, output tokens five times. These are Mistral Medium's price ratios, adjustable with `token_weights`. Agents re-send their context on every step, so most input is cached; at Mistral Medium's prices, 1M effective tokens is about $1.50. The wrapper watches each run's usage and tool calls while Vibe works and stops it at `token_budget` or `max_tool_calls` (`status: budget_exceeded` / `tool_call_limit`). `max_price` adds an optional money cap. A continuation or a fix round gets half of each cap. A continuation happens only when a run stops without a closing summary and its work looks unfinished (checks failing, nothing changed, or no checks to tell); when its changes pass the checks, the report just notes the missing summary. A run stopped at a cap still gets its fix round (`fix_after_cap = false` turns that off), and `autofix` commands run first, so a formatting failure costs no Mistral round at all.
 
 **Credit and costs.** Reports show each run's usage (fresh, cached and output tokens), its cost at the model's list prices with cached input at the cached rate, and, with `monthly_credit` set, how much of the month's credit is used. The session-start reminder tells Claude how much credit is left, so it delegates freely early in the month and selectively near the end. For a model with no known price, add it to `model_prices` as `[input, output, cached]` per million tokens; earlier runs are then priced from their recorded tokens.
 

@@ -342,6 +342,8 @@ class Run:
 CONTINUE_PROMPT = ("You stopped before finishing. Continue the task from where you left off, then end with "
                    "the summary: every file you changed and why, and anything you couldn't do.")
 
+READ_ONLY_TOOL = re.compile(r"read|grep|glob|search|todo|list|view", re.I)
+
 CANCELLED = re.compile(r"<user_cancellation>|User cancelled the operation")
 
 
@@ -363,7 +365,15 @@ def unfinished_reason(turn: list, final_text: str) -> str:
     """Why the turn looks cut off (no closing summary, or a summary that stops mid-sentence), or ""."""
     if not turn:
         return ""
-    last = next((e for e in reversed(turn) if isinstance(e, dict) and e.get("type") in ("message", "effect")), None)
+    entries = [e for e in turn if isinstance(e, dict) and e.get("type") in ("message", "effect")]
+    # Trailing read-only calls (re-reading a file, updating a todo list) after the summary don't matter.
+    while entries and entries[-1].get("type") == "effect" and READ_ONLY_TOOL.search(vibe._effect_tool(entries[-1])):
+        if any(e.get("type") == "message" and e.get("role") == "assistant" and len(vibe.text_of(e)) >= 80
+               for e in entries):
+            entries.pop()
+        else:
+            break
+    last = entries[-1] if entries else None
     if last and last.get("type") == "effect":
         return "Vibe's last step was a tool call, not a closing summary; the run may have stopped early."
     text = final_text.rstrip()
@@ -595,36 +605,51 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                       model_hint=model)
 
     vibe_call(prompt, 1.0)
-    continued = 0
-    # A run that stops without a closing summary gets one nudge to finish, within half the caps.
-    if run.unfinished and run.status == "ok" and run.session_id and settings["continue_attempts"] > 0:
-        continued = 1
-        vibe_call(CONTINUE_PROMPT, 0.5)
+    continued, summary_note = 0, ""
 
     verification, results, failures, attempts = "not_run", {}, [], 0
     # Checks limited to paths that Mistral ended up changing outside the scope join in now.
     changed_so_far = (gitops.changed_files(wt) if wt else [])
     commands += [c["cmd"] for c in verify if c not in planned and vibe.check_applies(c["paths"], [], changed_so_far)]
     skipped_checks = [c["cmd"] for c in verify if c["cmd"] not in commands]
+    autofixes = [c["cmd"] for c in settings["autofix"] if vibe.check_applies(c["paths"], scope, changed_so_far)]
     autofixed: list[str] = []
-    if commands and run.status in ("ok", "limit_reached", "budget_exceeded", "tool_call_limit"):
+
+    def check_round() -> None:
+        nonlocal results, failures
         results = run_checks(commands, run_dir, args.verify_timeout)
         failures = new_failures(results, baseline)
-        if failures and settings["autofix"]:
+        if failures and autofixes:
             # Formatting-type failures are fixed by a command, not by another Mistral round.
-            for command in settings["autofix"]:
+            for command in autofixes:
                 code, _out = run_checks([command], run_dir, args.verify_timeout)[command]
                 autofixed.append(command + ("" if code == 0 else f" (exit {code})"))
             results = run_checks(commands, run_dir, args.verify_timeout)
             failures = new_failures(results, baseline)
+
+    checkable = run.status in ("ok", "limit_reached", "budget_exceeded", "tool_call_limit")
+    if commands and checkable:
+        check_round()
+    if run.unfinished and run.status == "ok":
+        changed_now = gitops.changed_files(wt) if wt else [ln[3:] for ln in git(workdir, "status", "--porcelain").splitlines()]
+        # Asking Mistral to finish costs a round; it's only worth it when the work looks unfinished,
+        # not when its changes are in and pass the checks (the report shows the changes anyway).
+        if commands and not failures and changed_now:
+            summary_note = ("Mistral ended without a closing summary, but its changes pass the checks, so it "
+                            "wasn't asked to finish (that would cost a round). Read the diff instead.")
+        elif run.session_id and settings["continue_attempts"] > 0:
+            continued = 1
+            vibe_call(CONTINUE_PROMPT, 0.5)
+            if commands:
+                check_round()
+    if commands and checkable:
         # A run stopped at a cap still gets its fix round (by default): its first pass is spent,
         # and the failures are often small.
         while failures and attempts < fix_attempts and run.session_id and (
                 run.status == "ok" or (settings["fix_after_cap"] and run.status in ("budget_exceeded", "tool_call_limit"))):
             attempts += 1
             vibe_call(vibe.fix_prompt(failures, scope), 0.5)
-            results = run_checks(commands, run_dir, args.verify_timeout)
-            failures = new_failures(results, baseline)
+            check_round()
         if failures:
             verification = "failed"
         elif any(code != 0 for code, _out in results.values()):
@@ -672,7 +697,9 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append("checks_skipped (limited to paths this run doesn't touch): " + ", ".join(skipped_checks))
     if flaky:
         lines.append("flaky_checks (failed, then passed on a rerun before Mistral started): " + ", ".join(flaky))
-    if run.unfinished:
+    if summary_note:
+        lines.append("note: " + summary_note)
+    elif run.unfinished:
         lines.append("final_message_warning: " + run.unfinished)
     if baseline_source:
         lines.append("baseline: " + baseline_source)
@@ -755,8 +782,12 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                      + "\n".join(f"  - {cmd}" + (f"  ({n}x)" if n > 1 else "") for cmd, n in counts.most_common(15)))
     if run.problems:
         lines.append("tool_calls_failed:\n" + "\n".join(f"  - {p}" for p in run.problems[:20]))
-    if run.notices:
-        lines.append("vibe_notices:\n" + "\n".join(f"  - {n}" for n in run.notices[:10]))
+    notices = [n for n in run.notices if "Rewrote tool_input" not in n]
+    rewrites = len(run.notices) - len(notices)
+    if rewrites:
+        notices.append(f"{rewrites} tool-input rewrite notice(s) from the guard's path corrections (see guard: above)")
+    if notices:
+        lines.append("vibe_notices:\n" + "\n".join(f"  - {n}" for n in notices[:10]))
     if run.stderr and run.status != "ok" and run.stderr.strip() != run.final_text.strip():
         lines.append("stderr:\n" + truncate(run.stderr, 2000))
     lines.append("\n--- result from Mistral Vibe ---\n" + (truncate(run.final_text) if run.final_text else "(no final message)"))
@@ -851,10 +882,21 @@ def worktree_section(wt: dict, run_id: str, files: list[str], out_of_scope: list
     if files:
         diff = gitops.changes_diff(wt)
         n = diff.count("\n")
+        # The full diff is kept with the run's report, so it can still be read after --adopt removes the worktree.
+        diff_file = ledger.runs_dir() / f"{run_id}.diff"
+        try:
+            diff_file.parent.mkdir(parents=True, exist_ok=True)
+            diff_file.write_text(diff, encoding="utf-8")
+        except OSError:
+            diff_file = None
         if 0 < n <= diff_lines:
             lines.append(f"diff:\n```diff\n{diff.rstrip()}\n```")
         else:
-            lines.append(f"diff: {n} lines, not shown. Review with: git -C {shlex.quote(wt['path'])} diff --cached {wt['base'][:12]}")
+            lines.append(f"diff: {n} lines, too long to show here. Read it from "
+                         + (f"{diff_file}" if diff_file else
+                            f"git -C {shlex.quote(wt['path'])} diff --cached {wt['base'][:12]}"))
+        if diff_file and 0 < n <= diff_lines:
+            lines.append(f"diff_file: {diff_file}")
         lines.append(f"adopt_with: {script_cmd('--adopt', run_id)}   (add --paths ... to take only some files)")
     lines.append(f"discard_with: {script_cmd('--discard', run_id, '--note', 'why')}")
     return lines
