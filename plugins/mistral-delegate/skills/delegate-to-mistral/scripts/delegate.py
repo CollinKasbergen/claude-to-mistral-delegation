@@ -37,6 +37,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -72,6 +73,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--allow-command", action="append", default=[], metavar="CMD",
                      help="Write mode: a command prefix Vibe may run itself (e.g. 'npm test'). Repeatable, "
                           "added to the configured ones.")
+    run.add_argument("--scope", action="append", default=[], metavar="GLOB",
+                     help="Write mode: files Mistral may create or change, relative to the repo root "
+                          "(e.g. 'src/**/*.test.ts'). Repeatable. Changes outside are flagged, and --adopt skips them.")
+    run.add_argument("--no-baseline", action="store_true",
+                     help="Don't run the checks on the untouched worktree before Mistral starts.")
+    run.add_argument("--deps-mode", choices=config.DEPS_MODES,
+                     help="How dependency folders get into the worktree (default: hardlink).")
     run.add_argument("--allow-shell", action="store_true",
                      help="Pass --auto-approve so Vibe may run any shell command. Off by default.")
     run.add_argument("--model", help="Vibe model alias for this run (must exist in your Vibe config).")
@@ -106,6 +114,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     manage.add_argument("--discard", metavar="ID", help="Discard a write run and remove its worktree.")
     manage.add_argument("--paths", nargs="+", metavar="PATH", help="With --adopt: only apply these paths.")
     manage.add_argument("--note", help="With --discard/--adopt: why, for the track record.")
+    manage.add_argument("--include-out-of-scope", action="store_true",
+                        help="With --adopt: also apply changes outside the run's --scope.")
     manage.add_argument("--keep-worktree", action="store_true", help="With --adopt: keep the worktree.")
     manage.add_argument("--show-config", action="store_true", help="Print the effective settings.")
     return p.parse_args(argv)
@@ -149,18 +159,35 @@ def cmd_adopt(args: argparse.Namespace) -> int:
         return 0
     if not os.path.isdir(wt["path"]):
         raise DelegateError(f"The worktree {wt['path']} no longer exists.")
+    paths = args.paths
+    skipped: list[str] = []
+    scope = run.get("scope") or []
+    if scope and not args.include_out_of_scope:
+        changed = gitops.changed_files(wt)
+        if paths:
+            changed = [f for f in changed if any(f == p or f.startswith(p.rstrip("/") + "/") for p in paths)]
+        skipped = [f for f in changed if not vibe.matches_scope(f, scope)]
+        if skipped:
+            paths = [f for f in changed if vibe.matches_scope(f, scope)]
+            if not paths:
+                print("Every change is outside the run's scope (" + ", ".join(scope) + "); nothing applied. "
+                      "Use --include-out-of-scope to apply them anyway.")
+                return 1
     try:
-        files = gitops.apply_to_checkout(wt, args.paths)
+        files = gitops.apply_to_checkout(wt, paths)
     except DelegateError as e:
         raise DelegateError(f"{e}\nNothing was applied; the worktree is still at {wt['path']}. "
                             "Your checkout may have changed the same lines: apply by hand or use --paths.") from e
     if not files:
         print("Nothing to apply" + (" for those paths." if args.paths else ": the run made no changes."))
         return 0
-    outcome = "adopted_partial" if args.paths else "adopted"
-    ledger.append({"event": "outcome", "id": run["id"], "outcome": outcome, "paths": args.paths, "note": args.note})
+    outcome = "adopted_partial" if (args.paths or skipped) else "adopted"
+    ledger.append({"event": "outcome", "id": run["id"], "outcome": outcome, "paths": paths, "note": args.note})
     print(f"Applied {len(files)} file(s) from {run['id']} to {wt['toplevel']}:")
     print("\n".join(f"  {f}" for f in files))
+    if skipped:
+        print("Left out (outside the run's scope; --include-out-of-scope to apply):")
+        print("\n".join(f"  {f}" for f in skipped))
     if args.keep_worktree:
         print(f"Worktree kept at {wt['path']}.")
     else:
@@ -191,6 +218,8 @@ class Run:
         self.args = args
         self.status = "error"
         self.tool_calls = 0
+        self.turns = 0
+        self.denied: list[str] = []
         self.problems: list[str] = []
         self.notices: list[str] = []
         self.final_text = ""
@@ -205,10 +234,13 @@ class Run:
             self.status = "timeout"
             self.stderr = f"Vibe did not finish within {self.args.timeout}s and was stopped."
             return
-        info = vibe.summarize_history(vibe.parse_output(proc.stdout))
+        history = vibe.parse_output(proc.stdout)
+        info = vibe.summarize_history(this_turn(history))
         self.stderr = proc.stderr.strip()
-        self.session_id = info["session_id"] or self.session_id
+        self.session_id = info["session_id"] or vibe.summarize_history(history)["session_id"] or self.session_id
         self.tool_calls += info["tool_calls"]
+        self.turns += info["assistant_messages"]
+        self.denied += info["denied"]
         self.problems += info["problems"]
         self.notices += info["notices"]
         if info["final_text"]:
@@ -219,14 +251,28 @@ class Run:
               and not re.match(r"(Error|Teleport error):", self.stderr) and "Traceback" not in self.stderr):
             # Vibe reports a hit limit by printing the last assistant text to stderr, unprefixed.
             self.status = "limit_reached"
-            self.final_text = self.final_text or self.stderr
+            self.final_text = self.stderr
         else:
             self.status = "error"
 
 
-def run_checks(commands: list[str], cwd: str, timeout: int) -> tuple[list[str], tuple | None]:
-    """Run checks in order until one fails. Returns (lines for the report, failure or None)."""
-    lines = []
+def this_turn(history: list) -> list:
+    """The entries from the latest prompt on.
+
+    A resumed session's JSON output repeats the whole session, so counting all of
+    it again would inflate tool calls and denied commands.
+    """
+    for i in range(len(history) - 1, -1, -1):
+        entry = history[i]
+        if (isinstance(entry, dict) and entry.get("type") == "message" and entry.get("role") == "user"
+                and entry.get("source") in (None, "turn_start")):
+            return history[i:]
+    return history
+
+
+def run_checks(commands: list[str], cwd: str, timeout: int) -> dict[str, tuple[int, str]]:
+    """Run every check. Returns {command: (exit code, end of output)}."""
+    results = {}
     for command in commands:
         try:
             proc = subprocess.run(command, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -236,10 +282,27 @@ def run_checks(commands: list[str], cwd: str, timeout: int) -> tuple[list[str], 
             code = 124
             output = (e.output or "") if isinstance(e.output, str) else (e.output or b"").decode(errors="replace")
             output += f"\n[timed out after {timeout}s]"
-        lines.append(f"  {'pass' if code == 0 else 'FAIL'}: {command}" + ("" if code == 0 else f" (exit {code})"))
-        if code != 0:
-            return lines, (command, code, tail(output))
-    return lines, None
+        results[command] = (code, tail(output))
+    return results
+
+
+def new_failures(results: dict, baseline: dict) -> list[tuple[str, int, str]]:
+    """Failing checks that passed (or weren't run) before Mistral changed anything."""
+    return [(cmd, code, out) for cmd, (code, out) in results.items()
+            if code != 0 and not (cmd in baseline and baseline[cmd][0] != 0)]
+
+
+def check_lines(results: dict, baseline: dict) -> list[str]:
+    lines = []
+    for cmd, (code, _out) in results.items():
+        if code == 0:
+            note = " (was failing before Mistral)" if cmd in baseline and baseline[cmd][0] != 0 else ""
+            lines.append(f"  pass: {cmd}{note}")
+        elif cmd in baseline and baseline[cmd][0] != 0:
+            lines.append(f"  FAIL: {cmd} (exit {code}; already failing before Mistral changed anything)")
+        else:
+            lines.append(f"  FAIL: {cmd} (exit {code})")
+    return lines
 
 
 def run_task(args: argparse.Namespace) -> int:
@@ -255,8 +318,8 @@ def run_task(args: argparse.Namespace) -> int:
     task = (args.task or "").strip() or ("Implement the spec below." if spec else "")
     if not task:
         raise DelegateError("No task given. Pass it as an argument, '-' for stdin, or use --spec.")
-    if args.mode == "read" and (args.verify or args.in_place or args.allow_command):
-        raise DelegateError("--verify, --allow-command and --in-place only apply to --mode write.")
+    if args.mode == "read" and (args.verify or args.in_place or args.allow_command or args.scope):
+        raise DelegateError("--verify, --allow-command, --scope and --in-place only apply to --mode write.")
 
     top = gitops.toplevel(workdir)
     settings = config.load(top or workdir)
@@ -270,7 +333,10 @@ def run_task(args: argparse.Namespace) -> int:
     write = args.mode == "write"
     verify = [] if (args.no_verify or not write) else (args.verify or settings["verify"])
     allow_commands = list(dict.fromkeys(settings["allow_commands"] + args.allow_command)) if write else []
+    scope = list(dict.fromkeys(args.scope or settings["scope"])) if write else []
     fix_attempts = settings["fix_attempts"] if args.fix_attempts is None else max(0, args.fix_attempts)
+    baseline_on = settings["baseline"] and not args.no_baseline
+    deps_mode = args.deps_mode or settings["deps_mode"]
     kind = args.kind or ("search" if args.mode == "read" else "other")
 
     if shutil.which(args.vibe_bin) is None and not Path(args.vibe_bin).is_file():
@@ -295,44 +361,60 @@ def run_task(args: argparse.Namespace) -> int:
             return 2
         try:
             wt = gitops.prepare_worktree(top, args.worktree_name or run_id, snapshot=not args.no_snapshot,
-                                         link_deps=not args.no_link_deps, extra_links=args.link)
+                                         link_deps=not args.no_link_deps, extra_links=args.link,
+                                         deps_mode=deps_mode)
         except DelegateError as e:
             print(f"status: error\n\nCould not prepare the worktree: {e}")
             return 2
         run_dir = str(Path(wt["path"]) / Path(workdir).relative_to(top))
 
+    ledger.append({"event": "start", "id": run_id, "pid": os.getpid(), "mode": args.mode, "kind": kind,
+                   "repo": Path(top or workdir).name, "workdir": workdir, "task": task[:500],
+                   "policy": settings["policy"], "model": model, "scope": scope,
+                   "worktree": {k: wt[k] for k in ("name", "path", "toplevel", "base", "links")} if wt else None})
+
+    started_wall, started = time.time(), time.monotonic()
+    # Run the checks once before Mistral changes anything, so failures that were
+    # already there (or come from the worktree environment) aren't blamed on it.
+    baseline = run_checks(verify, run_dir, args.verify_timeout) if verify and baseline_on else {}
+    preexisting = [cmd for cmd, (code, _out) in baseline.items() if code != 0]
+
     prompt = vibe.build_prompt(task, mode=args.mode, spec=spec, context=args.context, verify=verify,
-                               allow_commands=allow_commands, allow_shell=args.allow_shell)
+                               allow_commands=allow_commands, allow_shell=args.allow_shell, scope=scope,
+                               preexisting_failures=preexisting)
     agent = args.agent or vibe.write_agent_profile(args.mode, model, allow_commands)
     trust = args.trust or wt is not None
 
-    ledger.append({"event": "start", "id": run_id, "pid": os.getpid(), "mode": args.mode, "kind": kind,
-                   "repo": Path(top or workdir).name, "workdir": workdir, "task": task[:500],
-                   "policy": settings["policy"], "model": model,
-                   "worktree": {k: wt[k] for k in ("name", "path", "toplevel", "base", "links")} if wt else None})
-
     run = Run(args)
-    stats_before = vibe.read_session_stats(args.resume, run_dir) if args.resume else None
-    started_wall, started = time.time(), time.monotonic()
+    stats_before = vibe.read_session_stats(args.resume, run_dir, model_hint=model) if args.resume else None
     run.call_vibe(vibe.build_command(args.vibe_bin, prompt, mode=args.mode, agent=agent, caps=caps,
-                                     allow_shell=args.allow_shell, trust=trust, resume=args.resume), run_dir)
+                                     allow_shell=args.allow_shell, trust=trust, resume=args.resume,
+                                     extra=settings["vibe_args"]), run_dir)
 
-    verification, check_lines, failure, attempts = "not_run", [], None, 0
+    verification, results, failures, attempts = "not_run", {}, [], 0
     if verify and run.status in ("ok", "limit_reached"):
-        check_lines, failure = run_checks(verify, run_dir, args.verify_timeout)
-        while failure and attempts < fix_attempts and run.status == "ok" and run.session_id:
+        results = run_checks(verify, run_dir, args.verify_timeout)
+        failures = new_failures(results, baseline)
+        while failures and attempts < fix_attempts and run.status == "ok" and run.session_id:
             attempts += 1
-            spent = vibe.stats_cost(vibe.read_session_stats(run.session_id, run_dir))
+            spent = vibe.stats_cost(vibe.read_session_stats(run.session_id, run_dir, model_hint=model)) or 0.0
             fix_caps = dict(caps, max_price=spent + caps["max_price"] * 0.5)
-            run.call_vibe(vibe.build_command(args.vibe_bin, vibe.fix_prompt(*failure), mode=args.mode, agent=agent,
-                                             caps=fix_caps, allow_shell=args.allow_shell, trust=trust,
-                                             resume=run.session_id), run_dir)
-            check_lines, failure = run_checks(verify, run_dir, args.verify_timeout)
-        verification = "failed" if failure else "passed"
+            run.call_vibe(vibe.build_command(args.vibe_bin, vibe.fix_prompt(failures, scope), mode=args.mode,
+                                             agent=agent, caps=fix_caps, allow_shell=args.allow_shell,
+                                             trust=trust, resume=run.session_id,
+                                             extra=settings["vibe_args"]), run_dir)
+            results = run_checks(verify, run_dir, args.verify_timeout)
+            failures = new_failures(results, baseline)
+        if failures:
+            verification = "failed"
+        elif any(code != 0 for code, _out in results.values()):
+            verification = "passed_except_preexisting"
+        else:
+            verification = "passed"
     elapsed = time.monotonic() - started
 
-    stats_after = vibe.read_session_stats(run.session_id, run_dir,
-                                          since=None if run.session_id else started_wall)
+    stats_after = vibe.read_session_stats(run.session_id, run_dir, since=None if run.session_id else started_wall,
+                                          model_hint=model)
     run.session_id = run.session_id or (stats_after or {}).get("session_id")
     use = vibe.usage(stats_after, stats_before)
 
@@ -342,47 +424,62 @@ def run_task(args: argparse.Namespace) -> int:
         if verification == "not_run":
             lines.append("verification: not run (Vibe did not finish)")
         else:
-            lines.append(f"verification: {verification} ({detail})\n" + "\n".join(check_lines))
+            lines.append(f"verification: {verification} ({detail})\n" + "\n".join(check_lines(results, baseline)))
+    if preexisting:
+        lines.append("baseline_warning: these checks already failed in the untouched "
+                     + ("worktree" if wt else "checkout") + " before Mistral changed anything: "
+                     + ", ".join(preexisting) + ". Mistral was told not to work around them. If they pass "
+                     "in your checkout, the cause is the worktree environment (see deps_mode).")
     lines.append(f"mode: {args.mode}, kind: {kind}, policy: {settings['policy']}" + (f", model: {model}" if model else ""))
-    if use:
-        line = f"usage: cost ${use['cost']:.4f} (first-pass cap ${caps['max_price']:.2f}), {use['steps']} steps, {use['tokens']:,} tokens"
-        if use["session_total"] is not None:
-            line += f" (this run; session total ${use['session_total']:.4f})"
-        lines.append(line)
-    else:
-        lines.append(f"usage: cost unknown (Vibe session log not found), first-pass cap ${caps['max_price']:.2f}")
-    lines.append(f"elapsed: {elapsed:.0f}s, tool_calls: {run.tool_calls}, max_turns: {caps['max_turns']}")
+    lines.append(usage_line(use, caps["max_price"]))
+    turns = use["steps"] if use and use.get("steps") is not None else run.turns
+    lines.append(f"elapsed: {elapsed:.0f}s, turns: {turns} (max_turns {caps['max_turns']}), "
+                 f"tool calls: {run.tool_calls} (several per turn; not capped by max_turns)")
     model_warning = vibe.unknown_model_warning(model) if not args.agent else None
     if model_warning:
         lines.append(f"model_warning: {model_warning}")
     if allow_commands:
         lines.append("vibe_may_run: " + ", ".join(allow_commands))
+    if scope:
+        lines.append("scope: " + ", ".join(scope))
     if run.session_id:
         lines.append(f"session_id: {run.session_id}  (follow up with: --resume {run.session_id}"
                      + (f" --worktree-name {wt['name']})" if wt else ")"))
 
     files: list[str] = []
+    out_of_scope: list[str] = []
     worktree_removed = False
     if wt:
         files = gitops.changed_files(wt)
+        out_of_scope = [f for f in files if scope and not vibe.matches_scope(f, scope)]
         if run.status in ("error", "timeout") and not wt["reused"] and not files:
             gitops.remove_worktree(wt)
             worktree_removed = True
             lines.append(f"worktree: removed {wt['name']} (Vibe failed before changing anything)")
         else:
-            lines += worktree_section(wt, run_id, files, args.diff_lines)
+            lines += worktree_section(wt, run_id, files, out_of_scope, args.diff_lines)
     elif write:
         status_out = git(workdir, "status", "--porcelain").rstrip()
         files = [line[3:] for line in status_out.splitlines()]
+        out_of_scope = [f for f in files if scope and not vibe.matches_scope(f, scope)]
         lines.append("changed_files (in your checkout):\n" + (status_out or "  (none)"))
+        if out_of_scope:
+            lines.append("out_of_scope_changes (in your checkout, outside --scope; revert them if unwanted): "
+                         + ", ".join(out_of_scope))
 
-    if failure:
-        lines.append(f"failing_check_output ({failure[0]}):\n```\n{failure[2]}\n```")
+    for cmd, code, out in failures[:3]:
+        lines.append(f"failing_check_output ({cmd}, exit {code}):\n```\n{out}\n```")
+    if run.denied:
+        counts = Counter(run.denied)
+        why = ("refused because they aren't in allow_commands; add them if Mistral needs them" if write
+               else "read mode runs no commands")
+        lines.append(f"denied_commands ({why}):\n"
+                     + "\n".join(f"  - {cmd}" + (f"  ({n}x)" if n > 1 else "") for cmd, n in counts.most_common(15)))
     if run.problems:
-        lines.append("tool_calls_not_completed:\n" + "\n".join(f"  - {p}" for p in run.problems[:20]))
+        lines.append("tool_calls_failed:\n" + "\n".join(f"  - {p}" for p in run.problems[:20]))
     if run.notices:
         lines.append("vibe_notices:\n" + "\n".join(f"  - {n}" for n in run.notices[:10]))
-    if run.stderr and run.status != "ok" and run.stderr != run.final_text:
+    if run.stderr and run.status != "ok" and run.stderr.strip() != run.final_text.strip():
         lines.append("stderr:\n" + truncate(run.stderr, 2000))
     lines.append("\n--- result from Mistral Vibe ---\n" + (truncate(run.final_text) if run.final_text else "(no final message)"))
 
@@ -390,14 +487,32 @@ def run_task(args: argparse.Namespace) -> int:
     ledger.save_report(run_id, report)
     ledger.append({"event": "end", "id": run_id, "status": run.status, "verification": verification,
                    "fix_attempts_used": attempts, "cost": use["cost"] if use else None,
-                   "steps": use["steps"] if use else None, "tokens": use["tokens"] if use else None,
-                   "files_changed": len(files), "session_id": run.session_id,
-                   "worktree_removed": worktree_removed})
+                   "cost_estimated": use["estimated"] if use else None,
+                   "steps": turns, "tokens": use["tokens"] if use else None,
+                   "files_changed": len(files), "out_of_scope": out_of_scope,
+                   "denied": sorted(set(run.denied)), "baseline_failures": preexisting,
+                   "session_id": run.session_id, "worktree_removed": worktree_removed})
     print(report)
     return 0 if run.status == "ok" and verification != "failed" else 1
 
 
-def worktree_section(wt: dict, run_id: str, files: list[str], diff_lines: int) -> list[str]:
+def usage_line(use: dict | None, max_price: float) -> str:
+    if not use:
+        return (f"usage: cost unknown (no token data in Vibe's session storage; if this keeps happening, set "
+                f"vibe_args = [\"--legacy-harness\"] in the config for exact costs), first-pass cap ${max_price:.2f}")
+    if use["cost"] is None:
+        cost = f"cost unknown (no price for model {use.get('model')!r} in Vibe's config)"
+    elif use["estimated"]:
+        cost = f"cost ~${use['cost']:.4f} (estimated from tokens at {use.get('model')} list prices)"
+    else:
+        cost = f"cost ${use['cost']:.4f}"
+    line = f"usage: {cost}, first-pass cap ${max_price:.2f}, {use['tokens']:,} tokens"
+    if use["session_total"] is not None:
+        line += f" (this run; session total ${use['session_total']:.4f})"
+    return line
+
+
+def worktree_section(wt: dict, run_id: str, files: list[str], out_of_scope: list[str], diff_lines: int) -> list[str]:
     lines = [f"worktree_name: {wt['name']}" + ("  (reused)" if wt["reused"] else ""),
              f"worktree_path: {wt['path']}"]
     snap = wt.get("snapshot")
@@ -407,9 +522,15 @@ def worktree_section(wt: dict, run_id: str, files: list[str], diff_lines: int) -
     else:
         lines.append(f"worktree_base: your HEAD at {wt['base'][:12]}")
     if wt.get("links"):
-        lines.append("linked_from_checkout (symlinks, shared with your checkout): " + ", ".join(wt["links"]))
+        how = {"hardlink": "hard-linked copies", "copy": "copies", "symlink": "symlinks"}.get(wt.get("deps_mode"), "linked")
+        lines.append(f"dependencies ({how} from your checkout): " + ", ".join(wt["links"]))
+    for note in wt.get("notes") or []:
+        lines.append(f"dependency_note: {note}")
     stat = gitops.changes_stat(wt)
     lines.append("changes_by_vibe:\n" + (stat or "  (none)"))
+    if out_of_scope:
+        lines.append("out_of_scope_changes (outside --scope; --adopt leaves these out unless you add "
+                     "--include-out-of-scope): " + ", ".join(out_of_scope))
     if files:
         diff = gitops.changes_diff(wt)
         n = diff.count("\n")

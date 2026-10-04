@@ -110,28 +110,95 @@ def snapshot_uncommitted(top: str, worktree: Path) -> dict | None:
     return {"modified": changed, "untracked": len(untracked)}
 
 
-def link_dependencies(top: str, worktree: Path, extra: list[str], auto: bool) -> list[str]:
+DEPS_MODES = ("hardlink", "copy", "symlink", "none")
+
+# Cache folders inside dependency trees are skipped when hard-linking: tools rewrite
+# them in place, which would also change the files in the user's checkout.
+CACHE_DIRS = (".vite", ".vitest", ".cache", ".turbo", ".parcel-cache")
+
+
+def _hardlink_tree(src: Path, dst: Path) -> None:
+    def link_or_copy(s: str, d: str) -> None:
+        try:
+            os.link(s, d)
+        except OSError:
+            shutil.copy2(s, d)
+
+    shutil.copytree(src, dst, symlinks=True, copy_function=link_or_copy,
+                    ignore=shutil.ignore_patterns(*CACHE_DIRS))
+
+
+def _can_hardlink(src: Path, dst_dir: Path) -> bool:
+    """Whether files under src can be hard-linked into dst_dir (same filesystem)."""
+    for root, _dirs, files in os.walk(src):
+        for name in files:
+            probe = dst_dir / f".mistral-delegate-link-probe-{os.getpid()}"
+            try:
+                os.link(Path(root, name), probe)
+            except OSError:
+                return False
+            probe.unlink()
+            return True
+    return True
+
+
+def prepare_dependencies(top: str, worktree: Path, extra: list[str], auto: bool,
+                         mode: str = "hardlink") -> tuple[list[str], list[str]]:
+    """Make dependency folders available in the worktree. Returns (paths prepared, notes).
+
+    hardlink: real directories whose files are hard links (fast, no extra disk, and tools
+              like Vite see them inside the project); falls back to symlink across filesystems.
+    copy:     a full copy (slow for big trees, fully independent).
+    symlink:  a symlink to the checkout's folder (instant, but some tools refuse paths
+              that resolve outside the project).
+    Extra paths from --link are always symlinked.
+    """
+    notes: list[str] = []
     candidates: list[str] = []
-    if auto:
+    if auto and mode != "none":
         listing = git(top, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z")
         for entry in listing.split("\0"):
             entry = entry.rstrip("/")
             if entry and Path(entry).name in DEPENDENCY_DIRS:
                 candidates.append(entry)
-    candidates += [e.strip("/") for e in extra]
 
-    linked = []
+    prepared = []
     for rel in dict.fromkeys(candidates):
+        src, dst = Path(top, rel), worktree / rel
+        if not src.is_dir() or dst.exists() or dst.is_symlink():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        how = mode
+        if how == "hardlink" and not _can_hardlink(src, dst.parent):
+            how = "symlink"
+            notes.append(f"{rel}: hard links not possible (different filesystem), symlinked instead; "
+                         "set deps_mode = \"copy\" if tools reject it")
+        if how in ("hardlink", "copy"):
+            try:
+                if how == "hardlink":
+                    _hardlink_tree(src, dst)
+                else:
+                    shutil.copytree(src, dst, symlinks=True)
+            except (OSError, shutil.Error) as e:
+                shutil.rmtree(dst, ignore_errors=True)
+                how = "symlink"
+                notes.append(f"{rel}: {e.__class__.__name__} while copying, symlinked instead")
+        if how == "symlink":
+            os.symlink(src, dst, target_is_directory=True)
+        prepared.append(rel)
+
+    for rel in dict.fromkeys(e.strip("/") for e in extra):
         src, dst = Path(top, rel), worktree / rel
         if not src.exists() or dst.exists() or dst.is_symlink():
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(src, dst, target_is_directory=src.is_dir())
-        linked.append(rel)
-    return linked
+        prepared.append(rel)
+    return prepared, notes
 
 
-def prepare_worktree(top: str, name: str, *, snapshot: bool, link_deps: bool, extra_links: list[str]) -> dict:
+def prepare_worktree(top: str, name: str, *, snapshot: bool, link_deps: bool, extra_links: list[str],
+                     deps_mode: str = "hardlink") -> dict:
     if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
         raise DelegateError(f"Invalid worktree name: {name!r} (use letters, digits, '.', '_' and '-')")
 
@@ -145,6 +212,8 @@ def prepare_worktree(top: str, name: str, *, snapshot: bool, link_deps: bool, ex
             "base": state.get("base") or git(existing, "rev-parse", "HEAD").strip(),
             "snapshot": state.get("snapshot"),
             "links": state.get("links", []),
+            "deps_mode": state.get("deps_mode"),
+            "notes": [],
             "reused": True,
         }
     if git(top, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}").strip():
@@ -155,10 +224,11 @@ def prepare_worktree(top: str, name: str, *, snapshot: bool, link_deps: bool, ex
     git_checked(top, "worktree", "add", "-q", "-b", name, str(path), "HEAD")
 
     snap = snapshot_uncommitted(top, path) if snapshot else None
-    links = link_dependencies(top, path, extra_links, auto=link_deps)
-    state = {"base": git(path, "rev-parse", "HEAD").strip(), "snapshot": snap, "links": links}
+    links, notes = prepare_dependencies(top, path, extra_links, auto=link_deps, mode=deps_mode)
+    state = {"base": git(path, "rev-parse", "HEAD").strip(), "snapshot": snap, "links": links,
+             "deps_mode": deps_mode if link_deps else "none"}
     state_path(path).write_text(json.dumps(state))
-    return {"name": name, "path": str(path), "toplevel": top, "reused": False, **state}
+    return {"name": name, "path": str(path), "toplevel": top, "reused": False, "notes": notes, **state}
 
 
 def stage_changes(wt: dict) -> None:
