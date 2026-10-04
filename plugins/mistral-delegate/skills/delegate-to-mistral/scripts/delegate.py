@@ -466,19 +466,81 @@ LOOSE_ASSERTION = re.compile(r"^\+\s*(assert\s+(?!.*==).*\s(not\s+)?in\s|assert\
                              r".*\.(toContain|toBeTruthy|toBeDefined|toBeGreaterThan)\()")
 
 
+# A line that checks something: an assertion, an expected exception, or a helper named for checking.
+ASSERTS = re.compile(r"\bassert|\bexpect\(|\.should\b|\braises\(|\bthrows\(|\.rejects\b|"
+                     r"(^|[\s.(])(assert|check|verify|expect)(_\w+|[A-Z]\w*)?\(")
+# Assertions a function that returns nothing also passes.
+NONE_ONLY = re.compile(r"assert\s+(\S.*\s+is\s+(not\s+)?None|not\s+[\w.\[\]'\"()]+)\s*(,.*)?$|assertIs(Not)?None\(|assertFalse\(|"
+                       r"\.(toBeNull|toBeUndefined|toBeFalsy)\(\)|\.not\.toBeDefined\(\)")
+PY_TEST = re.compile(r"^(\s*)(async\s+)?def\s+(test\w*)\s*\(")
+JS_TEST = re.compile(r"^(\s*)(it|test)(\.\w+)?\(\s*(['\"`])(.*?)\4")
+
+
+def new_tests(diff: str) -> list[tuple[str, str, list[str]]]:
+    """Test functions added whole in a diff: (file, test name, body lines)."""
+    found: list[tuple[str, str, list[str]]] = []
+    files: list[tuple[str, list[tuple[str, str]]]] = []  # (file, [(kind, text)]); kind "+", " " or "@" (hunk)
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            files.append((line[6:] if line.startswith("+++ b/") else "", []))
+        elif files and line.startswith("@@"):
+            files[-1][1].append(("@", ""))
+        elif files and line[:1] in ("+", " "):
+            files[-1][1].append((line[0], line[1:]))
+    for path, lines in files:
+        if not (path and TEST_FILE.search(path)):
+            continue
+        for i, (kind, text) in enumerate(lines):
+            start = PY_TEST.match(text) or JS_TEST.match(text) if kind == "+" else None
+            if not start:
+                continue
+            indent, body, whole = len(start.group(1)), [], True
+            for nkind, nxt in lines[i + 1:]:
+                if nkind == "@":
+                    break  # the hunk ends: the rest of the file isn't part of the change
+                if nxt.strip() and len(nxt) - len(nxt.lstrip()) <= indent:
+                    if nkind == "+" and nxt.strip().startswith("})"):
+                        body.append(nxt)  # a JS test's closing line
+                    break
+                if nkind != "+" and nxt.strip():
+                    whole = False  # the test goes on in lines that were already there
+                    break
+                body.append(nxt)
+            if whole and any(b.strip() for b in body):
+                found.append((path, start.group(3) if start.re is PY_TEST else start.group(5), body))
+    return found
+
+
 def assertion_hint(wt: dict) -> str:
-    """New test lines that assert loosely (membership, length, truthiness), a pattern Mistral falls back to."""
-    found, current = [], ""
-    for line in gitops.changes_diff(wt).splitlines():
+    """New tests that assert loosely (membership, length, truthiness), check only None, or check nothing:
+    patterns Mistral falls back to."""
+    diff = gitops.changes_diff(wt)
+    loose, current = [], ""
+    for line in diff.splitlines():
         if line.startswith("+++ b/"):
             current = line[6:]
         elif current and TEST_FILE.search(current) and LOOSE_ASSERTION.search(line):
-            found.append(f"{current}: {line[1:].strip()[:100]}")
-    if not found:
+            loose.append(f"{current}: {line[1:].strip()[:100]}")
+    empty, none_only = [], []
+    for path, name, body in new_tests(diff):
+        checks = [ln.strip() for ln in body if ASSERTS.search(ln) and not ln.strip().startswith(("#", "//"))]
+        if not checks:
+            empty.append(f"{path}: {name}")
+        elif all(NONE_ONLY.search(c) for c in checks):
+            none_only.append(f"{path}: {name}")
+    parts = []
+    if loose:
+        parts.append(f"{len(loose)} assertion(s) in the new tests check presence, size or truthiness, or compute "
+                     "the expected value with a condition, rather than asserting exact values, e.g. "
+                     + "; ".join(loose[:3]))
+    if empty:
+        parts.append(f"{len(empty)} new test(s) assert nothing: " + "; ".join(empty[:3]))
+    if none_only:
+        parts.append(f"{len(none_only)} new test(s) only check for None or a false value, which code that does "
+                     "nothing also passes: " + "; ".join(none_only[:3]))
+    if not parts:
         return ""
-    return (f"assertion_hint: {len(found)} assertion(s) in the new tests check presence, size or truthiness, "
-            "or compute the expected value with a condition, rather than asserting exact values, e.g. " + "; ".join(found[:3])
-            + ". Check them against the project's rules before adopting.")
+    return "assertion_hint: " + ". ".join(parts) + ". Check them against the project's rules before adopting."
 
 
 CANCELLED = re.compile(r"<user_cancellation>|User cancelled the operation")
@@ -1361,7 +1423,8 @@ def main(argv: list[str]) -> int:
             settings = config.load(gitops.toplevel(str(Path(args.workdir).resolve())) or args.workdir)
             vibe.EXTRA_PRICES.update(settings["model_prices"])
             print(ledger.format_stats(ledger.load_runs(), prices=vibe.model_prices(), currency=settings["currency"],
-                                      min_savings=settings["min_savings"]))
+                                      min_savings=settings["min_savings"],
+                                      allowed=settings["allow_commands"] + [c["cmd"] for c in settings["verify"]]))
             line = credit_line(settings, None)
             if line:
                 print(line)

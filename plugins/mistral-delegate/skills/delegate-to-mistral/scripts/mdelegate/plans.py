@@ -26,6 +26,8 @@ from .checks import CheckResult, check_lines, measure_baseline, new_failures, ru
 from .gitops import DelegateError
 from .plan import Plan, PlanError, Step, parse, select, step_spec
 
+BASELINE_WARNING = re.compile(r"baseline_warning: these checks already failed in the untouched \w+ before Mistral "
+                              r"changed anything: (.*?)\. Mistral was told")
 POLL = max(0.05, min(1.0, float(os.environ.get("MISTRAL_DELEGATE_WATCH_INTERVAL") or 1.0)))
 # Report lines from a step worth repeating in the plan's report.
 STEP_NOTE_PREFIXES = ("out_of_scope_changes", "test_strength_warning", "final_message_warning", "missing_files",
@@ -233,13 +235,15 @@ class PlanRun:
         if self.args.no_verify:
             commands = []
         else:
-            # The plan's own checks; otherwise every check a merged step had (each must still hold together)
-            # and the configured checks that concern the changed files.
-            commands = list(dict.fromkeys(self.plan.verify or self.args.verify or [
+            # The plan's own checks (and --verify) add to the rest, as --verify does in a single run: every
+            # check a merged step had (each must still hold together) and the configured checks that concern
+            # the changed files.
+            commands = list(dict.fromkeys([
+                *(self.args.verify or []), *self.plan.verify,
                 *[c for s in merged for c in self.plan.step(s).verify],
                 *[c["cmd"] for c in self.settings["verify"] if vibe.check_applies(c["paths"], [], changed)]]))
         # One merged step is that step's own result, already checked; the combination needs its own check.
-        if not commands or (len(merged) < 2 and not self.plan.verify):
+        if not commands or (len(merged) < 2 and not self.plan.verify and not self.args.verify):
             out["verification"] = "not_run" if not commands else "same_as_step"
             return out
         out["commands"] = commands
@@ -331,19 +335,42 @@ class PlanRun:
                  f"plan: {self.plan.title} ({len(merged)} of {len(self.steps)} steps merged)", *self.notes]
         for warning in self.settings["warnings"]:
             lines.append(f"config_warning: {warning}")
+        unread = [s.id for s in self.steps if s.id in merged
+                  and ((self.results.get(s.id) or {}).get("record") or {}).get("unfinished")]
+        if unread:
+            # Checks passing is why they were merged; nothing from Mistral says what it did or left out.
+            lines.append("review_first: " + ", ".join(unread) + (" ends" if len(unread) == 1 else " end")
+                         + " without a closing summary and " + ("was" if len(unread) == 1 else "were")
+                         + " merged on passing checks alone. Read " + ("its" if len(unread) == 1 else "their")
+                         + " diff before adopting: " + ", ".join(
+                             f"--result {self.results[s]['run_id']}" for s in unread if self.results[s].get("run_id")))
         lines.append("steps:")
         for step in self.steps:
             lines.append("  " + self.step_line(step, integration))
         notes: dict[str, list[str]] = {}  # note -> the steps that reported it
+        failed_before: dict[str, list[str]] = {}  # check -> the steps whose baseline it failed
         for step in self.steps:
             report_lines = (self.results.get(step.id) or {}).get("report", "").splitlines()
             for n, line in enumerate(report_lines):
-                if line.startswith(STEP_NOTE_PREFIXES):
+                listed = BASELINE_WARNING.match(line)
+                if listed:
+                    # Steps have different checks, so their warnings differ in wording: list each check once.
+                    for command in listed.group(1).split(", "):
+                        failed_before.setdefault(command, []).append(step.id)
+                elif line.startswith(STEP_NOTE_PREFIXES):
                     # Notes whose example matters stay whole; others keep their first sentence and list items.
                     whole = line.startswith(("out_of_scope", "missing_files", "assertion_hint", "test_strength"))
                     first = line[:500] if whole else line.split(". ")[0][:300]
                     items = [ln.strip() for ln in report_lines[n + 1:n + 6] if ln.startswith("  - ")]
                     notes.setdefault(first + (" " + "; ".join(items) if items else ""), []).append(step.id)
+        if failed_before:
+            lines.append("baseline_warning: these checks already failed on the plan's starting code, before any "
+                         "step changed it: " + "; ".join(
+                             f"{c} (in {'every step' if len(st) == len(self.steps) else ', '.join(st)})"
+                             for c, st in failed_before.items())
+                         + ". Mistral was told not to work around them. If they pass in your checkout, the cause "
+                           "is the worktree environment (see deps_mode); if they fail there too, it may be your "
+                           "own uncommitted changes, which the steps start from.")
         if notes:
             # The same note from several steps (a baseline warning every step sees) is listed once.
             lines.append("step_notes (from the steps' own reports):\n" + "\n".join(

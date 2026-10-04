@@ -1015,6 +1015,11 @@ class WriteModeTest(DelegateTestBase):
         stats = self.run_delegate("--stats").stdout
         self.assertIn("most denied commands", stats)
         self.assertIn("bash: npx vitest run", stats)
+        self.assertIn(", run ", stats)  # which run it was last denied in
+        (self.repo / ".mistral-delegate.toml").write_text('allow_commands = ["bash: npx vitest"]\n')
+        stats = self.run_delegate("--stats").stdout
+        self.assertNotIn("most denied commands", stats)
+        self.assertIn("denied before, allowed now", stats)
 
     def test_scope_is_in_prompt_and_out_of_scope_changes_are_flagged_and_not_adopted(self):
         out = self.run_delegate("--mode", "write", "--scope", "test_*.py", "Add tests", FAKE_VIBE_TOUCH_APP="1")
@@ -1341,7 +1346,7 @@ class PlanRunTest(DelegateTestBase):
         return path
 
     def runs(self):
-        return {e["id"]: e for e in map(json.loads, (self.home / "ledger.jsonl").read_text().splitlines())
+        return {e["id"]: e for e in map(json.loads, filter(str.strip, (self.home / "ledger.jsonl").read_text().splitlines()))
                 if e.get("event") == "start"}
 
     def test_steps_run_after_what_they_need_and_merge(self):
@@ -1623,11 +1628,44 @@ class PlanRunTest(DelegateTestBase):
             """)
         out = self.run_delegate("--plan", str(plan))
         notes = out.stdout.split("step_notes")[1].split("\nverification")[0]
-        self.assertEqual(notes.count("baseline_warning"), 1)
-        self.assertIn("all steps: baseline_warning", notes)
+        # The steps' baseline warnings become one plan line, before the step notes.
+        self.assertNotIn("baseline_warning", notes)
+        self.assertEqual(out.stdout.count("baseline_warning"), 1)
+        self.assertIn("before any step changed it: false (in every step)", out.stdout)
         self.assertIn("a: assertion_hint", notes)
         self.assertIn("tests/test_loose.py: assert 1 in [1, 2]", notes)  # the example, not cut off at "e.g"
         self.assertIn("checks passed_except_preexisting first try", out.stdout)
+
+    def test_plan_checks_add_to_the_configured_and_step_checks(self):
+        (self.repo / ".mistral-delegate.toml").write_text('verify = ["test -f b.txt"]\n')
+        plan = self.plan("""\
+            # Together
+            verify: test -f a.txt
+            ## step: a
+            verify: test -f a.txt -a -f test_app.py
+            FAKE_FILE a.txt A
+            ## step: b
+            FAKE_FILE b.txt B
+            """)
+        out = self.run_delegate("--plan", str(plan))
+        merged = out.stdout.split("verification: ")[1].split("\nelapsed")[0]
+        for check in ("test -f a.txt", "test -f a.txt -a -f test_app.py", "test -f b.txt"):
+            self.assertIn(f"pass: {check}", merged)
+
+    def test_steps_without_a_closing_summary_are_flagged_at_the_top(self):
+        plan = self.plan("""\
+            # Quiet
+            ## step: a
+            verify: true
+            FAKE_FILE a.txt A
+            ## step: b
+            verify: true
+            FAKE_FILE b.txt B
+            """)
+        out = self.run_delegate("--plan", str(plan), FAKE_VIBE_UNFINISHED="1")
+        head = out.stdout.split("steps:")[0]
+        self.assertIn("review_first: a, b end without a closing summary and were merged on passing checks alone", head)
+        self.assertIn("--result ", head)
 
     def test_steps_wait_for_free_slots(self):
         (self.home).mkdir(parents=True, exist_ok=True)
@@ -2063,6 +2101,72 @@ def _alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+class AssertionHintTest(unittest.TestCase):
+    DIFF = """\
+diff --git a/tests/test_s.py b/tests/test_s.py
++++ b/tests/test_s.py
+@@ -1,3 +1,17 @@
+ import pytest
++
++def test_empty(svc):
++    svc.run()
++
++def test_none(svc):
++    assert svc.get("x") is None
++
++def test_good(svc):
++    assert svc.get("a") == {"a": 1}
++
++def test_raises(svc):
++    with pytest.raises(KeyError):
++        svc.pop("zz")
+ 
+ def test_old():
+     pass
+@@ -40,3 +54,4 @@ def test_x():
+     a = 1
++    b = 2
+     return a
+diff --git a/web/a.test.ts b/web/a.test.ts
++++ b/web/a.test.ts
+@@ -1,2 +1,8 @@
+ describe('a', () => {
++  it('renders', () => {
++    render(<A />);
++  });
++  it('finds nothing', async () => {
++    expect(await f()).toBeNull();
++  });
+ });
+diff --git a/src/app.py b/src/app.py
++++ b/src/app.py
+@@ -1,1 +1,3 @@
++def test_helper():
++    pass
+"""
+
+    def setUp(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import delegate
+        self.delegate = delegate
+
+    def test_finds_tests_added_whole(self):
+        names = [(path, name) for path, name, _body in self.delegate.new_tests(self.DIFF)]
+        self.assertEqual(names, [("tests/test_s.py", "test_empty"), ("tests/test_s.py", "test_none"),
+                                 ("tests/test_s.py", "test_good"), ("tests/test_s.py", "test_raises"),
+                                 ("web/a.test.ts", "renders"), ("web/a.test.ts", "finds nothing")])
+
+    def test_flags_tests_without_assertions_or_with_none_only(self):
+        from unittest import mock
+        with mock.patch.object(self.delegate.gitops, "changes_diff", return_value=self.DIFF):
+            hint = self.delegate.assertion_hint({})
+        self.assertIn("2 new test(s) assert nothing: tests/test_s.py: test_empty; web/a.test.ts: renders", hint)
+        self.assertIn("2 new test(s) only check for None or a false value", hint)
+        self.assertIn("tests/test_s.py: test_none; web/a.test.ts: finds nothing", hint)
+        self.assertNotIn("test_good", hint)
+        self.assertNotIn("test_raises", hint)
 
 
 class GitOpsTest(unittest.TestCase):
