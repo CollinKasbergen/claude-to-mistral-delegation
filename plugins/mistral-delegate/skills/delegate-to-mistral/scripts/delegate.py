@@ -90,6 +90,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--max-price", type=float, help="Dollar cap for Vibe's first pass.")
     run.add_argument("--max-tokens", type=int)
     run.add_argument("--max-tool-calls", type=int, help="Stop Mistral after this many tool calls (enforced by the wrapper).")
+    run.add_argument("--token-budget", type=int,
+                     help="Stop Mistral after this many effective tokens (enforced by the wrapper).")
     run.add_argument("--worktree-name", help="Worktree/branch name (default: the run id). An existing "
                                              "worktree with this name is reused, e.g. for follow-ups.")
     run.add_argument("--in-place", action="store_true", help="Write mode: edit the checkout directly.")
@@ -241,35 +243,53 @@ class Run:
         self.cancelled = False
         self.unfinished = ""
         self.limit_note = ""
-        self.spent = 0.0
-        self.priced_with_fallback = False
+        self.effective = 0
+        self.live_tool_calls = 0
+        self.guard_log: Path | None = None
+        self.currency = "$"
         self.session_id: str | None = args.resume
 
-    def call_vibe(self, cmd: list[str], cwd: str, *, cap: float, max_tool_calls: int,
-                  model_hint: str | None = None) -> None:
-        """Run one Vibe call, stopping it when it spends more than `cap` dollars or makes more
-        than `max_tool_calls` tool calls. Vibe can't enforce either when it doesn't know the
-        model's price, so the wrapper watches the session's usage while it runs."""
+    def call_vibe(self, cmd: list[str], cwd: str, *, token_budget: int, max_tool_calls: int,
+                  max_price: float | None = None, model_hint: str | None = None) -> None:
+        """Run one Vibe call and stop it when it goes over this call's caps: `token_budget` effective
+        tokens, `max_tool_calls` tool calls, and `max_price` if set. Vibe can't enforce these itself
+        (no price for some models, and its turn limit counts prompts), so the wrapper watches the
+        session's usage and the guard's log while Vibe runs."""
         watcher = vibe.SessionWatcher(cwd, time.time(), session_id=self.session_id, model_hint=model_hint)
         base = watcher.poll() if self.session_id else None  # a resumed session already has usage
+        guard_base = len(guard.read_log(self.guard_log)) if self.guard_log else 0
         out_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
         err_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
         proc = subprocess.Popen(cmd, cwd=cwd, stdout=out_file, stderr=err_file, stdin=subprocess.DEVNULL, text=True)
         started, stopped, snap = time.monotonic(), "", None
+
+        def measure():
+            use = vibe.usage(snap, base) if snap else None
+            effective = use["effective"] if use else 0
+            calls = max(snap["tool_calls"] - (base or {}).get("tool_calls", 0) if snap else 0,
+                        len(guard.read_log(self.guard_log)) - guard_base if self.guard_log else 0)
+            cost, fallback = vibe.snapshot_cost(snap, base, fallback=True) if snap else (0.0, False)
+            return use, effective, calls, cost, fallback
+
         while proc.poll() is None:
             time.sleep(WATCH_INTERVAL)
             snap = watcher.poll() or snap
-            cost, calls, fallback = vibe.spent(snap, base)
+            _use, effective, calls, cost, fallback = measure()
             if time.monotonic() - started > self.args.timeout:
                 stopped = "timeout"
-            elif cost > cap:
+            elif effective > token_budget:
                 stopped = "budget_exceeded"
-                self.limit_note = (f"stopped at ~${cost:.2f}, over this call's cap of ${cap:.2f}"
+                self.limit_note = (f"stopped Mistral at {effective:,} effective tokens, over this call's budget "
+                                   f"of {token_budget:,}")
+            elif max_price is not None and cost > max_price:
+                stopped = "budget_exceeded"
+                self.limit_note = (f"stopped Mistral at ~{self.currency}{cost:.2f}, over this call's max_price of "
+                                   f"{self.currency}{max_price:.2f}"
                                    + (" (priced at mistral-medium-3.5 rates: the model's price is unknown)"
                                       if fallback else ""))
             elif calls > max_tool_calls:
                 stopped = "tool_call_limit"
-                self.limit_note = f"stopped after {calls} tool calls, over the cap of {max_tool_calls}"
+                self.limit_note = f"stopped Mistral after {calls} tool calls, over the cap of {max_tool_calls}"
             if stopped:
                 proc.terminate()
                 try:
@@ -279,9 +299,9 @@ class Run:
                     proc.wait()
                 break
         snap = watcher.poll() or snap
-        cost, calls, fallback = vibe.spent(snap, base)
-        self.spent += cost
-        self.priced_with_fallback = self.priced_with_fallback or (fallback and bool(snap))
+        _use, effective, calls, cost, fallback = measure()
+        self.effective += effective
+        self.live_tool_calls += calls
         self.session_id = self.session_id or watcher.session_id
         out_file.seek(0)
         err_file.seek(0)
@@ -417,10 +437,11 @@ def run_task(args: argparse.Namespace) -> int:
     top = gitops.toplevel(workdir)
     settings = config.load(top or workdir)
     vibe.EXTRA_PRICES.update(settings["model_prices"])
+    vibe.WEIGHTS.update(settings["token_weights"])
     if args.policy:
         settings["policy"] = args.policy
     caps = config.caps(settings, args.mode)
-    for key in ("max_turns", "max_price", "max_tokens", "max_tool_calls"):
+    for key in ("max_turns", "max_price", "max_tokens", "max_tool_calls", "token_budget"):
         if getattr(args, key) is not None:
             caps[key] = getattr(args, key)
     model = args.model or settings["model"]
@@ -478,8 +499,11 @@ def run_task(args: argparse.Namespace) -> int:
                 if (r.get("worktree") or {}).get("path") == wt["path"]]
         continues = max(same, key=lambda r: r.get("started") or 0)["id"] if same else None
     settings["continues"] = continues
+    # A follow-up is listed under the task it continues, not under its resume message.
+    original = (ledger.load_runs().get(continues) or {}).get("task") if continues else None
+    label = f"{original.split(' [follow-up')[0]} [follow-up]" if original else task
     ledger.append({"event": "start", "id": run_id, "pid": os.getpid(), "mode": args.mode, "kind": kind,
-                   "repo": Path(top or workdir).name, "workdir": workdir, "task": task[:500],
+                   "repo": Path(top or workdir).name, "workdir": workdir, "task": label[:500],
                    "policy": settings["policy"], "model": model, "scope": scope, "continues": continues,
                    "worktree": {k: wt[k] for k in ("name", "path", "toplevel", "base", "links")} if wt else None})
 
@@ -551,16 +575,23 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     run = Run(args)
     stats_before = vibe.read_session_stats(args.resume, run_dir, model_hint=model) if args.resume else None
 
+    run.guard_log = None if guard_warning else guard_log
+    run.currency = settings["currency"]
+
     def vibe_call(text: str, share: float) -> None:
-        """One Vibe call with `share` of the caps. Vibe's own --max-price counts the whole session, so
-        on a resumed session it gets what was already spent on top; the wrapper enforces this call's share."""
-        session_cost = vibe.stats_cost(vibe.read_session_stats(run.session_id, run_dir, model_hint=model)) \
-            if run.session_id else 0.0
-        vibe_caps = dict(caps, max_price=(session_cost or 0.0) + caps["max_price"] * share)
+        """One Vibe call with `share` of the caps, enforced by the wrapper. If a money cap is set, Vibe gets
+        it too; its --max-price counts the whole session, so a resumed session gets what it already spent on top."""
+        vibe_caps = dict(caps)
+        if caps.get("max_price") is not None:
+            session_cost = vibe.stats_cost(vibe.read_session_stats(run.session_id, run_dir, model_hint=model)) \
+                if run.session_id else 0.0
+            vibe_caps["max_price"] = (session_cost or 0.0) + caps["max_price"] * share
         run.call_vibe(vibe.build_command(args.vibe_bin, text, mode=args.mode, agent=agent, caps=vibe_caps,
                                          allow_shell=args.allow_shell, trust=trust, resume=run.session_id,
                                          extra=settings["vibe_args"]), run_dir,
-                      cap=caps["max_price"] * share, max_tool_calls=max(1, int(caps["max_tool_calls"] * share)),
+                      token_budget=int(caps["token_budget"] * share),
+                      max_tool_calls=max(1, int(caps["max_tool_calls"] * share)),
+                      max_price=caps["max_price"] * share if caps.get("max_price") is not None else None,
                       model_hint=model)
 
     vibe_call(prompt, 1.0)
@@ -575,10 +606,21 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     changed_so_far = (gitops.changed_files(wt) if wt else [])
     commands += [c["cmd"] for c in verify if c not in planned and vibe.check_applies(c["paths"], [], changed_so_far)]
     skipped_checks = [c["cmd"] for c in verify if c["cmd"] not in commands]
+    autofixed: list[str] = []
     if commands and run.status in ("ok", "limit_reached", "budget_exceeded", "tool_call_limit"):
         results = run_checks(commands, run_dir, args.verify_timeout)
         failures = new_failures(results, baseline)
-        while failures and attempts < fix_attempts and run.status == "ok" and run.session_id:
+        if failures and settings["autofix"]:
+            # Formatting-type failures are fixed by a command, not by another Mistral round.
+            for command in settings["autofix"]:
+                code, _out = run_checks([command], run_dir, args.verify_timeout)[command]
+                autofixed.append(command + ("" if code == 0 else f" (exit {code})"))
+            results = run_checks(commands, run_dir, args.verify_timeout)
+            failures = new_failures(results, baseline)
+        # A run stopped at a cap still gets its fix round (by default): its first pass is spent,
+        # and the failures are often small.
+        while failures and attempts < fix_attempts and run.session_id and (
+                run.status == "ok" or (settings["fix_after_cap"] and run.status in ("budget_exceeded", "tool_call_limit"))):
             attempts += 1
             vibe_call(vibe.fix_prompt(failures, scope), 0.5)
             results = run_checks(commands, run_dir, args.verify_timeout)
@@ -646,16 +688,21 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     if ran_model and not model and not vibe.is_mistral_model(ran_model):
         lines.append(f"model_note: Vibe's server-side default routed this run to {ran_model!r}, not a Mistral model. "
                      "To use Mistral, set model = \"mistral-medium-3.5\" in .mistral-delegate.toml.")
-    lines.append(usage_line(use, caps["max_price"]))
-    lines.append(f"budget: ~${run.spent:.4f} spent across this run's Vibe calls; caps enforced by the wrapper: "
-                 f"${caps['max_price']:.2f} and {caps['max_tool_calls']} tool calls for the first pass, half of each "
-                 "for a continuation or fix round"
-                 + ("; spend priced at mistral-medium-3.5 rates because the model's price is unknown"
-                    if run.priced_with_fallback else ""))
-    turns = use["steps"] if use and use.get("steps") is not None else run.turns
-    lines.append(f"elapsed: {elapsed:.0f}s, turns: {turns} (max_turns {caps['max_turns']}), "
-                 f"tool calls: {run.tool_calls} (several per turn; not capped by max_turns)")
-    lines.append(guard_line(guard_events, run.tool_calls, guard_warning))
+    lines.append(usage_line(use, settings["currency"]))
+    lines.append(f"budget: {run.effective:,} effective tokens used across this run's Vibe calls; the wrapper caps the "
+                 f"first pass at {caps['token_budget']:,} effective tokens and {caps['max_tool_calls']} tool calls"
+                 + (f" and {settings['currency']}{caps['max_price']:.2f}" if caps.get("max_price") else "")
+                 + ", and a continuation or fix round at half of that")
+    month_line = credit_line(settings, use)
+    if month_line:
+        lines.append(month_line)
+    tool_calls = max(run.tool_calls, run.live_tool_calls, len(guard_events))
+    steps = use.get("steps") if use else None
+    lines.append(f"elapsed: {elapsed:.0f}s, tool calls: {tool_calls}"
+                 + (f", model steps: {steps} (max_turns {caps['max_turns']})" if steps is not None else ""))
+    if autofixed:
+        lines.append("autofix: ran " + ", ".join(autofixed) + " before deciding on a fix round")
+    lines.append(guard_line(guard_events, tool_calls, guard_warning))
     model_warning = vibe.unknown_model_warning(model) if not args.agent else None
     if model_warning:
         lines.append(f"model_warning: {model_warning}")
@@ -715,13 +762,19 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     lines.append("\n--- result from Mistral Vibe ---\n" + (truncate(run.final_text) if run.final_text else "(no final message)"))
 
     report = "\n".join(lines)
+    # What delegating cost Claude (writing the task and spec, reading this report) against what doing it
+    # itself would have taken (Mistral's work, scaled by claude_relative_effort). Recorded for --stats.
+    overhead = vibe.effective_tokens(len(report) // 4, 0, (len(task) + len(spec or "")) // 4)
+    equivalent = int((use["effective"] if use else run.effective) * settings["claude_relative_effort"])
     ledger.save_report(run_id, report)
     ledger.append({"event": "end", "id": run_id, "status": run.status, "verification": verification,
                    "fix_attempts_used": attempts, "cost": use["cost"] if use else None,
                    "model": ran_model, "tokens_in": use["tokens_in"] if use else None,
-                   "tokens_out": use["tokens_out"] if use else None,
+                   "tokens_out": use["tokens_out"] if use else None, "cached": use["cached"] if use else None,
+                   "effective": use["effective"] if use else run.effective,
+                   "claude_overhead": overhead, "claude_equivalent": equivalent,
                    "cost_estimated": use["estimated"] if use else None,
-                   "steps": turns, "tokens": use["tokens"] if use else None,
+                   "steps": steps, "tool_calls": tool_calls, "tokens": use["tokens"] if use else None,
                    "files_changed": len(files), "out_of_scope": out_of_scope,
                    "denied": sorted(set(run.denied) | {f"{e.get('tool')}: {e.get('target')}" for e in guard_events
                                                        if e.get("action") == "deny"}),
@@ -743,22 +796,37 @@ def guard_line(events: list[dict], tool_calls: int, warning: str | None) -> str:
             f"corrected {rewritten} path(s)")
 
 
-def usage_line(use: dict | None, max_price: float) -> str:
+def usage_line(use: dict | None, currency: str) -> str:
     if not use:
-        return (f"usage: cost unknown (no token data in Vibe's session storage; if this keeps happening, set "
-                f"vibe_args = [\"--legacy-harness\"] in the config for exact costs), first-pass cap ${max_price:.2f}")
+        return ("usage: unknown (no token data in Vibe's session storage; if this keeps happening, set "
+                "vibe_args = [\"--legacy-harness\"] in the config)")
+    fresh = use["tokens_in"] - use["cached"]
+    line = (f"usage: {use['effective']:,} effective tokens (input {fresh:,} fresh + {use['cached']:,} cached, "
+            f"output {use['tokens_out']:,})")
     if use["cost"] is None:
-        cost = (f"cost unknown (no price for model {use.get('model')!r}; add model_prices = "
-                f"{{ \"{use.get('model')}\" = [input, output] }} in $ per million tokens to the config, "
-                f"and earlier runs are priced too)")
-    elif use["estimated"]:
-        cost = f"cost ~${use['cost']:.4f} (estimated from tokens at {use.get('model')} list prices)"
+        line += (f"; cost unknown: no price for model {use.get('model')!r} (add model_prices = "
+                 f"{{ \"{use.get('model')}\" = [input, output, cached] }} per million tokens to price it, "
+                 "earlier runs included)")
     else:
-        cost = f"cost ${use['cost']:.4f}"
-    line = f"usage: {cost}, first-pass cap ${max_price:.2f}, {use['tokens']:,} tokens"
-    if use["session_total"] is not None:
-        line += f" (this run; session total ${use['session_total']:.4f})"
+        line += f"; ~{currency}{use['cost']:.4f} at {use.get('model')} list prices"
+        if use["session_total"] is not None:
+            line += f" (session total ~{currency}{use['session_total']:.4f})"
     return line
+
+
+def credit_line(settings: dict, use: dict | None) -> str | None:
+    """Month-to-date use of the subscription's Vibe credit, this run included (it is recorded after)."""
+    credit = settings.get("monthly_credit")
+    if not credit:
+        return None
+    spent, unpriced, since = ledger.month_spend(ledger.load_runs(), settings["credit_reset_day"], vibe.model_prices())
+    if use and use["cost"] is not None:
+        spent += use["cost"]
+    elif use:
+        unpriced += 1
+    c = settings["currency"]
+    return (f"credit: ~{c}{spent:.2f} of {c}{credit:.2f} used since {since} ({spent / credit:.0%})"
+            + (f"; {unpriced} run(s) without a price aren't included" if unpriced else ""))
 
 
 def worktree_section(wt: dict, run_id: str, files: list[str], out_of_scope: list[str], diff_lines: int) -> list[str]:
@@ -801,7 +869,11 @@ def main(argv: list[str]) -> int:
         if args.stats:
             settings = config.load(gitops.toplevel(str(Path(args.workdir).resolve())) or args.workdir)
             vibe.EXTRA_PRICES.update(settings["model_prices"])
-            print(ledger.format_stats(ledger.load_runs(), prices=vibe.model_prices()))
+            print(ledger.format_stats(ledger.load_runs(), prices=vibe.model_prices(), currency=settings["currency"],
+                                      min_savings=settings["min_savings"]))
+            line = credit_line(settings, None)
+            if line:
+                print(line)
             return 0
         if args.result:
             report = ledger.read_report(args.result)

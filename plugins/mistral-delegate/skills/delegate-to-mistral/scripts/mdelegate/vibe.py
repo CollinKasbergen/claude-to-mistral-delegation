@@ -43,10 +43,17 @@ DEFAULT_BASH_ALLOWLIST = [
     "uname", "uniq", "wc", "which",
 ]
 
-# Model aliases Vibe ships with, and their prices in $ per million tokens (input, output).
-# Users add models under [[models]] in $VIBE_HOME/config.toml, with input_price/output_price.
-BUILTIN_MODELS = {"mistral-medium-3.5": (1.5, 7.5), "local": (0.0, 0.0)}
+# Model aliases Vibe ships with, and their prices per million tokens: (input, output, cached input).
+# Users add models under [[models]] in $VIBE_HOME/config.toml (input_price, output_price, cached_input_price).
+BUILTIN_MODELS = {"mistral-medium-3.5": (1.5, 7.5, 0.15), "local": (0.0, 0.0, 0.0)}
 DEFAULT_MODEL_ALIAS = "mistral-medium-3.5"
+# Cached input is billed at a fraction of the input price; used when a model's cached price is unknown.
+DEFAULT_CACHED_FRACTION = 0.1
+
+# Effective tokens: one number for "how much work did Mistral do", independent of prices.
+# Fresh input counts in full, cached input at a tenth, output five times (Mistral Medium's price ratios).
+DEFAULT_WEIGHTS = {"input": 1.0, "cached": 0.1, "output": 5.0}
+WEIGHTS: dict[str, float] = dict(DEFAULT_WEIGHTS)
 
 MAX_SPEC_CHARS = 20_000
 
@@ -66,29 +73,35 @@ def vibe_config() -> dict:
         return {}
 
 
-# Prices the user gave in the plugin config (model_prices), keyed by alias: (input, output) $/M tokens.
-EXTRA_PRICES: dict[str, tuple[float, float]] = {}
+# Prices from the plugin config (model_prices), keyed by alias: (input, output, cached or None) per M tokens.
+EXTRA_PRICES: dict[str, tuple] = {}
 
 MISTRAL_MODEL_PREFIXES = ("mistral", "devstral", "codestral", "magistral", "ministral", "pixtral", "leanstral", "local")
 
 
-def model_prices(config: dict | None = None) -> dict[str, tuple[float, float]]:
+def _price_triple(data: dict) -> tuple | None:
+    try:
+        cached = data.get("cached_input_price")
+        return (float(data.get("input_price", 0.0)), float(data.get("output_price", 0.0)),
+                None if cached is None else float(cached))
+    except (TypeError, ValueError):
+        return None
+
+
+def model_prices(config: dict | None = None) -> dict[str, tuple]:
     prices = dict(BUILTIN_MODELS)
     for m in (config if config is not None else vibe_config()).get("models", []):
-        if isinstance(m, dict) and m.get("alias"):
-            prices[m["alias"]] = (float(m.get("input_price", 0.0)), float(m.get("output_price", 0.0)))
+        if isinstance(m, dict) and m.get("alias") and (triple := _price_triple(m)):
+            prices[m["alias"]] = triple
     prices.update(EXTRA_PRICES)
     return prices
 
 
-def _find_model_price(data, alias: str) -> tuple[float, float] | None:
+def _find_model_price(data, alias: str) -> tuple | None:
     """Search a JSON structure (e.g. a session's experiments) for a model definition with prices."""
     if isinstance(data, dict):
         if data.get("alias") == alias and "input_price" in data and "output_price" in data:
-            try:
-                return float(data["input_price"]), float(data["output_price"])
-            except (TypeError, ValueError):
-                return None
+            return _price_triple(data)
         values = data.values()
     elif isinstance(data, list):
         values = data
@@ -104,6 +117,18 @@ def _find_model_price(data, alias: str) -> tuple[float, float] | None:
         if found:
             return found
     return None
+
+
+def price_cost(tokens_in: int, cached: int, tokens_out: int, price: tuple) -> float:
+    """Cost of a usage at a (input, output, cached-or-None) price; cached input at its own rate."""
+    cached = min(max(cached, 0), max(tokens_in, 0))
+    cached_price = price[2] if len(price) > 2 and price[2] is not None else price[0] * DEFAULT_CACHED_FRACTION
+    return ((tokens_in - cached) * price[0] + cached * cached_price + tokens_out * price[1]) / 1_000_000
+
+
+def effective_tokens(tokens_in: int, cached: int, tokens_out: int) -> int:
+    cached = min(max(cached, 0), max(tokens_in, 0))
+    return int((tokens_in - cached) * WEIGHTS["input"] + cached * WEIGHTS["cached"] + tokens_out * WEIGHTS["output"])
 
 
 def is_mistral_model(alias: str | None) -> bool:
@@ -224,8 +249,9 @@ def build_command(vibe_bin: str, prompt: str, *, mode: str, agent: str | None, c
         "--prompt", prompt,
         "--output", "json",
         "--max-turns", str(caps["max_turns"]),
-        "--max-price", f"{caps['max_price']:.4f}",
     ]
+    if caps.get("max_price") is not None:
+        cmd += ["--max-price", f"{caps['max_price']:.4f}"]
     if caps.get("max_tokens"):
         cmd += ["--max-tokens", str(caps["max_tokens"])]
     cmd += ["--agent", agent or ("plan" if mode == "read" else "accept-edits")]
@@ -404,51 +430,71 @@ def _same_dir(a: str | None, b: str) -> bool:
     return not a or Path(a).resolve() == Path(b).resolve()
 
 
-def _legacy_stats(root: Path, session_id: str | None, cwd: str, since: float | None) -> dict | None:
-    if session_id:
-        metas = list(root.glob(f"*_{session_id[:8]}/meta.json"))
-    else:
-        dirs = sorted((d for d in root.iterdir() if d.is_dir() and d.name != "unified"),
-                      key=lambda d: d.stat().st_mtime)[-50:]
-        metas = [d / "meta.json" for d in dirs]
-    for meta_path in sorted(metas, key=lambda m: m.stat().st_mtime if m.exists() else 0, reverse=True):
-        try:
-            if since is not None and meta_path.stat().st_mtime < since - 1:
-                continue
-            meta = json.loads(meta_path.read_text())
-        except (OSError, ValueError):
-            continue
-        if session_id and meta.get("session_id") != session_id:
-            continue
-        if not session_id and not _same_dir((meta.get("environment") or {}).get("working_directory"), cwd):
-            continue
-        stats = meta.get("stats")
-        if isinstance(stats, dict):
-            model = (meta.get("config") or {}).get("active_model") if isinstance(meta.get("config"), dict) else None
-            return {"session_id": meta.get("session_id"), "model": model or None, **stats}
-    return None
+class JournalReader:
+    """Reads a Unified Harness session journal incrementally.
 
+    Tracks the session's cumulative token usage (session.tokenUsage), cached input
+    tokens (tokenUsage.cachedInputTokens when the harness reports it, otherwise the
+    sum of cached_input_tokens over the completions it recorded) and tool calls.
+    """
 
-def _unified_token_usage(session_dir: Path) -> dict | None:
-    """The latest session.tokenUsage recorded in a Unified Harness session's journal."""
-    usage = None
-    for journal in sorted((session_dir / "journal").glob("*.jsonl")):
-        try:
-            lines = journal.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            continue
-        for line in lines:
-            if '"tokenUsage"' not in line:
-                continue
+    def __init__(self, session_dir: Path):
+        self.dir = session_dir
+        self._offsets: dict[Path, int] = {}
+        self._partial: dict[Path, str] = {}
+        self.usage: dict | None = None
+        self.completion_cached = 0
+        self.effects: set[str] = set()
+
+    def read(self) -> None:
+        for journal in sorted((self.dir / "journal").glob("*.jsonl")):
             try:
-                record = json.loads(line)
-            except ValueError:
+                with journal.open("r", encoding="utf-8", errors="replace") as f:
+                    f.seek(self._offsets.get(journal, 0))
+                    chunk = f.read()
+                    self._offsets[journal] = f.tell()
+            except OSError:
                 continue
-            for delta in (record.get("payload") or {}).get("delta") or []:
-                session = ((delta or {}).get("state") or {}).get("session") or {}
-                if isinstance(session.get("tokenUsage"), dict):
-                    usage = session["tokenUsage"]
-    return usage
+            lines = (self._partial.pop(journal, "") + chunk).split("\n")
+            self._partial[journal] = lines.pop()  # an incomplete last line waits for the next read
+            for line in lines:
+                if '"tokenUsage"' not in line and '"effect"' not in line and "cached_input_tokens" not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                payload = record.get("payload") or {}
+                for delta in payload.get("delta") or []:
+                    if not isinstance(delta, dict):
+                        continue
+                    session = (delta.get("state") or {}).get("session") or {}
+                    if isinstance(session.get("tokenUsage"), dict):
+                        self.usage = session["tokenUsage"]
+                    entry = delta.get("entry") or {}
+                    if entry.get("type") == "effect" and entry.get("id"):
+                        self.effects.add(entry["id"])
+                if record.get("type") != "projection_delta" and "cached_input_tokens" in line:
+                    self.completion_cached += _sum_key(payload, "cached_input_tokens")
+
+    def tokens(self) -> tuple[int, int, int]:
+        """(input incl. cached, cached, output)."""
+        usage = self.usage or {}
+        tokens_in = int(usage.get("inputTokens") or usage.get("input_tokens") or 0)
+        cached = usage.get("cachedInputTokens", usage.get("cached_input_tokens"))
+        cached = int(cached) if cached is not None else self.completion_cached
+        return tokens_in, min(cached, tokens_in), int(usage.get("outputTokens") or usage.get("output_tokens") or 0)
+
+
+def _sum_key(data, key: str, depth: int = 0) -> int:
+    if depth > 12:
+        return 0
+    if isinstance(data, dict):
+        total = int(data[key]) if isinstance(data.get(key), (int, float)) else 0
+        return total + sum(_sum_key(v, key, depth + 1) for k, v in data.items() if k != key)
+    if isinstance(data, list):
+        return sum(_sum_key(v, key, depth + 1) for v in data)
+    return 0
 
 
 def _unified_model(session_dir: Path) -> str | None:
@@ -461,52 +507,64 @@ def _unified_model(session_dir: Path) -> str | None:
     return None
 
 
-def _unified_stats(root: Path, session_id: str | None, cwd: str, since: float | None,
-                   model_hint: str | None, config: dict) -> dict | None:
-    base = root / "unified"
-    if not base.is_dir():
+def _legacy_snapshot(meta: dict, model_hint: str | None, config: dict) -> dict | None:
+    stats = meta.get("stats")
+    if not isinstance(stats, dict):
         return None
+    model = ((meta.get("config") or {}).get("active_model") if isinstance(meta.get("config"), dict) else None) \
+        or model_hint or DEFAULT_MODEL_ALIAS
+    price = None
+    if stats.get("input_price_per_million") or stats.get("output_price_per_million"):
+        price = (float(stats.get("input_price_per_million") or 0), float(stats.get("output_price_per_million") or 0),
+                 None if stats.get("cached_input_price_per_million") is None
+                 else float(stats["cached_input_price_per_million"]))
+    price = model_prices(config).get(model) or price
+    return {
+        "session_id": meta.get("session_id"),
+        "model": model,
+        "tokens_in": int(stats.get("session_prompt_tokens") or 0),
+        "cached": int(stats.get("session_cached_tokens") or 0),
+        "tokens_out": int(stats.get("session_completion_tokens") or 0),
+        "steps": stats.get("steps"),
+        "tool_calls": sum(int(stats.get(k) or 0) for k in ("tool_calls_succeeded", "tool_calls_failed",
+                                                            "tool_calls_rejected", "tool_calls_hook_denied")),
+        "price": price,
+    }
+
+
+def _unified_snapshot(session_dir: Path, meta: dict, reader: "JournalReader", model_hint: str | None,
+                      config: dict) -> dict:
+    model = _unified_model(session_dir) or model_hint or DEFAULT_MODEL_ALIAS
+    # Prices: Vibe's config and the plugin's model_prices, then the model definition a
+    # server-side experiment supplied for this session (saved in its meta.json).
+    price = model_prices(config).get(model) or _find_model_price([meta.get("experiments"), meta.get("config")], model)
+    tokens_in, cached, tokens_out = reader.tokens()
+    return {"session_id": meta.get("session_id") or session_dir.name, "model": model, "tokens_in": tokens_in,
+            "cached": cached, "tokens_out": tokens_out, "steps": None, "tool_calls": len(reader.effects),
+            "price": price}
+
+
+def _candidates(root: Path, session_id: str | None, since: float | None) -> list[tuple[Path, str]]:
+    unified = root / "unified"
     if session_id:
-        candidates = [base / session_id]
-    else:
-        candidates = sorted((d for d in base.iterdir() if d.is_dir()), key=lambda d: d.stat().st_mtime,
-                            reverse=True)[:50]
-    for session_dir in candidates:
-        try:
-            if since is not None and session_dir.stat().st_mtime < since - 1:
+        found = [(unified / session_id, "unified")] if (unified / session_id).is_dir() else []
+        return found + [(m.parent, "legacy") for m in root.glob(f"*_{session_id[:8]}/meta.json")]
+    out = []
+    for base, kind in ((unified, "unified"), (root, "legacy")):
+        if not base.is_dir():
+            continue
+        for d in base.iterdir():
+            try:
+                if d.is_dir() and d.name != "unified" and (since is None or d.stat().st_mtime >= since - 1):
+                    out.append((d.stat().st_mtime, d, kind))
+            except OSError:
                 continue
-            meta = json.loads((session_dir / "meta.json").read_text())
-        except (OSError, ValueError):
-            continue
-        if not session_id and not _same_dir((meta.get("environment") or {}).get("working_directory"), cwd):
-            continue
-        usage = _unified_token_usage(session_dir)
-        if usage is None:
-            continue
-        model = _unified_model(session_dir) or model_hint or DEFAULT_MODEL_ALIAS
-        # Prices: Vibe's config and the plugin's model_prices, then the model definition a
-        # server-side experiment supplied for this session (saved in its meta.json).
-        price = model_prices(config).get(model) or _find_model_price(
-            [meta.get("experiments"), meta.get("config")], model)
-        stats = {
-            "session_id": meta.get("session_id") or session_dir.name,
-            "session_prompt_tokens": int(usage.get("inputTokens") or 0),
-            "session_completion_tokens": int(usage.get("outputTokens") or 0),
-            "steps": None,
-            "model": model,
-            "estimated": True,
-        }
-        if price:
-            stats["input_price_per_million"], stats["output_price_per_million"] = price
-        else:
-            stats["price_unknown"] = True
-        return stats
-    return None
+    return [(d, kind) for _m, d, kind in sorted(out, reverse=True)[:50]]
 
 
 def read_session_stats(session_id: str | None, cwd: str, since: float | None = None,
                        model_hint: str | None = None) -> dict | None:
-    """Find a session's stats in Vibe's session storage (legacy or Unified Harness layout).
+    """A session's cumulative usage from Vibe's session storage (legacy or Unified Harness layout).
 
     With a session id, match it exactly. Without one (e.g. when a limit stopped the
     run and nothing was printed), take the newest session written since `since`
@@ -516,45 +574,71 @@ def read_session_stats(session_id: str | None, cwd: str, since: float | None = N
     root = session_root(config)
     if not root.is_dir():
         return None
-    return (_legacy_stats(root, session_id, cwd, since)
-            or _unified_stats(root, session_id, cwd, since, model_hint, config))
+    for session_dir, kind in _candidates(root, session_id, since):
+        try:
+            meta = json.loads((session_dir / "meta.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if session_id and meta.get("session_id") not in (session_id, None):
+            continue
+        if not session_id and not _same_dir((meta.get("environment") or {}).get("working_directory"), cwd):
+            continue
+        if kind == "legacy":
+            snap = _legacy_snapshot(meta, model_hint, config)
+        else:
+            reader = JournalReader(session_dir)
+            reader.read()
+            if reader.usage is None:
+                continue
+            snap = _unified_snapshot(session_dir, meta, reader, model_hint, config)
+        if snap:
+            return snap
+    return None
+
+
+def snapshot_cost(snap: dict | None, base: dict | None = None, *, fallback: bool = False) -> tuple[float | None, bool]:
+    """(cost of snap minus base, priced_with_fallback). Unknown price -> None, or Mistral Medium's if fallback."""
+    if not snap:
+        return 0.0, False
+    if snap.get("model") == "local":
+        return 0.0, False
+    base = base or {}
+    price, used_fallback = snap.get("price"), False
+    if not price or not any(price[:2]):
+        if not fallback:
+            return None, False
+        price, used_fallback = BUILTIN_MODELS[DEFAULT_MODEL_ALIAS], True
+    d_in = snap["tokens_in"] - base.get("tokens_in", 0)
+    d_cached = snap["cached"] - base.get("cached", 0)
+    d_out = snap["tokens_out"] - base.get("tokens_out", 0)
+    return price_cost(d_in, d_cached, d_out, price), used_fallback
 
 
 def stats_cost(stats: dict | None) -> float | None:
-    if not stats:
-        return 0.0
-    if stats.get("price_unknown"):
-        return None
-    if "session_cost" in stats:
-        return float(stats["session_cost"])
-    prompt = stats.get("session_prompt_tokens", 0)
-    cached = min(stats.get("session_cached_tokens", 0), prompt)
-    in_price = stats.get("input_price_per_million", 0.0)
-    cached_price = stats.get("cached_input_price_per_million")
-    cached_price = in_price if cached_price is None else cached_price
-    out = stats.get("session_completion_tokens", 0) * stats.get("output_price_per_million", 0.0)
-    return ((prompt - cached) * in_price + cached * cached_price + out) / 1_000_000
+    return snapshot_cost(stats)[0]
 
 
 def usage(after: dict | None, before: dict | None) -> dict | None:
-    """This run's cost, steps and tokens (after minus before, for resumed sessions)."""
+    """This run's usage (after minus before, for resumed sessions)."""
     if not after:
         return None
     before = before or {}
-    cost_after, cost_before = stats_cost(after), stats_cost(before) if before else 0.0
+    d_in = after["tokens_in"] - before.get("tokens_in", 0)
+    d_cached = after["cached"] - before.get("cached", 0)
+    d_out = after["tokens_out"] - before.get("tokens_out", 0)
+    cost, _ = snapshot_cost(after, before)
     steps = after.get("steps")
     if steps is not None and before.get("steps") is not None:
         steps -= before["steps"]
     return {
-        "cost": None if cost_after is None or cost_before is None else cost_after - cost_before,
-        "estimated": bool(after.get("estimated")),
+        "cost": cost,
+        "estimated": True,
         "model": after.get("model"),
-        "tokens_in": after.get("session_prompt_tokens", 0) - before.get("session_prompt_tokens", 0),
-        "tokens_out": after.get("session_completion_tokens", 0) - before.get("session_completion_tokens", 0),
+        "tokens_in": d_in, "cached": d_cached, "tokens_out": d_out,
+        "tokens": d_in + d_out,
+        "effective": effective_tokens(d_in, d_cached, d_out),
         "steps": steps,
-        "tokens": (after.get("session_prompt_tokens", 0) + after.get("session_completion_tokens", 0)
-                   - before.get("session_prompt_tokens", 0) - before.get("session_completion_tokens", 0)),
-        "session_total": cost_after if before else None,
+        "session_total": snapshot_cost(after)[0] if before else None,
     }
 
 
@@ -588,7 +672,7 @@ def check_applies(check_paths: list[str], scope: list[str], files: list[str]) ->
 # --- live budget tracking -------------------------------------------------------------
 
 class SessionWatcher:
-    """Reads a running Vibe session's token usage and tool calls, incrementally.
+    """Follows a running Vibe session's usage, incrementally.
 
     Vibe enforces --max-price only with a known model price, and its turn limit
     counts prompts rather than tool calls, so the wrapper watches the session
@@ -601,128 +685,36 @@ class SessionWatcher:
         self.root = session_root(self.config)
         self.dir: Path | None = None
         self.kind = ""
-        self._offsets: dict[Path, int] = {}
-        self._partial: dict[Path, str] = {}
-        self._usage: dict | None = None
-        self._effects: set[str] = set()
-        self._meta: dict = {}
+        self.meta: dict = {}
+        self.reader: JournalReader | None = None
 
     def _locate(self) -> bool:
         if self.dir is not None:
             return True
         if not self.root.is_dir():
             return False
-        unified = self.root / "unified"
-        if self.session_id:
-            if (unified / self.session_id).is_dir():
-                self.dir, self.kind = unified / self.session_id, "unified"
-                return True
-            for meta in self.root.glob(f"*_{self.session_id[:8]}/meta.json"):
-                self.dir, self.kind = meta.parent, "legacy"
-                return True
-            return False
-        candidates = []
-        for base, kind in ((unified, "unified"), (self.root, "legacy")):
-            if not base.is_dir():
-                continue
-            for d in base.iterdir():
-                try:
-                    if d.is_dir() and d.name != "unified" and d.stat().st_mtime >= self.since - 1:
-                        candidates.append((d.stat().st_mtime, d, kind))
-                except OSError:
-                    continue
-        for _mtime, d, kind in sorted(candidates, reverse=True):
+        for d, kind in _candidates(self.root, self.session_id, None if self.session_id else self.since):
             try:
                 meta = json.loads((d / "meta.json").read_text())
             except (OSError, ValueError):
                 continue
-            if _same_dir((meta.get("environment") or {}).get("working_directory"), self.cwd):
-                self.dir, self.kind, self._meta = d, kind, meta
-                self.session_id = meta.get("session_id") or d.name
-                return True
+            if not self.session_id and not _same_dir((meta.get("environment") or {}).get("working_directory"), self.cwd):
+                continue
+            self.dir, self.kind, self.meta = d, kind, meta
+            self.session_id = meta.get("session_id") or d.name
+            self.reader = JournalReader(d) if kind == "unified" else None
+            return True
         return False
 
-    def _read_journal(self) -> None:
-        for journal in sorted((self.dir / "journal").glob("*.jsonl")):
-            try:
-                with journal.open("r", encoding="utf-8", errors="replace") as f:
-                    f.seek(self._offsets.get(journal, 0))
-                    chunk = f.read()
-                    self._offsets[journal] = f.tell()
-            except OSError:
-                continue
-            lines = (self._partial.pop(journal, "") + chunk).split("\n")
-            self._partial[journal] = lines.pop()  # an incomplete last line waits for the next poll
-            for line in lines:
-                if '"tokenUsage"' not in line and '"effect"' not in line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue
-                for delta in (record.get("payload") or {}).get("delta") or []:
-                    if not isinstance(delta, dict):
-                        continue
-                    session = (delta.get("state") or {}).get("session") or {}
-                    if isinstance(session.get("tokenUsage"), dict):
-                        self._usage = session["tokenUsage"]
-                    entry = delta.get("entry") or {}
-                    if entry.get("type") == "effect" and entry.get("id"):
-                        self._effects.add(entry["id"])
-
     def poll(self) -> dict | None:
-        """{tokens_in, tokens_out, tool_calls, model, cost (exact or None), price (tuple or None)}, or None."""
+        """The session's cumulative usage so far, or None before it shows up."""
         if not self._locate():
             return None
         if self.kind == "unified":
-            self._read_journal()
-            if not self._meta:
-                try:
-                    self._meta = json.loads((self.dir / "meta.json").read_text())
-                except (OSError, ValueError):
-                    self._meta = {}
-            model = _unified_model(self.dir) or self.model_hint or DEFAULT_MODEL_ALIAS
-            usage = self._usage or {}
-            price = model_prices(self.config).get(model) or _find_model_price(
-                [self._meta.get("experiments"), self._meta.get("config")], model)
-            return {"tokens_in": int(usage.get("inputTokens") or 0), "tokens_out": int(usage.get("outputTokens") or 0),
-                    "tool_calls": len(self._effects), "model": model, "cost": None, "price": price}
+            self.reader.read()
+            return _unified_snapshot(self.dir, self.meta, self.reader, self.model_hint, self.config)
         try:
             meta = json.loads((self.dir / "meta.json").read_text())
         except (OSError, ValueError):
             return None
-        stats = meta.get("stats") or {}
-        model = ((meta.get("config") or {}).get("active_model") if isinstance(meta.get("config"), dict) else None) \
-            or self.model_hint or DEFAULT_MODEL_ALIAS
-        tool_calls = sum(int(stats.get(k) or 0) for k in ("tool_calls_succeeded", "tool_calls_failed",
-                                                           "tool_calls_rejected", "tool_calls_hook_denied"))
-        price = None
-        if stats.get("input_price_per_million") or stats.get("output_price_per_million"):
-            price = (float(stats.get("input_price_per_million") or 0), float(stats.get("output_price_per_million") or 0))
-        price = price or model_prices(self.config).get(model)
-        cost = float(stats["session_cost"]) if stats.get("session_cost") else None
-        return {"tokens_in": int(stats.get("session_prompt_tokens") or 0),
-                "tokens_out": int(stats.get("session_completion_tokens") or 0),
-                "tool_calls": tool_calls, "model": model, "cost": cost, "price": price}
-
-
-def spent(snap: dict | None, base: dict | None) -> tuple[float, int, bool]:
-    """(cost, tool calls, priced_with_fallback) between two watcher snapshots.
-
-    Without a known price, tokens are priced at Mistral Medium's list price so the
-    cap still means something.
-    """
-    if not snap:
-        return 0.0, 0, False
-    if snap.get("model") == "local":
-        return 0.0, snap["tool_calls"] - (base or {}).get("tool_calls", 0), False
-    base = base or {"tokens_in": 0, "tokens_out": 0, "tool_calls": 0, "cost": None}
-    calls = snap["tool_calls"] - base.get("tool_calls", 0)
-    if snap.get("cost") is not None and snap.get("price") and any(snap["price"]):
-        return snap["cost"] - (base.get("cost") or 0.0), calls, False
-    price, fallback = snap.get("price"), False
-    if not price or not any(price):
-        price, fallback = BUILTIN_MODELS[DEFAULT_MODEL_ALIAS], True
-    tin = snap["tokens_in"] - base.get("tokens_in", 0)
-    tout = snap["tokens_out"] - base.get("tokens_out", 0)
-    return (tin * price[0] + tout * price[1]) / 1_000_000, calls, fallback
+        return _legacy_snapshot(meta, self.model_hint, self.config)

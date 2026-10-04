@@ -67,19 +67,35 @@ model = "mistral-medium-3.5"
 
 # Prices ($ per million tokens: input, output) for models Vibe has no price for,
 # so their runs get a cost. Earlier runs are priced from their tokens too.
-# model_prices = { "glm-5-3" = [1.0, 4.0] }
+# model_prices = { "glm-5-3" = [1.0, 4.0, 0.1] }   # input, output, cached
 
-# Caps per run. Leave these out to use the policy's defaults
-# (balanced: write $1.00 / 80 tool calls, read $0.25 / 40 tool calls).
-# A continuation or fix round gets half of each cap.
-# max_price and max_tool_calls are enforced by the plugin while Mistral works
-# (Vibe can't enforce a price cap for a model whose price it doesn't know).
+# Your Mistral Vibe credit per month (e.g. what your subscription includes).
+# Reports and the session-start reminder show how much of it is used, so
+# Claude delegates freely early in the month and selectively near the end.
+# monthly_credit = 225
+# currency = "€"
+# credit_reset_day = 1
+
+# Commands that fix formatting-type check failures. They run before a
+# Mistral fix round, so a formatting failure costs no extra Mistral round.
+# autofix = ["ruff format .", "npx prettier --write ."]
+
+# Once enough runs are adopted or discarded, flag kinds of task where
+# delegating saved Claude less than this many times what it cost Claude
+# (writing the spec, reading the report). Claude then keeps those itself.
+# min_savings = 2
+
+# Caps per run in effective tokens: fresh input counts in full, cached input
+# at a tenth, output five times (adjust with token_weights). The plugin
+# enforces token_budget and max_tool_calls while Mistral works.
+# 1M effective tokens is about $1.50 at Mistral Medium's prices.
 [write]
-max_price = 1.00
+token_budget = 1000000
 max_tool_calls = 80
 max_turns = 30
+# max_price = 2.00   # optional money cap on top
 
 [read]
-max_price = 0.25
+token_budget = 300000
 max_tool_calls = 40
 max_turns = 15
