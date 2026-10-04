@@ -149,7 +149,8 @@ def compute_stats(runs: dict[str, dict], days: int = 90) -> dict:
             s["partial"] += 1
         elif r.get("outcome") == "discarded":
             s["discarded"] += 1
-        if isinstance(r.get("cost"), (int, float)):
+        # Runs without cost data (cost missing, or $0 with no tokens recorded) stay out of the averages.
+        if isinstance(r.get("cost"), (int, float)) and (r["cost"] > 0 or r.get("tokens")):
             s["cost"] += r["cost"]
             s["costed"] += 1
     return dict(by_kind)
@@ -189,7 +190,9 @@ def format_stats(runs: dict[str, dict], days: int = 90) -> str:
                      f"{_avg_cost(s):<9} ${s['cost']:.2f}")
         total_runs += s["runs"]
         total_cost += s["cost"]
-    lines.append(f"total: {total_runs} runs, ${total_cost:.2f} (runs with unknown cost not included)")
+    uncosted = sum(s["runs"] - s["costed"] for s in stats.values())
+    lines.append(f"total: {total_runs} runs, ${total_cost:.2f}"
+                 + (f" ({uncosted} run(s) without cost data are left out of costs and averages)" if uncosted else ""))
     denied = top_denied(runs, days)
     if denied:
         lines.append("most denied commands (add to allow_commands if Mistral needs them):")

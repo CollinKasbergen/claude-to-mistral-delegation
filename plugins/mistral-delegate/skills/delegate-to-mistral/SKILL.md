@@ -45,7 +45,8 @@ python3 <wrapper> --mode write --kind feature \
 - `--allow-command CMD` (repeatable): command prefixes Mistral may run itself while working, e.g. the test command, so it can iterate. Each part of a chained command must match. Anything else stays refused. `--allow-shell` allows every command; use it only with the user's OK.
 - **Guard hook.** During a run, a Vibe hook checks every tool call before Vibe would ask for approval:
   - Disallowed commands, paths outside the project, writes outside `--scope`, secrets and network tools are refused with an error message Mistral sees, so it can try another way. Without the hook, Vibe treats a refused approval as the user cancelling and ends the session.
-  - A path written like `/src/app.ts` is corrected to the project.
+  - A path that points to the right file under the wrong base (`/src/app.ts`, or a worktree path missing its run folder) is corrected to the project, in file tools and in shell commands.
+  - Print-only `sed -n` is allowed alongside Vibe's read-only commands, though `read_file` and `grep` are better.
   - The report's `guard:` line shows what it checked, and `refused_by_guard` lists the refusals.
 - `--model ALIAS`: a Vibe model alias from the user's Vibe config, for this run.
 - Caps come from the policy (`--show-config` shows them). Override with `--max-turns`, `--max-price` or `--max-tokens` and tell the user when you raise them. Fix rounds add half the price cap each.
@@ -61,7 +62,11 @@ Split a change into independent steps that touch different files, and start each
 
 ```toml
 policy = "balanced"                         # conservative | balanced | aggressive
-verify = ["npm test", "npx tsc --noEmit"]   # checks after every write run
+verify = [                                   # checks after every write run
+  "npm run lint",                                          # always
+  { cmd = "npx vitest run", paths = ["frontend/"] },        # only when the scope or changes touch frontend/
+  { cmd = "pytest -q", paths = ["backend/"] },
+]
 allow_commands = ["npm test", "npx vitest"] # commands Mistral may run itself
 fix_attempts = 1
 max_parallel = 3
@@ -87,12 +92,16 @@ Requirements / cases: <bulleted, exhaustive list>.
 Out of scope: <what not to touch>.
 ```
 
+**For tests, spell out the harness setup.** Name the existing test file to copy, how to mount or render the unit, which modules to stub and how (e.g. a parent layout, the clipboard, timers), and how to read the result (DOM queries, toasts, emitted events). Specs with this setup succeed first time; specs without it send Mistral guessing and often end empty.
+
 The wrapper adds the rules itself: which commands may run, which checks must pass, no package installs, no weakened tests, and a final summary. Mistral covers what you list and seldom more, so the cases list matters most.
 
 ## After the run
 
 The report starts with `run_id`, `status` and `verification`, then `usage` (cost, steps, tokens), the change list, and the full diff when it is short.
 
+- **final_message_warning.** Mistral's last step was a tool call, or its summary stops mid-sentence: the run was likely cut short. Treat the result as unfinished even if checks pass, and resume or redo it.
+- **checks_skipped / flaky_checks.** Configured checks limited to paths this run doesn't touch are skipped. A check that failed and then passed on an immediate rerun before Mistral started is flaky, not broken.
 - **status: no_changes.** Mistral finished without changing any file. Read its result to see why (a blocked task, a misunderstanding, or the work already existed) before retrying.
 - **status: stopped_by_refusal.** Vibe ended the session after a refused approval, which the guard normally prevents. Check the `guard:` line, then `--resume` to let Mistral continue.
 - **verification: passed_except_preexisting.** Mistral broke nothing new, but some checks were already failing. Treat it like passed for Mistral's work, and look at the `baseline_warning`.

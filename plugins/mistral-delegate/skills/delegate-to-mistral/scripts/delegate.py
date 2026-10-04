@@ -225,6 +225,7 @@ class Run:
         self.final_text = ""
         self.stderr = ""
         self.cancelled = False
+        self.unfinished = ""
         self.session_id: str | None = args.resume
 
     def call_vibe(self, cmd: list[str], cwd: str) -> None:
@@ -248,6 +249,7 @@ class Run:
         self.notices += info["notices"]
         if info["final_text"]:
             self.final_text = info["final_text"]
+        self.unfinished = unfinished_reason(this_turn(history), info["final_text"])
         if proc.returncode == 0:
             self.status = "ok"
         elif (proc.returncode == 1 and not proc.stdout.strip() and self.stderr
@@ -274,6 +276,19 @@ def this_turn(history: list) -> list:
                 and entry.get("source") in (None, "turn_start")):
             return history[i:]
     return history
+
+
+def unfinished_reason(turn: list, final_text: str) -> str:
+    """Why the turn looks cut off (no closing summary, or a summary that stops mid-sentence), or ""."""
+    if not turn:
+        return ""
+    last = next((e for e in reversed(turn) if isinstance(e, dict) and e.get("type") in ("message", "effect")), None)
+    if last and last.get("type") == "effect":
+        return "Vibe's last step was a tool call, not a closing summary; the run may have stopped early."
+    text = final_text.rstrip()
+    if text and (text.endswith(("…", "...", ":", ",", ";", "(")) or text.endswith(("and", "the", "to"))):
+        return "Mistral's final message stops mid-sentence; the run may have been cut short."
+    return ""
 
 
 def run_checks(commands: list[str], cwd: str, timeout: int) -> dict[str, tuple[int, str]]:
@@ -337,7 +352,8 @@ def run_task(args: argparse.Namespace) -> int:
             caps[key] = getattr(args, key)
     model = args.model or settings["model"]
     write = args.mode == "write"
-    verify = [] if (args.no_verify or not write) else (args.verify or settings["verify"])
+    verify = [] if (args.no_verify or not write) else (
+        [{"cmd": c, "paths": []} for c in args.verify] if args.verify else settings["verify"])
     allow_commands = list(dict.fromkeys(settings["allow_commands"] + args.allow_command)) if write else []
     scope = list(dict.fromkeys(args.scope or settings["scope"])) if write else []
     fix_attempts = settings["fix_attempts"] if args.fix_attempts is None else max(0, args.fix_attempts)
@@ -395,23 +411,37 @@ def run_task(args: argparse.Namespace) -> int:
         }, config.home())
     try:
         return execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps, model, write, verify,
-                       allow_commands, scope, fix_attempts, baseline_on, kind, guard_log, guard_warning)
+                       allow_commands, scope, fix_attempts, baseline_on, kind, guard_log, guard_warning, guard_root)
     finally:
         guard.remove_policy(run_dir, run_id, config.home())
 
 
 def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps, model, write, verify,
-            allow_commands, scope, fix_attempts, baseline_on, kind, guard_log, guard_warning) -> int:
+            allow_commands, scope, fix_attempts, baseline_on, kind, guard_log, guard_warning, guard_root) -> int:
     started_wall, started = time.time(), time.monotonic()
+    # Only the checks that concern this run: ones limited to paths outside the scope are skipped.
+    planned = [c for c in verify if vibe.check_applies(c["paths"], scope, [])]
+    commands = [c["cmd"] for c in planned]
     # Run the checks once before Mistral changes anything, so failures that were
     # already there (or come from the worktree environment) aren't blamed on it.
-    baseline = run_checks(verify, run_dir, args.verify_timeout) if verify and baseline_on else {}
+    # A failing check is rerun once, so a flaky one isn't reported as broken.
+    baseline, flaky = {}, []
+    if commands and baseline_on:
+        baseline = run_checks(commands, run_dir, args.verify_timeout)
+        failing = [cmd for cmd, (code, _out) in baseline.items() if code != 0]
+        if failing:
+            rerun = run_checks(failing, run_dir, args.verify_timeout)
+            flaky = [cmd for cmd, (code, _out) in rerun.items() if code == 0]
+            baseline.update(rerun)
     preexisting = [cmd for cmd, (code, _out) in baseline.items() if code != 0]
 
-    prompt = vibe.build_prompt(task, mode=args.mode, spec=spec, context=args.context, verify=verify,
+    prompt = vibe.build_prompt(task, mode=args.mode, spec=spec, context=args.context, verify=commands,
                                allow_commands=allow_commands, allow_shell=args.allow_shell, scope=scope,
-                               preexisting_failures=preexisting)
-    agent = args.agent or vibe.write_agent_profile(args.mode, model, allow_commands)
+                               preexisting_failures=preexisting, root=guard_root,
+                               cwd=os.path.realpath(run_dir))
+    # Print-only `sed -n` is safe once the guard vets its script; without the guard, keep Vibe's default.
+    vibe_allow = allow_commands + (["sed -n"] if write and not guard_warning else [])
+    agent = args.agent or vibe.write_agent_profile(args.mode, model, vibe_allow)
     trust = args.trust or wt is not None
 
     run = Run(args)
@@ -421,8 +451,12 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                                      extra=settings["vibe_args"]), run_dir)
 
     verification, results, failures, attempts = "not_run", {}, [], 0
-    if verify and run.status in ("ok", "limit_reached"):
-        results = run_checks(verify, run_dir, args.verify_timeout)
+    # Checks limited to paths that Mistral ended up changing outside the scope join in now.
+    changed_so_far = (gitops.changed_files(wt) if wt else [])
+    commands += [c["cmd"] for c in verify if c not in planned and vibe.check_applies(c["paths"], [], changed_so_far)]
+    skipped_checks = [c["cmd"] for c in verify if c["cmd"] not in commands]
+    if commands and run.status in ("ok", "limit_reached"):
+        results = run_checks(commands, run_dir, args.verify_timeout)
         failures = new_failures(results, baseline)
         while failures and attempts < fix_attempts and run.status == "ok" and run.session_id:
             attempts += 1
@@ -432,7 +466,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                                              agent=agent, caps=fix_caps, allow_shell=args.allow_shell,
                                              trust=trust, resume=run.session_id,
                                              extra=settings["vibe_args"]), run_dir)
-            results = run_checks(verify, run_dir, args.verify_timeout)
+            results = run_checks(commands, run_dir, args.verify_timeout)
             failures = new_failures(results, baseline)
         if failures:
             verification = "failed"
@@ -463,12 +497,18 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                      "the user cancelling). " + ("The guard hook was not active: " + guard_warning if guard_warning
                      else "The guard hook should prevent this; check guard below.")
                      + " Resume with --resume to let Mistral continue.")
-    if verify:
+    if commands:
         detail = f"after {attempts} fix attempt{'s' if attempts != 1 else ''}" if attempts else "first try"
         if verification == "not_run":
             lines.append("verification: not run (Vibe did not finish)")
         else:
             lines.append(f"verification: {verification} ({detail})\n" + "\n".join(check_lines(results, baseline)))
+    if skipped_checks:
+        lines.append("checks_skipped (limited to paths this run doesn't touch): " + ", ".join(skipped_checks))
+    if flaky:
+        lines.append("flaky_checks (failed, then passed on a rerun before Mistral started): " + ", ".join(flaky))
+    if run.unfinished:
+        lines.append("final_message_warning: " + run.unfinished)
     if preexisting:
         lines.append("baseline_warning: these checks already failed in the untouched "
                      + ("worktree" if wt else "checkout") + " before Mistral changed anything: "

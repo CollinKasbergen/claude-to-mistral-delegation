@@ -52,9 +52,9 @@ Claude delegates on its own, following the active policy. You can also ask ("hav
 ## How a write task runs
 
 1. **Worktree.** A new git worktree is made from your current code, including uncommitted and untracked files (committed there as a snapshot). Ignored dependency folders such as `node_modules` and `.venv` are hard-linked in. They are real folders inside the worktree whose files are shared with your checkout, so tools like Vite accept them. Cache folders (`.vite`, `.cache`, …) are skipped. Set `deps_mode` to `copy`, `symlink` or `none` to change this.
-2. **Baseline.** Your checks run once on the untouched worktree. Checks that already fail there aren't blamed on Mistral: they're reported as pre-existing, Mistral is told not to work around them, and they never trigger a fix round.
+2. **Baseline.** Your checks run once on the untouched worktree; checks limited to paths outside the run's scope are skipped, and a check that fails is rerun once so a flaky one isn't mistaken for a broken one. Checks that already fail there aren't blamed on Mistral: they're reported as pre-existing, Mistral is told not to work around them, and they never trigger a fix round.
 3. **Prompt.** The task, the spec (`--spec`), the files to read first (`--context`), and the rules: which files Mistral may change (`--scope`), which commands it may run, which checks must pass, no package installs, no weakened tests.
-4. **Guard.** A Vibe `pre_tool` hook checks every tool call during the run. Disallowed commands, paths outside the project, writes outside the scope, secrets and network tools are refused with an error Mistral sees and can work around. Paths written like `/src/app.ts` are corrected to the project. Without it, Vibe's programmatic mode treats a refused approval as the user cancelling and ends the whole session.
+4. **Guard.** A Vibe `pre_tool` hook checks every tool call during the run. Disallowed commands, paths outside the project, writes outside the scope, secrets and network tools are refused with an error Mistral sees and can work around. Paths that point to the right file under the wrong base (`/src/app.ts`, or a worktree path missing its run folder) are corrected to the project. Print-only `sed -n` is allowed alongside Vibe's read-only commands, and the prompt gives Mistral the absolute project root and steers it to the read_file and grep tools. Without it, Vibe's programmatic mode treats a refused approval as the user cancelling and ends the whole session.
 5. **Vibe runs** with a generated agent profile that auto-approves file edits and only the commands you allowed (`--allow-command` / `allow_commands`). Each part of a chained command must be allowed, and everything else is refused.
 6. **Checks.** The wrapper runs each `--verify` command in the worktree. If one fails, its output goes back to the same Vibe session for a fix (`--fix-attempts`, default 1), and the checks run again.
 7. **Report.** It shows status, verification, cost, turns and tokens, the change list, files changed outside the scope, commands Mistral was refused, the diff when short, and `adopt_with` / `discard_with` commands.
@@ -69,7 +69,11 @@ Settings come from `~/.mistral-delegate/config.toml` (all projects), then `<repo
 ```toml
 policy = "balanced"          # conservative | balanced | aggressive
 model = "mistral-medium-3.5" # a model alias from your Vibe config
-verify = ["npm test"]
+verify = [
+  "npm run lint",                                     # always runs
+  { cmd = "npx vitest run", paths = ["frontend/"] },  # only when the scope or changes touch frontend/
+  { cmd = "pytest -q", paths = ["backend/"] },
+]
 allow_commands = ["npm test"]
 fix_attempts = 1
 max_parallel = 3

@@ -246,7 +246,9 @@ class ReadModeTest(DelegateTestBase):
         prompt = self.last()["prompt"]
         self.assertIn("Implement the spec below.", prompt)
         self.assertIn("## Spec\n\nGoal: explain the parser.", prompt)
-        self.assertIn("## Read these files first\n\n- app.py", prompt)
+        self.assertIn("## Read these files first (paths relative to the project root)\n\n- app.py", prompt)
+        self.assertIn(f"The project root is `{os.path.realpath(self.repo)}`", prompt)
+        self.assertIn("read_file and grep tools rather than shell commands", prompt)
 
     def test_task_from_stdin(self):
         self.run_delegate("-", stdin="Long task from stdin")
@@ -363,6 +365,32 @@ class WriteModeTest(DelegateTestBase):
         hooks = (self.tmpdir / "vibe-home" / "hooks.toml").read_text()
         self.assertIn("mistral-delegate-guard", hooks)
         self.assertEqual(list((self.home / "guards").glob("*.json")), [])
+
+    def test_checks_limited_to_other_paths_are_skipped(self):
+        (self.repo / ".mistral-delegate.toml").write_text(textwrap.dedent("""\
+            verify = [
+              "true",
+              { cmd = "test -f frontend_check_ran || touch frontend_check_ran", paths = ["frontend/"] },
+              { cmd = "touch backend_check_ran", paths = ["backend/**"] },
+            ]
+        """))
+        out = self.run_delegate("--mode", "write", "--scope", "frontend/src/**", "Task")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("checks_skipped (limited to paths this run doesn't touch): touch backend_check_ran", out.stdout)
+        wt = Path(self.value(out, "worktree_path"))
+        self.assertFalse((wt / "backend_check_ran").exists())
+        self.assertIn("pass: test -f frontend_check_ran", out.stdout)
+
+    def test_flaky_baseline_check_is_rerun(self):
+        check = "test -f .flaky_once || { touch .flaky_once; exit 1; }"
+        out = self.run_delegate("--mode", "write", "--verify", check, "Task")
+        self.assertIn("flaky_checks (failed, then passed on a rerun before Mistral started)", out.stdout)
+        self.assertNotIn("baseline_warning", out.stdout)
+        self.assertIn("verification: passed", out.stdout)
+
+    def test_sed_is_allowed_in_the_profile_only_with_the_guard(self):
+        self.run_delegate("--mode", "write", "Task")
+        self.assertIn('"sed -n"', self.profile(self.last()["argv"]))
 
     def test_no_changes_is_its_own_status(self):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_NO_WRITE="1")
@@ -660,14 +688,17 @@ class GuardPolicyTest(unittest.TestCase):
     def test_allowed_commands(self):
         for command in ["cat frontend/src/router/index.ts | grep export", "npm test -- --run", "CI=1 npm test",
                         "grep -rn foo . 2>/dev/null", 'grep "a|b;c" frontend', "ls && git diff",
-                        "npx vitest run src/x.test.ts 2>&1 | tail", "cat " + self.root + "/frontend/src/router/index.ts"]:
+                        "npx vitest run src/x.test.ts 2>&1 | tail",
+                        "sed -n 1,20p frontend/src/router/index.ts | grep x", "sed -n '/export/p' frontend/src/router/index.ts", "cat " + self.root + "/frontend/src/router/index.ts"]:
             with self.subTest(command=command):
                 self.assertIsNone(self.shell(command))
 
     def test_refused_commands_explain_why(self):
         cases = {
             "node -e 'console.log(1)'": "`node` isn't allowed",
-            "sed -n 1,20p frontend/src/router/index.ts | grep x": "`sed` isn't allowed",
+            "sed -i s/a/b/ frontend/src/router/index.ts": "`sed` isn't allowed",
+            "sed -n 'w out.txt' frontend/src/router/index.ts": "`sed` isn't allowed",
+            "sed 1,20p frontend/src/router/index.ts": "`sed` isn't allowed",
             "ls; rm -rf frontend": "`rm` isn't allowed",
             "ls\nrm -rf frontend": "`rm` isn't allowed",
             "echo $(whoami)": "Command substitution",
@@ -694,6 +725,21 @@ class GuardPolicyTest(unittest.TestCase):
                                                 self.policy, self.root)
         self.assertEqual(action, "rewrite")
         self.assertEqual(new["path"], os.path.join(self.root, "frontend/src/router/index.ts"))
+
+    def test_paths_with_a_wrong_base_are_corrected(self):
+        wrong = os.path.join(os.path.dirname(self.root), "frontend/src/router/index.ts")
+        action, _r, new = guard.check_tool("read_file", {"path": wrong}, self.policy, self.root)
+        self.assertEqual(action, "rewrite")
+        self.assertEqual(new["path"], os.path.join(self.root, "frontend/src/router/index.ts"))
+        rel = ".mistral-worktrees/repo-0d0e3437/frontend/src/router/index.ts"
+        action, _r, new = guard.check_tool("read_file", {"path": rel}, self.policy, self.root)
+        self.assertEqual(action, "rewrite")
+        self.assertEqual(new["path"], os.path.join(self.root, "frontend/src/router/index.ts"))
+        action, _r, new = guard.check_tool("bash", {"command": f'cat "{wrong}" | grep export'}, self.policy, self.root)
+        self.assertEqual(action, "rewrite")
+        self.assertIn(os.path.join(self.root, "frontend/src/router/index.ts"), new["command"])
+        # A single-name file elsewhere is not mapped into the project.
+        self.assertEqual(guard.check_tool("read_file", {"path": "/etc/hosts"}, self.policy, self.root)[0], "deny")
 
     def test_paths_outside_the_project_are_refused(self):
         action, reason, _ = guard.check_tool("read_file", {"path": "/etc/hosts"}, self.policy, self.root)
@@ -773,6 +819,35 @@ class WorktreeLocationTest(unittest.TestCase):
                     gitops._device = original
             finally:
                 del os.environ["MISTRAL_DELEGATE_HOME"]
+
+
+class UnfinishedRunTest(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import delegate
+        self.delegate = delegate
+
+    def test_detects_runs_that_stop_early(self):
+        msg = lambda text: {"type": "message", "role": "assistant", "content": [{"type": "text", "text": text}]}
+        tool = {"type": "effect", "title": "read_file", "state": {"status": "completed"}}
+        f = self.delegate.unfinished_reason
+        self.assertIn("tool call", f([msg("Looking"), tool], "Looking"))
+        self.assertIn("mid-sentence", f([msg("AppLayout triggers advisors.load()…")], "AppLayout triggers advisors.load()…"))
+        self.assertEqual(f([msg("Added tests in src/a.test.ts.")], "Added tests in src/a.test.ts."), "")
+        self.assertEqual(f([msg("- src/a.test.ts: new tests")], "- src/a.test.ts: new tests"), "")
+
+
+class CostStatsTest(unittest.TestCase):
+    def test_runs_without_cost_data_are_left_out_of_averages(self):
+        from mdelegate import ledger
+        runs = {
+            "a": {"id": "a", "kind": "tests", "status": "ok", "started": time.time(), "cost": 0.2, "tokens": 1000},
+            "b": {"id": "b", "kind": "tests", "status": "ok", "started": time.time(), "cost": None},
+            "c": {"id": "c", "kind": "tests", "status": "ok", "started": time.time(), "cost": 0.0, "tokens": 0},
+        }
+        self.assertIn("$0.200", ledger.format_stats(runs))
+        self.assertIn("2 run(s) without cost data", ledger.format_stats(runs))
+        self.assertIn("$0.200 avg", ledger.compact_stats(runs))
 
 
 class ManifestTest(unittest.TestCase):

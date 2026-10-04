@@ -196,6 +196,51 @@ def _sensitive(path: str) -> bool:
     return any(fnmatch.fnmatch(name, p) for p in SENSITIVE) and not name.endswith((".example", ".sample", ".template"))
 
 
+def correct_path(value: str, root: str, write: bool = False) -> str | None:
+    """Map a path that points outside the project back into it, if a suffix of it exists there.
+
+    Catches paths written as if the project were the filesystem root (/src/app.ts)
+    and paths built from the wrong base, such as the worktrees folder without the
+    run's own folder (.mistral-worktrees/<repo>-<hash>/frontend/x.ts).
+    """
+    parts = [p for p in value.replace("\\", "/").split("/") if p not in ("", ".", "~")]
+    for i in range(len(parts)):
+        rest = parts[i:]
+        if ".." in rest or (i > 0 and len(rest) < 2):
+            continue
+        candidate = os.path.join(root, *rest)
+        if os.path.exists(candidate) or (write and os.path.isdir(os.path.dirname(candidate))):
+            return candidate
+    return None
+
+
+SED_SAFE_FLAGS = {"-n", "-E", "-r", "-s", "--quiet", "--silent", "-e"}
+SED_SAFE_SCRIPT = re.compile(r"^(?:(?:\d+|\$)(?:,(?:\d+|\$))?p|\d+q|/[^/]*/p|(?:\d+|\$)(?:,(?:\d+|\$))?p;\d+q)$")
+
+
+def _sed_files(words: list[str]) -> list[str] | None:
+    """The file arguments of a print-only `sed -n` call, or None if it could do anything else."""
+    if "-n" not in words and "--quiet" not in words and "--silent" not in words:
+        return None
+    scripts, files, expect_script = [], [], False
+    for word in words[1:]:
+        if expect_script:
+            scripts.append(word)
+            expect_script = False
+        elif word == "-e":
+            expect_script = True
+        elif word.startswith("-"):
+            if word not in SED_SAFE_FLAGS:
+                return None
+        elif not scripts:
+            scripts.append(word)
+        else:
+            files.append(word)
+    if not scripts or not all(SED_SAFE_SCRIPT.match(s) for s in scripts):
+        return None
+    return files
+
+
 def _shell_tokens(command: str) -> list[str]:
     lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
@@ -203,20 +248,29 @@ def _shell_tokens(command: str) -> list[str]:
 
 
 def check_shell(command: str, policy: dict, cwd: str) -> str | None:
-    """Return a refusal reason, or None if the command may run."""
+    """Return a refusal reason, or None if the command may run as written."""
+    reason, corrections = analyze_shell(command, policy, cwd)
+    if reason is None and corrections:
+        return "paths need correcting: " + ", ".join(f"{a} -> {b}" for a, b in corrections.items())
+    return reason
+
+
+def analyze_shell(command: str, policy: dict, cwd: str) -> tuple[str | None, dict[str, str]]:
+    """(refusal reason or None, {path as written: corrected path inside the project})."""
+    corrections: dict[str, str] = {}
     if policy.get("allow_shell"):
-        return None
+        return None, corrections
     allowed = policy.get("allow_commands") or []
     hint = ("Use the read_file and grep tools to inspect files and the edit/write tools to change them. "
             "Commands you may run: " + ", ".join(f"`{c}`" for c in allowed if c not in policy.get("default_commands", []))
             if any(c not in policy.get("default_commands", []) for c in allowed)
             else "Use the read_file and grep tools to inspect files and the edit/write tools to change them.")
     if "`" in command or "$(" in command or "<(" in command or ">(" in command:
-        return f"Command substitution isn't allowed in this run. {hint}"
+        return f"Command substitution isn't allowed in this run. {hint}", corrections
     try:
         tokens = _shell_tokens(command)
     except ValueError:
-        return f"Couldn't parse that command. {hint}"
+        return f"Couldn't parse that command. {hint}", corrections
 
     segments: list[list[str]] = [[]]
     i = 0
@@ -225,7 +279,7 @@ def check_shell(command: str, policy: dict, cwd: str) -> str | None:
         if tok in SEPARATORS:
             segments.append([])
         elif tok in ("(", ")", "((", "))"):
-            return f"Subshells and grouping aren't allowed in this run. {hint}"
+            return f"Subshells and grouping aren't allowed in this run. {hint}", corrections
         elif set(tok) <= set("<>&|") and ("<" in tok or ">" in tok):
             target = tokens[i + 1] if i + 1 < len(tokens) else ""
             if segments[-1] and segments[-1][-1].isdigit():
@@ -240,7 +294,7 @@ def check_shell(command: str, policy: dict, cwd: str) -> str | None:
                 i += 2
                 continue
             return (f"Redirection (`{tok}`) isn't allowed in this run; write files with the edit/write tools. "
-                    f"{hint}")
+                    f"{hint}"), corrections
         else:
             segments[-1].append(tok)
         i += 1
@@ -250,18 +304,29 @@ def check_shell(command: str, policy: dict, cwd: str) -> str | None:
             words = words[1:]
         if not words:
             continue
-        if not any(words[:len(p.split())] == p.split() for p in allowed):
-            return f"`{words[0]}` isn't allowed in this run. {hint}"
+        sed_files = _sed_files(words) if words[0] == "sed" else None
+        if sed_files is None and not any(words[:len(p.split())] == p.split() for p in allowed):
+            return f"`{words[0]}` isn't allowed in this run. {hint}", corrections
         if words[0] == "find" and FIND_UNSAFE & set(words):
-            return "`find` with -exec/-delete isn't allowed in this run. Use plain `find` to list files."
-        for word in words[1:]:
+            return "`find` with -exec/-delete isn't allowed in this run. Use plain `find` to list files.", corrections
+        for word in (sed_files if sed_files is not None else words[1:]):
+            looks_like_path = word.startswith(("/", "~")) or ".." in word.split("/") or (
+                "/" in word and not word.startswith("-") and not os.path.exists(os.path.join(cwd, word)))
+            if not looks_like_path or word == "/dev/null":
+                continue
+            resolved = _resolve(word, cwd)
+            if _inside(resolved, policy["root"]):
+                if not os.path.exists(resolved) and (fixed := correct_path(word, policy["root"])):
+                    corrections[word] = fixed
+                continue
+            fixed = correct_path(word, policy["root"])
+            if fixed and (word.startswith(("/", "~")) or ".." in word.split("/") or os.path.exists(fixed)):
+                corrections[word] = fixed
+                continue
             if word.startswith(("/", "~")) or ".." in word.split("/"):
-                if word == "/dev/null":
-                    continue
-                if not _inside(_resolve(word, cwd), policy["root"]):
-                    return (f"`{word}` is outside the project. Use paths relative to the project root "
-                            f"({policy['root']}).")
-    return None
+                return (f"`{word}` is outside the project. Use paths relative to the project root "
+                        f"({policy['root']})."), corrections
+    return None, corrections
 
 
 def _is_write(tool: str, tool_input: dict) -> bool:
@@ -278,24 +343,40 @@ def check_tool(tool: str, tool_input: dict, policy: dict, cwd: str) -> tuple[str
         return "deny", ("No one can answer questions during this run. Make a reasonable choice, "
                         "and list it in your final summary."), None
 
-    command = tool_input.get("command")
-    if isinstance(command, str):
-        reason = check_shell(command, policy, tool_input.get("cwd") or cwd)
-        if reason:
-            return "deny", reason, None
-
     root = policy["root"]
     new_input = dict(tool_input)
     rewritten = False
+    command = tool_input.get("command")
+    if isinstance(command, str):
+        reason, corrections = analyze_shell(command, policy, tool_input.get("cwd") or cwd)
+        if reason:
+            return "deny", reason, None
+        for wrong, fixed in corrections.items():
+            if f'"{wrong}"' in command or f"'{wrong}'" in command:
+                command = command.replace(wrong, fixed)
+            elif wrong in command:
+                command = command.replace(wrong, shlex.quote(fixed))
+            else:
+                return "deny", (f"`{wrong}` is outside the project; the file is at `{fixed}`. "
+                                f"Use paths relative to the project root ({root})."), None
+        if corrections:
+            new_input["command"] = command
+            rewritten = True
     write = _is_write(tool, tool_input)
     for key in PATH_KEYS:
         values = tool_input.get(key)
         if not isinstance(values, str) or not values:
             continue
         resolved = _resolve(values, cwd)
-        if not _inside(resolved, root):
-            candidate = os.path.join(root, values.lstrip("/"))
-            if values.startswith("/") and (os.path.exists(candidate) or (write and os.path.isdir(os.path.dirname(candidate)))):
+        if _inside(resolved, root) and not os.path.exists(resolved) and not write:
+            candidate = correct_path(values, root)
+            if candidate and os.path.realpath(candidate) != resolved:
+                new_input[key] = candidate
+                resolved = os.path.realpath(candidate)
+                rewritten = True
+        elif not _inside(resolved, root):
+            candidate = correct_path(values, root, write)
+            if candidate:
                 new_input[key] = candidate
                 resolved = os.path.realpath(candidate)
                 rewritten = True
@@ -318,6 +399,12 @@ def check_tool(tool: str, tool_input: dict, policy: dict, cwd: str) -> tuple[str
     return "allow", None, None
 
 
+def changed_value(old: dict, new: dict | None) -> str | None:
+    if not new:
+        return None
+    return next((str(new[k]) for k in ("command", *PATH_KEYS) if k in new and new.get(k) != old.get(k)), None)
+
+
 def main() -> None:
     try:
         event = json.loads(sys.stdin.read() or "{}")
@@ -338,7 +425,7 @@ def main() -> None:
         os.makedirs(os.path.dirname(policy["log"]), exist_ok=True)
         with open(policy["log"], "a", encoding="utf-8") as f:
             f.write(json.dumps({"tool": tool, "target": str(target)[:300], "action": action, "reason": reason,
-                                "new": (new_input or {}).get("path") or (new_input or {}).get("file_path")}) + "\n")
+                                "new": changed_value(tool_input, new_input)}) + "\n")
     except (OSError, KeyError):
         pass
     if action == "deny":

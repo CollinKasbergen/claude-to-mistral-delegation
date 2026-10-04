@@ -14,7 +14,13 @@ policy = "balanced"
 #   Python: ["pytest -q", "ruff check ."]
 #   Go:     ["go test ./...", "go vet ./..."]
 #   Rust:   ["cargo test", "cargo clippy -- -D warnings"]
-verify = ["npm test", "npx tsc --noEmit"]
+# A check can be limited to paths: it then runs only when the task's --scope or
+# Mistral's changes touch them (saves running backend tests for a frontend task).
+verify = [
+  "npm test",
+  "npx tsc --noEmit",
+  # { cmd = "pytest -q", paths = ["backend/"] },
+]
 
 # Commands Mistral may run itself while it works, so it can fix its own
 # mistakes before handing back. These are prefixes: "npm test" also allows

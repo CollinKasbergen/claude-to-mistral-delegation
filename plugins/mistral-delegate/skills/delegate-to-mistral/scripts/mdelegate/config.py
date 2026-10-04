@@ -60,6 +60,23 @@ def _as_list(value) -> list[str]:
     return [str(v) for v in value if str(v).strip()]
 
 
+def _as_checks(value, warnings: list[str]) -> list[dict]:
+    """verify entries: "cmd" or {cmd = "...", paths = ["frontend/", ...]} (run only when those paths are involved)."""
+    checks = []
+    for item in value if isinstance(value, list) else [value]:
+        if isinstance(item, str) and item.strip():
+            checks.append({"cmd": item, "paths": []})
+        elif isinstance(item, dict) and isinstance(item.get("cmd"), str) and item["cmd"].strip():
+            checks.append({"cmd": item["cmd"], "paths": _as_list(item.get("paths"))})
+        elif item:
+            warnings.append(f"ignored verify entry {item!r}: use a string or {{cmd = ..., paths = [...]}}")
+    return checks
+
+
+def check_label(check: dict) -> str:
+    return check["cmd"] + (f" (when {', '.join(check['paths'])})" if check["paths"] else "")
+
+
 def _load_toml(path: Path, warnings: list[str]) -> dict:
     if not path.is_file():
         return {}
@@ -120,7 +137,7 @@ def load(repo_root: str | None) -> dict:
     if settings["policy"] not in POLICIES:
         settings["warnings"].append(f"unknown policy {settings['policy']!r}, using 'balanced'")
         settings["policy"] = "balanced"
-    settings["verify"] = _as_list(settings["verify"])
+    settings["verify"] = _as_checks(settings["verify"], settings["warnings"])
     settings["allow_commands"] = _as_list(settings["allow_commands"])
     settings["scope"] = _as_list(settings["scope"])
     settings["vibe_args"] = _as_list(settings["vibe_args"])
@@ -159,7 +176,7 @@ def describe(settings: dict) -> str:
     lines = [
         f"policy: {settings['policy']}  -> {POLICY_GUIDANCE[settings['policy']]}",
         f"model: {settings['model'] or '(Vibe default)'}",
-        f"verify: {', '.join(settings['verify']) or '(none)'}",
+        f"verify: {'; '.join(check_label(c) for c in settings['verify']) or '(none)'}",
         f"allow_commands: {', '.join(settings['allow_commands']) or '(none)'}",
         f"fix_attempts: {settings['fix_attempts']}",
         f"max_parallel: {settings['max_parallel']}",
