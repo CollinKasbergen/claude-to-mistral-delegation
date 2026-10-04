@@ -29,14 +29,17 @@ or <repo>/.mistral-delegate.toml; see --show-config.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 from collections import Counter
 from pathlib import Path
@@ -44,13 +47,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mdelegate import commands as cmdforms, config, gitops, guard, ledger, vibe  # noqa: E402
-from mdelegate.gitops import DelegateError, git  # noqa: E402
+from mdelegate.gitops import DelegateError  # noqa: E402
 
 KINDS = ("tests", "feature", "bugfix", "refactor", "migration", "boilerplate", "docs", "search", "other")
 MAX_RESULT_CHARS = 12_000
 CHECK_OUTPUT_LINES = 60
 CHECK_OUTPUT_CHARS = 5_000
-WATCH_INTERVAL = float(os.environ.get("MISTRAL_DELEGATE_WATCH_INTERVAL", 3))
+def _env_number(name: str, default, cast=int):
+    try:
+        return cast(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
+
+WATCH_INTERVAL = _env_number("MISTRAL_DELEGATE_WATCH_INTERVAL", 3.0, float)
 SCRIPT = Path(__file__).resolve()
 
 
@@ -105,7 +115,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                      help="Load the project's .vibe/ config and AGENTS.md (always on in worktrees).")
     run.add_argument("--resume", metavar="SESSION_ID", help="Continue an earlier Vibe session.")
     run.add_argument("--agent", help="Use this Vibe agent profile instead of the generated one.")
-    run.add_argument("--timeout", type=int, default=int(os.environ.get("MISTRAL_DELEGATE_TIMEOUT", 900)),
+    run.add_argument("--timeout", type=int, default=_env_number("MISTRAL_DELEGATE_TIMEOUT", 900),
                      help="Seconds before a Vibe call is killed (default 900).")
     run.add_argument("--diff-lines", type=int, default=300,
                      help="Include the full diff in the report when it is at most this many lines (0: never).")
@@ -155,8 +165,9 @@ def find_run(run_id: str) -> dict:
 
 def worktree_scope(run: dict) -> list[str]:
     """The combined scope of every run on this run's worktree; [] if any of them had no scope (no limit)."""
-    path = (run.get("worktree") or {}).get("path")
-    runs = [r for r in ledger.load_runs().values() if path and (r.get("worktree") or {}).get("path") == path] or [run]
+    runs = runs_on_worktree(run) if (run.get("worktree") or {}).get("path") else [run]
+    if run.get("id") is None:  # the report of a run not recorded under an id here: add its own scope
+        runs = runs + [run]
     if any(not r.get("scope") for r in runs):
         return []
     return list(dict.fromkeys(entry for r in runs for entry in r["scope"]))
@@ -168,13 +179,21 @@ def runs_on_worktree(run: dict) -> list[dict]:
     if not path:
         return [run]
     return [r for r in ledger.load_runs().values()
-            if r["id"] == run["id"] or ((r.get("worktree") or {}).get("path") == path and not r.get("outcome"))]
+            if r["id"] == run.get("id") or ((r.get("worktree") or {}).get("path") == path and not r.get("outcome"))]
+
+
+def refuse_while_running(run: dict) -> None:
+    """--adopt and --discard wait for every run on the worktree: a resume may still be working in it."""
+    busy = [r["id"] for r in runs_on_worktree(run) if ledger.state(r) == "running"]
+    if busy:
+        raise DelegateError(("That run is still going" if busy == [run["id"]] else
+                             f"{', '.join(busy)} is still working in this run's worktree")
+                            + ". Wait for it to finish (see --status).")
 
 
 def cmd_adopt(args: argparse.Namespace) -> int:
     run = find_run(args.adopt)
-    if ledger.state(run) == "running":
-        raise DelegateError("That run is still going. Wait for it to finish.")
+    refuse_while_running(run)
     wt = run.get("worktree")
     if not wt:
         if run.get("mode") != "write":
@@ -184,14 +203,15 @@ def cmd_adopt(args: argparse.Namespace) -> int:
         return 0
     if not os.path.isdir(wt["path"]):
         raise DelegateError(f"The worktree {wt['path']} no longer exists.")
+    # An earlier --adopt --keep-worktree moved the base past what it applied.
+    wt = dict(wt, base=gitops.load_state(wt["path"]).get("base") or wt["base"])
     paths = args.paths
     skipped: list[str] = []
     # A resumed run may have a narrower scope than the run it continues; the worktree holds both.
     scope = worktree_scope(run)
     if scope and not args.include_out_of_scope:
-        changed = gitops.changed_files(wt)
-        if paths:
-            changed = [f for f in changed if any(f == p or f.startswith(p.rstrip("/") + "/") for p in paths)]
+        # --paths are git pathspecs (`.`, `src/*`): check exactly the files they select.
+        changed = gitops.changed_files(wt, paths)
         skipped = [f for f in changed if not vibe.matches_scope(f, scope)]
         if skipped and not args.skip_out_of_scope:
             print(f"Nothing applied: {len(skipped)} changed file(s) in this worktree are outside the scope of its "
@@ -221,8 +241,13 @@ def cmd_adopt(args: argparse.Namespace) -> int:
     if skipped:
         print("Left out (outside the run's scope; --include-out-of-scope to apply):")
         print("\n".join(f"  {f}" for f in skipped))
-    if args.keep_worktree:
-        print(f"Worktree kept at {wt['path']}.")
+    partial = bool(args.paths or skipped)
+    if args.keep_worktree or partial:
+        # What was applied becomes the worktree's new base, so a later adopt (after a resume) applies only
+        # what came after it.
+        gitops.commit_applied(wt, files)
+        print(f"Worktree kept at {wt['path']}"
+              + (f" with the changes you didn't apply; --discard {run['id']} removes it." if partial else "."))
     else:
         gitops.remove_worktree(wt)
         print("Worktree removed.")
@@ -232,11 +257,14 @@ def cmd_adopt(args: argparse.Namespace) -> int:
 
 def cmd_discard(args: argparse.Namespace) -> int:
     run = find_run(args.discard)
-    if ledger.state(run) == "running":
-        raise DelegateError("That run is still going. Wait for it to finish.")
+    refuse_while_running(run)
     wt = run.get("worktree")
     if wt and os.path.isdir(wt["path"]):
         gitops.remove_worktree(wt)
+    if run.get("outcome") == "adopted_partial":
+        # The rest of a partly adopted run: the track record keeps it as partly adopted.
+        print(f"Removed the worktree of {run['id']} (its adopted part stays in your checkout).")
+        return 0
     for sibling in runs_on_worktree(run):
         ledger.append({"event": "outcome", "id": sibling["id"], "outcome": "discarded", "note": args.note})
     print(f"Discarded {run['id']}" + (" and removed its worktree." if wt else "."))
@@ -261,11 +289,18 @@ class Run:
         self.cancelled = False
         self.unfinished = ""
         self.limit_note = ""
+        self.limit_flag = ""
         self.effective = 0
         self.live_tool_calls = 0
         self.guard_log: Path | None = None
         self.currency = "$"
         self.session_id: str | None = args.resume
+        self.run_id = ""
+        self.env: dict | None = None
+        self.spent = 0.0  # estimated cost of the Vibe calls so far, for a run that is interrupted
+        self.unmetered = False  # a Vibe call whose session (and so its token use) was never found
+        self.last_snap: dict | None = None
+        self.guard_policy: dict | None = None
 
     def call_vibe(self, cmd: list[str], cwd: str, *, token_budget: int, max_tool_calls: int,
                   max_price: float | None = None, model_hint: str | None = None) -> None:
@@ -273,12 +308,15 @@ class Run:
         tokens, `max_tool_calls` tool calls, and `max_price` if set. Vibe can't enforce these itself
         (no price for some models, and its turn limit counts prompts), so the wrapper watches the
         session's usage and the guard's log while Vibe runs."""
-        watcher = vibe.SessionWatcher(cwd, time.time(), session_id=self.session_id, model_hint=model_hint)
+        watcher = vibe.SessionWatcher(cwd, time.time(), session_id=self.session_id, model_hint=model_hint,
+                                      marker=self.run_id)
         base = watcher.poll() if self.session_id else None  # a resumed session already has usage
         guard_base = len(guard.read_log(self.guard_log)) if self.guard_log else 0
-        out_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
-        err_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
-        proc = subprocess.Popen(cmd, cwd=cwd, stdout=out_file, stderr=err_file, stdin=subprocess.DEVNULL, text=True)
+        out_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+        err_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+        # Vibe gets its own process group, so stopping it also stops the tests and servers it started.
+        proc = subprocess.Popen(cmd, cwd=cwd, stdout=out_file, stderr=err_file, stdin=subprocess.DEVNULL, text=True,
+                                encoding="utf-8", errors="replace", env=self.env, start_new_session=True)
         started, stopped, snap = time.monotonic(), "", None
 
         def measure():
@@ -289,38 +327,44 @@ class Run:
             cost, fallback = vibe.snapshot_cost(snap, base, fallback=True) if snap else (0.0, False)
             return use, effective, calls, cost, fallback
 
-        while proc.poll() is None:
-            time.sleep(WATCH_INTERVAL)
+        try:
+            while proc.poll() is None:
+                time.sleep(WATCH_INTERVAL)
+                snap = watcher.poll() or snap
+                _use, effective, calls, cost, fallback = measure()
+                if time.monotonic() - started > self.args.timeout:
+                    stopped = "timeout"
+                elif effective > token_budget:
+                    stopped = "budget_exceeded"
+                    self.limit_note = (f"stopped Mistral at {effective:,} effective tokens, over this call's "
+                                       f"token_budget of {token_budget:,}")
+                    self.limit_flag = "--token-budget"
+                elif max_price is not None and cost > max_price:
+                    stopped = "budget_exceeded"
+                    self.limit_note = (f"stopped Mistral at ~{self.currency}{cost:.2f}, over this call's max_price "
+                                       f"of {self.currency}{max_price:.2f}"
+                                       + (" (priced at mistral-medium-3.5 rates: the model's price is unknown)"
+                                          if fallback else ""))
+                    self.limit_flag = "--max-price"
+                elif calls > max_tool_calls:
+                    stopped = "tool_call_limit"
+                    self.limit_note = f"stopped Mistral after {calls} tool calls, over the cap of {max_tool_calls}"
+                    self.limit_flag = "--max-tool-calls"
+                if stopped:
+                    break
+        finally:
+            # Stopped at a cap, or the wrapper itself is being stopped: end Vibe and everything it started.
+            stop_process_group(proc)
             snap = watcher.poll() or snap
             _use, effective, calls, cost, fallback = measure()
-            if time.monotonic() - started > self.args.timeout:
-                stopped = "timeout"
-            elif effective > token_budget:
-                stopped = "budget_exceeded"
-                self.limit_note = (f"stopped Mistral at {effective:,} effective tokens, over this call's budget "
-                                   f"of {token_budget:,}")
-            elif max_price is not None and cost > max_price:
-                stopped = "budget_exceeded"
-                self.limit_note = (f"stopped Mistral at ~{self.currency}{cost:.2f}, over this call's max_price of "
-                                   f"{self.currency}{max_price:.2f}"
-                                   + (" (priced at mistral-medium-3.5 rates: the model's price is unknown)"
-                                      if fallback else ""))
-            elif calls > max_tool_calls:
-                stopped = "tool_call_limit"
-                self.limit_note = f"stopped Mistral after {calls} tool calls, over the cap of {max_tool_calls}"
-            if stopped:
-                proc.terminate()
-                try:
-                    proc.wait(10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-                break
-        snap = watcher.poll() or snap
-        _use, effective, calls, cost, fallback = measure()
-        self.effective += effective
-        self.live_tool_calls += calls
-        self.session_id = self.session_id or watcher.session_id
+            self.effective += effective
+            self.live_tool_calls += calls
+            self.spent += cost or 0.0
+            if snap is None:
+                self.unmetered = True
+            elif not self.session_id:
+                self.last_snap = snap
+        self.session_id = self.session_id or watcher.found_id
         out_file.seek(0)
         err_file.seek(0)
         proc = subprocess.CompletedProcess(cmd, proc.returncode, out_file.read(), err_file.read())
@@ -331,8 +375,10 @@ class Run:
             self.stderr = f"Vibe did not finish within {self.args.timeout}s and was stopped."
             return
         history = vibe.parse_output(proc.stdout)
-        # A refused approval in programmatic mode cancels the session.
-        self.cancelled = self.cancelled or bool(CANCELLED.search(proc.stdout) or CANCELLED.search(proc.stderr))
+        # A refused approval in programmatic mode cancels the session. Only this turn counts: a resumed
+        # session prints its whole history, earlier cancellations included.
+        turn_text = json.dumps(this_turn(history)) if history else proc.stdout
+        self.cancelled = self.cancelled or bool(CANCELLED.search(turn_text) or CANCELLED.search(proc.stderr))
         info = vibe.summarize_history(this_turn(history))
         self.stderr = proc.stderr.strip()
         self.session_id = info["session_id"] or vibe.summarize_history(history)["session_id"] or self.session_id
@@ -355,6 +401,26 @@ class Run:
             self.final_text = self.stderr
         else:
             self.status = "error"
+
+
+def stop_process_group(proc: subprocess.Popen, grace: float = 10) -> None:
+    """Stop a process started with start_new_session=True and every process in its group."""
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, None)):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.wait(wait)
+            if sig == signal.SIGTERM:
+                # The leader is gone; make sure nothing it started lingers.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
 CONTINUE_PROMPT = ("You stopped before finishing. Continue the task from where you left off, then end with "
@@ -395,9 +461,107 @@ def unfinished_reason(turn: list, final_text: str) -> str:
     if last and last.get("type") == "effect":
         return "Vibe's last step was a tool call, not a closing summary; the run may have stopped early."
     text = final_text.rstrip()
-    if text and (text.endswith(("…", "...", ":", ",", ";", "(")) or text.endswith(("and", "the", "to"))):
+    if text and (text.endswith(("…", "...", ":", ",", ";", "(")) or re.search(r"\b(and|the|to)$", text)):
         return "Mistral's final message stops mid-sentence; the run may have been cut short."
     return ""
+
+
+TEST_FILE = re.compile(r"(^|/)(tests?|__tests__|specs?)/|[._-](test|spec)s?\.[a-z]+$|(^|/)test_[^/]+\.py$|"
+                       r"_test\.(py|go)$|(^|/)conftest\.py$")
+# Changed files that count as code under test: source files, not docs, configs, lockfiles or fixtures.
+CODE_FILE = re.compile(r"\.(py|pyi|ts|tsx|js|jsx|mjs|cjs|vue|svelte|go|rs|java|kt|kts|rb|php|cs|swift|c|cc|cpp|h|hpp|"
+                       r"m|mm|scala|ex|exs|clj|dart|lua|sql)$")
+NOT_CODE = re.compile(r"(^|/)(testdata|fixtures?|__snapshots__|__mocks__|migrations)/|\.config\.[a-z]+$|"
+                      r"(^|/)(setup|conftest|manage)\.py$")
+# Test runners, recognised after runner options are dropped and script spellings normalised.
+TEST_RUNNERS = {"pytest", "vitest", "jest", "mocha", "ava", "rspec", "phpunit", "tox", "nox", "karma", "jasmine",
+                "playwright", "cypress"}
+# Runners that accept test files as arguments, so only Mistral's changed tests need to run.
+FILE_ARG_RUNNERS = {"pytest", "vitest", "jest"}
+
+
+def _test_runner(command: str, extra: list[str]) -> str | None:
+    """The test runner a check command invokes (None for lint, type checks, `test -f` and the like)."""
+    if any(command == e or command.startswith(e + " ") for e in extra):
+        return "configured"
+    for segment in re.split(r"&&|\|\||;|\|", command):
+        words = guard.normalize_command(segment.split())
+        if not words:
+            continue
+        if words[0] in ("npx", "bunx") or words[:2] in (["pnpm", "exec"], ["npm", "exec"]) or \
+                words[:2] in (["uv", "run"], ["poetry", "run"], ["pdm", "run"], ["hatch", "run"]):
+            words = words[2:] if words[0] in ("pnpm", "npm", "uv", "poetry", "pdm", "hatch") else words[1:]
+        if words[:2] in (["python", "-m"], ["python3", "-m"]):
+            words = words[2:]
+        if not words:
+            continue
+        if words[0] in TEST_RUNNERS or words[0] == "unittest":
+            return words[0]
+        if words[:2] in (["go", "test"], ["cargo", "test"], ["dotnet", "test"], ["mix", "test"]):
+            return " ".join(words[:2])
+        if len(words) >= 3 and words[0] in ("npm", "pnpm", "yarn", "bun") and words[1] == "run" and \
+                (words[2] == "test" or words[2].startswith("test:")):
+            return f"{words[0]} run {words[2]}"
+    return None
+
+
+def test_strength(wt: dict, run_dir: str, checks: list[dict], baseline: dict, settings: dict, timeout: int) -> str:
+    """Run Mistral's new and changed tests against the original code, on a clean copy.
+
+    Tests that still pass there don't exercise the change: a guarded assertion, the
+    wrong object under test. Only test commands whose baseline passed and that concern
+    the changed tests are used; pytest, vitest and jest run just the changed test files.
+    """
+    files = gitops.changed_files(wt)
+    tests = [f for f in files if TEST_FILE.search(f)]
+    code = [f for f in files if f not in tests and CODE_FILE.search(f) and not NOT_CODE.search(f)]
+    if not tests or not code:
+        return ""
+    selected = []
+    for check in checks:
+        runner = _test_runner(check["cmd"], settings["test_commands"])
+        measured = check["cmd"] in baseline and baseline[check["cmd"]][0] == 0
+        if runner and measured and vibe.check_applies(check["paths"], [], tests):
+            selected.append((check["cmd"], runner))
+    if not selected:
+        return ""
+    rel_dir = os.path.relpath(run_dir, wt["path"])
+    commands = []
+    for command, runner in selected:
+        if runner in FILE_ARG_RUNNERS and not re.search(r"(^|\s)--(\s|$)|[;&|<>]", command):
+            args = [os.path.relpath(os.path.join(wt["path"], t), run_dir) for t in tests]
+            commands.append((command, command + " " + " ".join(shlex.quote(a) for a in args)))
+        else:
+            commands.append((command, command))
+    gitops.stage_changes(wt)
+    try:
+        patch = gitops.git_checked(wt["path"], "diff", *gitops.DIFF_OPTS, "--cached", "--binary", wt["base"],
+                                   "--", *tests)
+        with gitops.clean_copy(wt, settings["deps_mode"]) as clean:
+            if patch.strip():
+                gitops.git_checked(clean, "apply", "--whitespace=nowarn", "-", input=patch)
+            cwd = clean / rel_dir
+            if not cwd.is_dir():
+                return f"test_strength: not checked ({rel_dir} doesn't exist in the original code)"
+            results = run_checks([run for _orig, run in commands], str(cwd), timeout)
+    except (DelegateError, OSError) as e:
+        return f"test_strength: not checked ({e})"
+    timed_out = [run for run, (code_, _o) in results.items() if code_ == 124]
+    if timed_out:
+        return f"test_strength: not checked ({', '.join(timed_out)} timed out on the original code)"
+    failing = [(run, out) for run, (code_, out) in results.items() if code_ != 0]
+    if not failing:
+        # Every relevant suite passed without Mistral's code changes: its tests didn't notice them.
+        return ("test_strength_warning: Mistral's tests still pass on the original code, without its changes to "
+                + ", ".join(code[:5]) + (" …" if len(code) > 5 else "")
+                + f" ({', '.join(results)}). They don't test the change: look for guarded or missing assertions, "
+                "or the wrong thing under test.")
+    shown = []
+    for run, out in failing[:2]:
+        last = [ln.strip() for ln in out.splitlines() if ln.strip()][-1:] or ["no output"]
+        shown.append(f"{run}: {last[0][:160]}")
+    return ("test_strength: Mistral's tests fail on the original code, as they should (" + "; ".join(shown)
+            + "). If that's an import or setup error rather than an assertion, it proves less.")
 
 
 def measure_baseline(commands: list[str], cwd: str, timeout: int, flaky: list[str]) -> dict:
@@ -411,17 +575,39 @@ def measure_baseline(commands: list[str], cwd: str, timeout: int, flaky: list[st
     return baseline
 
 
+# Folders (relative to the repo) that the linked virtualenv installs in editable mode from the user's
+# checkout: checks put the copy in the folder they run in first on PYTHONPATH.
+EDITABLE_SOURCES: list[str] = []
+
+
+def python_path_env(root: str | None) -> dict | None:
+    if not EDITABLE_SOURCES or not root:
+        return None
+    paths = [str(Path(root, rel)) for rel in EDITABLE_SOURCES]
+    return dict(os.environ, PYTHONPATH=os.pathsep.join(paths + [p for p in [os.environ.get("PYTHONPATH")] if p]))
+
+
 def run_checks(commands: list[str], cwd: str, timeout: int) -> dict[str, tuple[int, str]]:
     """Run every check. Returns {command: (exit code, end of output)}."""
     results = {}
+    env = python_path_env(gitops.toplevel(cwd)) if EDITABLE_SOURCES else None
     for command in commands:
+        # Its own process group, so a timeout also stops what the check started (test workers, servers).
+        proc = subprocess.Popen(command, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, start_new_session=True, env=env)
+        timed_out = False
         try:
-            proc = subprocess.run(command, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  text=True, timeout=timeout, stdin=subprocess.DEVNULL)
-            code, output = proc.returncode, proc.stdout
-        except subprocess.TimeoutExpired as e:
-            code = 124
-            output = (e.output or "") if isinstance(e.output, str) else (e.output or b"").decode(errors="replace")
+            out, _ = proc.communicate(timeout=timeout)
+            code = proc.returncode
+        except subprocess.TimeoutExpired:
+            stop_process_group(proc, grace=2)
+            out, _ = proc.communicate()
+            code, timed_out = 124, True
+        except BaseException:
+            stop_process_group(proc, grace=2)
+            raise
+        output = (out or b"").decode("utf-8", errors="replace")
+        if timed_out:
             output += f"\n[timed out after {timeout}s]"
         results[command] = (code, tail(output))
     return results
@@ -462,8 +648,13 @@ def run_task(args: argparse.Namespace) -> int:
     if args.mode == "read" and (args.verify or args.in_place or args.allow_command or args.scope):
         raise DelegateError("--verify, --allow-command, --scope and --in-place only apply to --mode write.")
 
+    if not Path(workdir).is_dir():
+        raise DelegateError(f"--workdir {workdir} doesn't exist.")
     top = gitops.toplevel(workdir)
     settings = config.load(top or workdir)
+    if settings["errors"]:
+        # Running without the project's settings would also run without its checks and caps.
+        raise DelegateError("Fix the config first (nothing was run):\n" + "\n".join(f"  {e}" for e in settings["errors"]))
     vibe.EXTRA_PRICES.update(settings["model_prices"])
     vibe.WEIGHTS.update(settings["token_weights"])
     if args.policy:
@@ -486,32 +677,52 @@ def run_task(args: argparse.Namespace) -> int:
     deps_mode = args.deps_mode or settings["deps_mode"]
     kind = args.kind or ("search" if args.mode == "read" else "other")
 
-    if shutil.which(args.vibe_bin) is None and not Path(args.vibe_bin).is_file():
+    vibe_path = shutil.which(args.vibe_bin) or (args.vibe_bin if Path(args.vibe_bin).is_file() else None)
+    if vibe_path is None:
         print("status: error\n\nVibe CLI not found. Install it with `uv tool install mistral-vibe` "
               "(or `pip install mistral-vibe`), then run `vibe --setup` once to store your API key.")
         return 2
-
-    active = ledger.running(ledger.load_runs())
-    if len(active) >= settings["max_parallel"]:
-        raise DelegateError(f"{len(active)} delegations are already running (max_parallel = "
-                            f"{settings['max_parallel']}): {', '.join(r['id'] for r in active)}. "
-                            "Wait for one to finish (see --status) or raise max_parallel in the config.")
+    if not os.access(vibe_path, os.X_OK):
+        raise DelegateError(f"{vibe_path} isn't executable (chmod +x it, or point VIBE_BIN at the vibe CLI).")
+    if write and not args.in_place and not top:
+        print("status: error\n\nWrite mode needs a git repository for worktree isolation. "
+              "Pass --in-place to let Vibe edit the directory directly.")
+        return 2
 
     prefix = "read" if not write else ("inplace" if args.in_place else "mistral")
     run_id = f"{prefix}-{uuid.uuid4().hex[:8]}"
+    start = {"event": "start", "id": run_id, "time": time.time(), "pid": os.getpid(),
+             "pid_started": ledger.process_started(os.getpid()), "mode": args.mode, "kind": kind,
+             "repo": Path(top or workdir).name, "workdir": workdir, "task": task[:500], "policy": settings["policy"],
+             "model": model, "scope": scope, "continues": None, "worktree": None}
+    # Counting the running delegations and recording this one happen under one lock, so two runs
+    # started at the same moment can't both slip under max_parallel.
+    with ledger.locked():
+        active = ledger.running(ledger.load_runs())
+        if len(active) >= settings["max_parallel"]:
+            raise DelegateError(f"{len(active)} delegations are already running (max_parallel = "
+                                f"{settings['max_parallel']}): {', '.join(r['id'] for r in active)}. "
+                                "Wait for one to finish (see --status) or raise max_parallel in the config.")
+        ledger.append(start)
 
     run_dir, wt = workdir, None
     if write and not args.in_place:
-        if not top:
-            print("status: error\n\nWrite mode needs a git repository for worktree isolation. "
-                  "Pass --in-place to let Vibe edit the directory directly.")
-            return 2
         try:
             wt = gitops.prepare_worktree(top, args.worktree_name or run_id, snapshot=not args.no_snapshot,
                                          link_deps=not args.no_link_deps, extra_links=args.link,
                                          deps_mode=deps_mode, worktrees_dir=settings["worktrees_dir"])
         except DelegateError as e:
+            ledger.append({"event": "end", "id": run_id, "status": "error", "verification": "not_run",
+                           "error": f"worktree: {e}"[:300]})
             print(f"status: error\n\nCould not prepare the worktree: {e}")
+            return 2
+        if not Path(wt["path"], Path(workdir).relative_to(top)).is_dir():
+            if not wt["reused"]:
+                gitops.remove_worktree(wt)
+            ledger.append({"event": "end", "id": run_id, "status": "error", "verification": "not_run",
+                           "error": "workdir missing in worktree"})
+            print(f"status: error\n\n{Path(workdir).relative_to(top)} isn't in the worktree: it is untracked or "
+                  "ignored in your checkout. Run from a tracked folder, or drop --no-snapshot.")
             return 2
         run_dir = str(Path(wt["path"]) / Path(workdir).relative_to(top))
         # New files named literally in the scope get their folders up front, so writing them can't fail on that.
@@ -530,10 +741,9 @@ def run_task(args: argparse.Namespace) -> int:
     # A follow-up is listed under the task it continues, not under its resume message.
     original = (ledger.load_runs().get(continues) or {}).get("task") if continues else None
     label = f"{original.split(' [follow-up')[0]} [follow-up]" if original else task
-    ledger.append({"event": "start", "id": run_id, "pid": os.getpid(), "mode": args.mode, "kind": kind,
-                   "repo": Path(top or workdir).name, "workdir": workdir, "task": label[:500],
-                   "policy": settings["policy"], "model": model, "scope": scope, "continues": continues,
-                   "worktree": {k: wt[k] for k in ("name", "path", "toplevel", "base", "links")} if wt else None})
+    # The full start record, now that the worktree and the run it continues are known.
+    ledger.append(dict(start, task=label[:500], continues=continues,
+                       worktree={k: wt[k] for k in ("name", "path", "toplevel", "base", "links")} if wt else None))
 
     # The guard hook refuses disallowed tool calls with an error Mistral can work around,
     # instead of letting Vibe's approval prompt cancel the session.
@@ -541,24 +751,51 @@ def run_task(args: argparse.Namespace) -> int:
     guard_log = ledger.runs_dir() / f"{run_id}.guard.jsonl"
     guard_log.parent.mkdir(parents=True, exist_ok=True)
     guard_warning = guard.install(vibe.vibe_home(), config.home())
+    run = Run(args)
+    run.run_id = run_id
+    # Vibe passes its environment on to hooks: the guard finds this run's policy by this id.
+    EDITABLE_SOURCES[:] = gitops.editable_sources(top, wt.get("links") or []) if wt else []
+    run.env = dict(python_path_env(wt["path"] if wt else None) or os.environ, **{guard.RUN_ENV: run_id})
     if not guard_warning:
         default_cmds = vibe.DEFAULT_BASH_ALLOWLIST if write else []
-        guard.write_policy(run_dir, {
+        run.guard_policy = {
             "run_id": run_id, "root": guard_root, "mode": args.mode, "scope": scope,
             "allow_commands": default_cmds + allow_commands, "default_commands": default_cmds,
             "allow_shell": args.allow_shell, "log": str(guard_log),
-            "expires": time.time() + args.timeout * (fix_attempts + 1) + args.verify_timeout * 3 + 600,
-        }, config.home())
+            # Dependency folders and --link paths come from the checkout (links, hard links): never written to.
+            "protected": list((wt or {}).get("links") or []),
+        }
+    # A stopped wrapper (a timeout in the calling tool, a closed terminal) still ends Vibe and records the run.
+    previous = {sig: signal.signal(sig, _exit_on_signal) for sig in (signal.SIGTERM, signal.SIGHUP)}
     try:
         return execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps, model, write, verify,
-                       allow_commands, scope, fix_attempts, baseline_on, kind, guard_log, guard_warning, guard_root)
+                       allow_commands, scope, fix_attempts, baseline_on, kind, guard_log, guard_warning, guard_root,
+                       run)
+    except BaseException as e:
+        interrupted = isinstance(e, (SystemExit, KeyboardInterrupt))
+        ledger.append({"event": "end", "id": run_id, "status": "interrupted" if interrupted else "error",
+                       "verification": "not_run", "cost": run.spent or None, "cost_estimated": True,
+                       "effective": run.effective, "session_id": run.session_id,
+                       "error": (f"{e.__class__.__name__}: {e}")[:300]})
+        if interrupted or isinstance(e, DelegateError):
+            raise
+        print(f"status: error\n\nrun_id: {run_id}\nUnexpected error: {e.__class__.__name__}: {e}\n"
+              + "".join(traceback.format_exception(type(e), e, e.__traceback__)[-3:]).rstrip())
+        return 2
     finally:
         guard.remove_policy(run_dir, run_id, config.home())
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _exit_on_signal(signum, _frame) -> None:
+    raise SystemExit(128 + signum)
 
 
 def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps, model, write, verify,
-            allow_commands, scope, fix_attempts, baseline_on, kind, guard_log, guard_warning, guard_root) -> int:
-    started_wall, started = time.time(), time.monotonic()
+            allow_commands, scope, fix_attempts, baseline_on, kind, guard_log, guard_warning, guard_root,
+            run: "Run") -> int:
+    started = time.monotonic()
     # Only the checks that concern this run: ones limited to paths outside the scope are skipped.
     planned = [c for c in verify if vibe.check_applies(c["paths"], scope, [])]
     commands = [c["cmd"] for c in planned]
@@ -600,7 +837,6 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     agent = args.agent or vibe.write_agent_profile(args.mode, model, vibe_allow)
     trust = args.trust or wt is not None
 
-    run = Run(args)
     stats_before = vibe.read_session_stats(args.resume, run_dir, model_hint=model) if args.resume else None
 
     run.guard_log = None if guard_warning else guard_log
@@ -609,6 +845,10 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     def vibe_call(text: str, share: float) -> None:
         """One Vibe call with `share` of the caps, enforced by the wrapper. If a money cap is set, Vibe gets
         it too; its --max-price counts the whole session, so a resumed session gets what it already spent on top."""
+        if run.guard_policy:
+            # Active for this call only: a Vibe that outlives the wrapper finds no live policy and is refused.
+            guard.write_policy(run_dir, dict(run.guard_policy, expires=time.time() + args.timeout + 300),
+                               config.home())
         vibe_caps = dict(caps)
         if caps.get("max_price") is not None:
             session_cost = vibe.stats_cost(vibe.read_session_stats(run.session_id, run_dir, model_hint=model)) \
@@ -622,7 +862,14 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                       max_price=caps["max_price"] * share if caps.get("max_price") is not None else None,
                       model_hint=model)
 
-    vibe_call(prompt, 1.0)
+    # In place, only what changes from now on is Mistral's: the checkout may hold the user's own uncommitted work.
+    inplace_root = (top or workdir) if write and not wt else None
+    inplace_before = gitops.checkout_state(inplace_root) if inplace_root else {}
+
+    def inplace_changes() -> list[str]:
+        return gitops.changed_since(inplace_root, inplace_before) if inplace_root else []
+
+    vibe_call(prompt if args.resume else prompt + "\n\n" + vibe.run_marker(run_id), 1.0)
     continued, summary_note = 0, ""
 
     verification, results, failures, attempts = "not_run", {}, [], 0
@@ -640,8 +887,10 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         if failures and autofixes:
             # Formatting-type failures are fixed by a command, not by another Mistral round.
             for command in autofixes:
-                code, _out = run_checks([command], run_dir, args.verify_timeout)[command]
-                autofixed.append(command + ("" if code == 0 else f" (exit {code})"))
+                code, out = run_checks([command], run_dir, args.verify_timeout)[command]
+                tail_lines = [ln.strip() for ln in out.splitlines() if ln.strip()][-2:]
+                autofixed.append(command + ("" if code == 0 else
+                                            f" (exit {code}: {' / '.join(tail_lines)[:240] or 'no output'})"))
             results = run_checks(commands, run_dir, args.verify_timeout)
             failures = new_failures(results, baseline)
 
@@ -656,7 +905,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
 
     missing = missing_new_files() if write else []
     if run.status == "ok" and (run.unfinished or missing):
-        changed_now = gitops.changed_files(wt) if wt else [ln[3:] for ln in git(workdir, "status", "--porcelain").splitlines()]
+        changed_now = gitops.changed_files(wt) if wt else inplace_changes()
         # Asking Mistral to finish costs a round; it's only worth it when the work looks unfinished:
         # files the task named are missing, checks fail, nothing changed, or there are no checks to tell.
         follow_up = None
@@ -688,15 +937,21 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
             verification = "passed_except_preexisting"
         else:
             verification = "passed"
+    strength_line = ""
+    if (settings["test_strength"] and wt and verification in ("passed", "passed_except_preexisting")
+            and run.status in ("ok", "budget_exceeded", "tool_call_limit")):
+        strength_line = test_strength(wt, run_dir, [c for c in verify if c["cmd"] in commands], baseline,
+                                      settings, args.verify_timeout)
     elapsed = time.monotonic() - started
 
-    stats_after = vibe.read_session_stats(run.session_id, run_dir, since=None if run.session_id else started_wall,
-                                          model_hint=model)
+    # Without a session id (Vibe was stopped before printing one), only the snapshot the watcher
+    # identified counts; the newest session in the directory may be a parallel run's.
+    stats_after = (vibe.read_session_stats(run.session_id, run_dir, model_hint=model) if run.session_id
+                   else run.last_snap)
     run.session_id = run.session_id or (stats_after or {}).get("session_id")
     use = vibe.usage(stats_after, stats_before)
 
-    files_now = (gitops.changed_files(wt) if wt else
-                 [line[3:] for line in git(workdir, "status", "--porcelain").splitlines()] if write else [])
+    files_now = gitops.changed_files(wt) if wt else inplace_changes()
     if run.cancelled and run.status in ("ok", "error"):
         run.status = "stopped_by_refusal"
     elif write and run.status == "ok" and not files_now:
@@ -706,14 +961,22 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     guard_events = guard.read_log(guard_log)
 
     lines = [f"run_id: {run_id}", f"status: {run.status}"]
+    for warning in settings["warnings"]:
+        lines.append(f"config_warning: {warning}")
+    if run.unmetered and (run.tool_calls or run.live_tool_calls or run.final_text):  # Vibe did work unwatched
+        lines.append("budget_warning: the wrapper couldn't find this run's Vibe session, so its token and price caps "
+                     "weren't enforced for at least one call (tool calls were still capped by the guard, and turns "
+                     "by Vibe). Check session_logging in Vibe's config.toml.")
     if run.status == "no_changes":
         lines.append("note: Mistral finished without changing any file. Read its result below to see why.")
     if run.status == "incomplete":
         lines.append("missing_files (named in --scope but never created; passing checks don't cover them): "
                      + ", ".join(missing))
     if run.status in ("budget_exceeded", "tool_call_limit"):
-        lines.append(f"note: the wrapper {run.limit_note}. The work so far is in the worktree: review it, "
-                     "--resume with a higher --max-price/--max-tool-calls, or discard it.")
+        lines.append(f"note: the wrapper {run.limit_note}. "
+                     + ("The work so far is in the worktree: review it, --resume with a higher " if wt else
+                        "Review what it found, or --resume with a higher ")
+                     + (run.limit_flag or "--token-budget") + (", or discard it." if wt else "."))
     if settings.get("continues"):
         lines.append(f"continues: {settings['continues']} (same worktree). This run's id and the earlier one "
                      "both refer to everything in the worktree; --adopt or --discard either settles both.")
@@ -735,6 +998,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append("checks_skipped (limited to paths this run doesn't touch): " + ", ".join(skipped_checks))
     if flaky:
         lines.append("flaky_checks (failed, then passed on a rerun before Mistral started): " + ", ".join(flaky))
+    if strength_line:
+        lines.append(strength_line)
     if summary_note:
         lines.append("note: " + summary_note)
     elif run.unfinished:
@@ -801,10 +1066,10 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         else:
             lines += worktree_section(wt, run_id, files, out_of_scope, args.diff_lines)
     elif write:
-        status_out = git(workdir, "status", "--porcelain").rstrip()
-        files = [line[3:] for line in status_out.splitlines()]
+        files = files_now
         out_of_scope = [f for f in files if scope and not vibe.matches_scope(f, scope)]
-        lines.append("changed_files (in your checkout):\n" + (status_out or "  (none)"))
+        lines.append("changed_files (in your checkout, by this run; your earlier uncommitted changes aren't "
+                     "listed):\n" + ("\n".join(f"  {f}" for f in files) or "  (none)"))
         if out_of_scope:
             lines.append("out_of_scope_changes (in your checkout, outside --scope; revert them if unwanted): "
                          + ", ".join(out_of_scope))
@@ -914,10 +1179,21 @@ def worktree_section(wt: dict, run_id: str, files: list[str], out_of_scope: list
     else:
         lines.append(f"worktree_base: your HEAD at {wt['base'][:12]}")
     if wt.get("links"):
-        how = {"hardlink": "hard-linked copies", "copy": "copies", "symlink": "symlinks"}.get(wt.get("deps_mode"), "linked")
-        lines.append(f"dependencies ({how} from your checkout): " + ", ".join(wt["links"]))
+        labels = {"clone": "copy-on-write clones", "hardlink": "hard-linked copies", "copy": "copies",
+                  "symlink": "symlinks"}
+        methods = wt.get("deps_methods") or {}
+        groups: dict[str, list[str]] = {}
+        for link in wt["links"]:
+            how = methods.get(link) or wt.get("deps_mode")
+            groups.setdefault(labels.get(how, "linked"), []).append(link)
+        for label, links in groups.items():
+            lines.append(f"dependencies ({label} from your checkout): " + ", ".join(links))
     for note in wt.get("notes") or []:
         lines.append(f"dependency_note: {note}")
+    if EDITABLE_SOURCES:
+        lines.append("python_path: your virtualenv installs " + ", ".join(EDITABLE_SOURCES) + " in editable mode "
+                     "from your checkout; checks and Mistral's commands put the worktree's copy first on PYTHONPATH, "
+                     "so they test Mistral's code")
     stat = gitops.changes_stat(wt)
     lines.append("changes_by_vibe:\n" + (stat or "  (none)"))
     if files:
@@ -947,7 +1223,9 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
         if args.status:
-            print(ledger.format_status(ledger.load_runs()))
+            top = gitops.toplevel(str(Path(args.workdir).resolve()))
+            currency = config.load(top or args.workdir)["currency"]
+            print(ledger.format_status(ledger.load_runs(), currency=currency))
             return 0
         if args.stats:
             settings = config.load(gitops.toplevel(str(Path(args.workdir).resolve())) or args.workdir)

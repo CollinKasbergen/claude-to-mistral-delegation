@@ -6,6 +6,7 @@ Run with: python3 -m unittest discover -s tests
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -84,6 +85,10 @@ FAKE_VIBE = textwrap.dedent('''\
         json.dump({"session_id": session_id, "environment": {"working_directory": cwd}, "stats": stats},
                   open(meta_path, "w"))
 
+    if os.environ.get("FAKE_VIBE_CHILD"):
+        import subprocess as _sp
+        child = _sp.Popen(["sleep", "300"])  # a test server or watcher Vibe started
+        open(os.environ["FAKE_VIBE_CHILD"], "w").write(str(child.pid))
     if os.environ.get("FAKE_VIBE_SPEND") or os.environ.get("FAKE_VIBE_EFFECTS"):
         import time as _t
         sdir = os.path.join(root, "unified", session_id)
@@ -159,6 +164,9 @@ FAKE_VIBE = textwrap.dedent('''\
                dict(entry, id="old-b", type="effect", title="Run command",
                     detail={"kind": "shell", "toolName": "bash", "input": {"command": "rm -rf /tmp/x"}},
                     state={"status": "skipped", "reason": "denied", "display": {}})] if resumed else []
+    if resumed and os.environ.get("FAKE_VIBE_OLD_CANCEL"):
+        history.append(dict(entry, id="old-a", type="message", role="assistant", content=[
+            {"type": "text", "text": "<user_cancellation>User cancelled the operation.</user_cancellation>"}]))
     print(json.dumps(history + turn, indent=2))
 ''')
 
@@ -189,7 +197,8 @@ class DelegateTestBase(unittest.TestCase):
                     "MISTRAL_DELEGATE_MAX_TURNS", "MISTRAL_DELEGATE_WORKTREES", "FAKE_VIBE_STORAGE",
                     "FAKE_VIBE_TOUCH_APP", "FAKE_VIBE_HOOK_CALLS", "FAKE_VIBE_NO_WRITE", "FAKE_VIBE_CANCEL",
                     "FAKE_VIBE_MODEL", "FAKE_VIBE_EXPERIMENT_PRICE", "FAKE_VIBE_SPEND", "FAKE_VIBE_EFFECTS",
-                    "FAKE_VIBE_UNFINISHED", "FAKE_VIBE_CACHED", "FAKE_VIBE_CACHED_COMPLETION", "FAKE_VIBE_REWRITE_NOTICES"):
+                    "FAKE_VIBE_UNFINISHED", "FAKE_VIBE_CACHED", "FAKE_VIBE_CACHED_COMPLETION", "FAKE_VIBE_REWRITE_NOTICES",
+                    "FAKE_VIBE_CHILD", "FAKE_VIBE_OLD_CANCEL", "GIT_CONFIG_GLOBAL"):
             self.env.pop(var, None)
 
     def tearDown(self):
@@ -390,7 +399,7 @@ class WriteModeTest(DelegateTestBase):
         self.assertEqual(out.returncode, 0, out.stdout)
         results = self.last()["hook_results"]
         self.assertEqual(results[0]["decision"], "deny")
-        self.assertIn("`node` isn't allowed", results[0]["reason"])
+        self.assertIn("`node -e 1` isn't allowed", results[0]["reason"])
         self.assertTrue(results[1]["hook_specific_output"]["tool_input"]["path"].endswith("/app.py"))
         self.assertIsNone(results[2])
         self.assertIn("guard: checked 3 tool calls, refused 1", out.stdout)
@@ -537,7 +546,8 @@ class WriteModeTest(DelegateTestBase):
         out = self.run_delegate("--mode", "write", "--token-budget", "300000", "Task",
                                 FAKE_VIBE_STORAGE="unified", FAKE_VIBE_SPEND="1", FAKE_VIBE_EFFECTS="1")
         self.assertIn("status: budget_exceeded", out.stdout)
-        self.assertIn("over this call's budget of 300,000", out.stdout)
+        self.assertIn("over this call's token_budget of 300,000", out.stdout)
+        self.assertIn("--resume with a higher --token-budget", out.stdout)
         calls = int(out.stdout.split("tool calls: ")[1].split(",")[0].split("\n")[0])
         self.assertGreater(calls, 0)  # counted live, although Vibe printed nothing
 
@@ -634,6 +644,162 @@ class WriteModeTest(DelegateTestBase):
         self.assertEqual(out.returncode, 1)
         self.assertIn("status: incomplete", out.stdout)
         self.assertIn("missing_files (named in --scope but never created", out.stdout)
+
+    def test_failed_autofix_shows_why(self):
+        (self.repo / ".mistral-delegate.toml").write_text(
+            "autofix = [\"echo 'eslint: 2 problems (2 errors)'; exit 1\"]\n")
+        out = self.run_delegate("--mode", "write", "--fix-attempts", "0", "--verify", "test ! -f test_app.py", "Task")
+        self.assertIn("(exit 1: eslint: 2 problems (2 errors))", out.stdout)
+
+    def test_weak_tests_are_flagged(self):
+        (self.repo / ".mistral-delegate.toml").write_text('test_commands = ["test ! -f nothing_here"]\n')
+        out = self.run_delegate("--mode", "write", "--verify", "test ! -f nothing_here", "Task",
+                                FAKE_VIBE_TOUCH_APP="1")
+        self.assertIn("test_strength_warning: Mistral's tests still pass on the original code", out.stdout)
+        self.assertIn("app.py", out.stdout.split("test_strength_warning")[1].split("\n")[0])
+
+    def test_tests_that_need_the_change_pass_the_strength_check(self):
+        (self.repo / ".mistral-delegate.toml").write_text('test_commands = ["test ! -f test_app.py"]\n')
+        out = self.run_delegate("--mode", "write", "--verify", "test ! -f test_app.py || grep -q 'changed by vibe' app.py",
+                                "Task", FAKE_VIBE_TOUCH_APP="1")
+        self.assertIn("verification: passed", out.stdout)
+        self.assertIn("test_strength: Mistral's tests fail on the original code, as they should", out.stdout)
+
+    def test_strength_check_needs_both_suites_to_pass_to_warn(self):
+        (self.repo / ".mistral-delegate.toml").write_text('test_commands = ["test ! -f"]\n')
+        out = self.run_delegate("--mode", "write", "--verify", "test ! -f nothing_here",
+                                "--verify", "test ! -f test_app.py || grep -q 'changed by vibe' app.py",
+                                "Task", FAKE_VIBE_TOUCH_APP="1")
+        self.assertNotIn("test_strength_warning", out.stdout)  # the unrelated suite passing proves nothing
+        self.assertIn("as they should", out.stdout)
+
+    def test_strength_check_skips_non_test_commands_and_unmeasured_baselines(self):
+        out = self.run_delegate("--mode", "write", "--verify", "test ! -f nothing_here", "Task",
+                                FAKE_VIBE_TOUCH_APP="1")
+        self.assertNotIn("test_strength", out.stdout)  # `test -f` isn't a test runner
+        (self.repo / ".mistral-delegate.toml").write_text('test_commands = ["test ! -f"]\nbaseline = false\n')
+        out = self.run_delegate("--mode", "write", "--verify", "test ! -f nothing_here", "Task",
+                                FAKE_VIBE_TOUCH_APP="1")
+        self.assertNotIn("test_strength", out.stdout)  # no baseline: unknown whether it passed before
+
+    def test_tests_only_changes_skip_the_strength_check(self):
+        (self.repo / ".mistral-delegate.toml").write_text('test_commands = ["test ! -f"]\n')
+        out = self.run_delegate("--mode", "write", "--verify", "test ! -f nothing_here", "Task")
+        self.assertNotIn("test_strength", out.stdout)
+
+    def test_a_worktree_the_user_made_is_never_reused(self):
+        self.git("-c", "user.email=t@t", "-c", "user.name=t", "worktree", "add", "-q", "-b", "feat",
+                 str(self.tmpdir / "feat"))
+        (self.tmpdir / "feat" / "wip.py").write_text("work in progress\n")
+        for name in ("feat", self.git("branch", "--show-current").strip()):
+            with self.subTest(name=name):
+                out = self.run_delegate("--mode", "write", "--worktree-name", name, "Task")
+                self.assertEqual(out.returncode, 2)
+                self.assertIn("worktree mistral-delegate didn't create", out.stdout)
+        self.assertEqual(self.calls(), [])
+        self.assertTrue((self.tmpdir / "feat" / "wip.py").exists())
+        self.assertNotIn("wip.py", self.git("-C", str(self.tmpdir / "feat"), "diff", "--cached", "--name-only"))
+
+    def test_adopt_and_discard_wait_for_a_resume_in_the_same_worktree(self):
+        first = self.run_delegate("--mode", "write", "Task")
+        run_id = self.value(first, "run_id")
+        runs = [json.loads(line) for line in (self.home / "ledger.jsonl").read_text().splitlines()]
+        worktree = next(e["worktree"] for e in runs if e.get("event") == "start" and e.get("worktree"))
+        with open(self.home / "ledger.jsonl", "a") as f:  # a resume of it, still running (this process)
+            f.write(json.dumps({"event": "start", "id": "mistral-resume1", "pid": os.getpid(), "mode": "write",
+                                "time": time.time(), "worktree": worktree}) + "\n")
+        for flag in ("--adopt", "--discard"):
+            with self.subTest(flag=flag):
+                out = self.run_delegate(flag, run_id)
+                self.assertEqual(out.returncode, 2)
+                self.assertIn("mistral-resume1 is still working in this run's worktree", out.stdout)
+        self.assertTrue(Path(worktree["path"]).is_dir())
+
+    def test_user_git_settings_dont_break_runs_or_adopt(self):
+        gitconfig = self.tmpdir / "gitconfig"
+        gitconfig.write_text("[diff]\n\tnoprefix = true\n\texternal = false\n[color]\n\tui = always\n"
+                             "[core]\n\tquotePath = true\n")
+        (self.repo / "app.py").write_text("print('dirty')\n")  # snapshot needs a diff
+        out = self.run_delegate("--mode", "write", "Task", GIT_CONFIG_GLOBAL=str(gitconfig))
+        self.assertEqual(out.returncode, 0, out.stdout)
+        adopt = self.run_delegate("--adopt", self.value(out, "run_id"), GIT_CONFIG_GLOBAL=str(gitconfig))
+        self.assertEqual(adopt.returncode, 0, adopt.stdout)
+        self.assertTrue((self.repo / "test_app.py").exists())
+
+    def test_hard_linked_dependencies_skip_build_info_and_are_protected(self):
+        (self.repo / "node_modules" / ".tmp").mkdir()
+        (self.repo / "node_modules" / ".tmp" / "tsconfig.app.tsbuildinfo").write_text("user\n")
+        (self.repo / "node_modules" / "left-pad" / "index.js").write_text("module.exports = 1\n")
+        calls = [["write_file", {"path": "node_modules/left-pad/index.js", "content": "changed"}]]
+        out = self.run_delegate("--mode", "write", "--deps-mode", "hardlink", "Task",
+                                FAKE_VIBE_HOOK_CALLS=json.dumps(calls))
+        wt = Path(self.value(out, "worktree_path"))
+        self.assertFalse((wt / "node_modules" / ".tmp").exists())
+        self.assertTrue((wt / "node_modules" / "left-pad" / "index.js").exists())
+        self.assertEqual(self.last()["hook_results"][0]["decision"], "deny")
+        self.assertIn("shared with the user's checkout", self.last()["hook_results"][0]["reason"])
+
+    def test_stopping_vibe_at_a_cap_stops_what_it_started(self):
+        (self.repo / ".mistral-delegate.toml").write_text("[write]\ntoken_budget = 300000\n")
+        pid_file = self.tmpdir / "child.pid"
+        out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_STORAGE="unified", FAKE_VIBE_SPEND="1",
+                                FAKE_VIBE_CHILD=str(pid_file))
+        self.assertIn("status: budget_exceeded", out.stdout)
+        pid = int(pid_file.read_text())
+        deadline = time.time() + 5
+        while time.time() < deadline and _alive(pid):
+            time.sleep(0.05)
+        self.assertFalse(_alive(pid), "the child Vibe started is still running")
+
+    def test_a_stopped_wrapper_stops_vibe_and_records_the_run(self):
+        pid_file = self.tmpdir / "child.pid"
+        env = dict(self.env, FAKE_VIBE_BEHAVIOUR="ok", FAKE_VIBE_STORAGE="unified", FAKE_VIBE_EFFECTS="1",
+                   FAKE_VIBE_CHILD=str(pid_file))
+        proc = subprocess.Popen([sys.executable, str(SCRIPT), "--workdir", str(self.repo), "--mode", "write", "Task"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        deadline = time.time() + 10
+        while time.time() < deadline and not pid_file.exists():
+            time.sleep(0.05)
+        time.sleep(0.2)
+        proc.terminate()
+        proc.communicate(timeout=30)
+        pid = int(pid_file.read_text())
+        deadline = time.time() + 5
+        while time.time() < deadline and _alive(pid):
+            time.sleep(0.05)
+        self.assertFalse(_alive(pid))
+        status = self.run_delegate("--status")
+        self.assertIn("interrupted", status.stdout)
+        self.assertEqual(list((self.home / "guards" / "runs").glob("*.json")), [])
+
+    def test_an_earlier_refusal_doesnt_mark_a_resume_as_refused(self):
+        first = self.run_delegate("--mode", "write", "Task")
+        name = self.value(first, "worktree_name")
+        out = self.run_delegate("--mode", "write", "--worktree-name", name, "--resume", "sess-1234567890",
+                                "Go on", FAKE_VIBE_OLD_CANCEL="1")
+        self.assertIn("status: ok", out.stdout)
+
+    def test_a_broken_config_stops_the_run(self):
+        (self.repo / ".mistral-delegate.toml").write_text('verify = ["false"]\npolicy = balanced\n')
+        out = self.run_delegate("--mode", "write", "Task")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("Fix the config first", out.stdout)
+        self.assertIn(".mistral-delegate.toml", out.stdout)
+        self.assertEqual(self.calls(), [])
+
+    def test_config_mistakes_are_reported_in_the_run(self):
+        (self.repo / ".mistral-delegate.toml").write_text(
+            'verfy = ["npm test"]\nmax_price = 0.5\nfix_after_cap = "false"\n'
+            '[write]\nmax_price = "cheap"\nmax-price = 2\ntoken_budget = 500000\n')
+        out = self.run_delegate("--mode", "write", "Task")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        report = out.stdout
+        self.assertIn("config_warning: ignored unknown setting 'verfy'", report)
+        self.assertIn("config_warning: ignored max_price in", report)
+        self.assertIn("caps go under [write] or [read]", report)
+        self.assertIn("config_warning: ignored [write].max_price = 'cheap'", report)
+        self.assertIn("config_warning: ignored unknown setting [write] 'max-price'", report)
+        self.assertIn("first pass at 500,000 effective tokens", report)
 
     def test_no_changes_is_its_own_status(self):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_NO_WRITE="1")
@@ -753,6 +919,32 @@ class WriteModeTest(DelegateTestBase):
         self.assertEqual(res.returncode, 0, res.stdout)
         self.assertTrue((self.repo / "other.py").exists())
         self.assertFalse((self.repo / "test_app.py").exists())
+        self.assertTrue((wt / "test_app.py").exists())  # the rest stays in the kept worktree
+        self.assertIn(f"--discard {run_id} removes it", res.stdout)
+        self.run_delegate("--discard", run_id)
+        self.assertFalse(wt.exists())
+        self.assertIn("partial", self.run_delegate("--status").stdout)  # still counted as partly adopted
+
+    def test_adopt_paths_are_scope_checked_like_git_reads_them(self):
+        out = self.run_delegate("--mode", "write", "--scope", "test_*.py", "Task", FAKE_VIBE_TOUCH_APP="1")
+        res = self.run_delegate("--adopt", self.value(out, "run_id"), "--paths", ".")
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("app.py", res.stdout)
+        self.assertNotIn("# changed by vibe", (self.repo / "app.py").read_text())
+
+    def test_a_resume_after_a_kept_adopt_can_be_adopted(self):
+        first = self.run_delegate("--mode", "write", "Task")
+        name = self.value(first, "worktree_name")
+        adopt = self.run_delegate("--adopt", self.value(first, "run_id"), "--keep-worktree")
+        self.assertEqual(adopt.returncode, 0, adopt.stdout)
+        wt = Path(self.value(first, "worktree_path"))
+        (wt / "later.py").write_text("z = 3\n")
+        second = self.run_delegate("--mode", "write", "--worktree-name", name, "--resume", "sess-1234567890",
+                                   "More", FAKE_VIBE_NO_WRITE="1")
+        res = self.run_delegate("--adopt", self.value(second, "run_id"))
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertTrue((self.repo / "later.py").exists())
+        self.assertNotIn("test_app.py", res.stdout)  # applied the first time
 
     def test_discard_removes_worktree_and_records_note(self):
         out = self.run_delegate("--mode", "write", "--kind", "feature", "Task")
@@ -806,12 +998,18 @@ class WriteModeTest(DelegateTestBase):
         self.assertIn("pkg/test_app.py", out.stdout)
 
     def test_allow_shell_and_in_place(self):
-        out = self.run_delegate("--mode", "write", "--in-place", "--allow-shell", "Fix it")
+        (self.repo / "app.py").write_text("print('my own edit')\n")  # the user's uncommitted work
+        (self.repo / "NOTES.txt").write_text("mine\n")
+        out = self.run_delegate("--mode", "write", "--in-place", "--allow-shell", "--scope", "test_app.py", "Fix it")
         argv = self.last()["argv"]
         self.assertIn("--auto-approve", argv)
         self.assertNotIn("--trust", argv)
         self.assertTrue((self.repo / "test_app.py").exists())
-        self.assertIn("?? test_app.py", out.stdout)
+        changed = out.stdout.split("changed_files")[1].split("\n\n")[0]
+        self.assertIn("  test_app.py", changed)
+        self.assertNotIn("app.py\n", changed.replace("test_app.py", ""))
+        self.assertNotIn("NOTES.txt", out.stdout)
+        self.assertNotIn("out_of_scope_changes", out.stdout)
 
     def test_failed_run_removes_untouched_worktree(self):
         out = self.run_delegate("--mode", "write", "--worktree-name", "mistral-err", "Task", behaviour="error")
@@ -889,6 +1087,25 @@ class ConfigTest(DelegateTestBase):
         self.assertEqual(self.calls(), [])
 
 
+class EditableInstallTest(DelegateTestBase):
+    def test_checks_import_the_worktrees_copy_of_an_editable_package(self):
+        (self.repo / ".gitignore").write_text("node_modules/\n.venv/\n")
+        (self.repo / "src" / "pkg").mkdir(parents=True)
+        (self.repo / "src" / "pkg" / "__init__.py").write_text("VALUE = 'user'\n")
+        self.git("add", "-A")
+        self.git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "pkg")
+        site = self.repo / ".venv" / "lib" / "python3.11" / "site-packages"
+        site.mkdir(parents=True)
+        (site / "__editable__.pkg.pth").write_text(str(self.repo / "src") + "\n")
+        check = "python3 -c \"import pkg, sys; sys.exit(0 if pkg.VALUE == 'user' else 3)\""
+        # Without the fix, the check would import the checkout's pkg; the worktree's copy says 'mistral'.
+        out = self.run_delegate("--mode", "write", "--no-baseline", "--fix-attempts", "0", "--verify",
+                                "sed -i s/user/mistral/ src/pkg/__init__.py; " + check.replace("'user'", "'mistral'"),
+                                "Task", PYTHONPATH="")
+        self.assertIn("python_path: your virtualenv installs src in editable mode", out.stdout)
+        self.assertIn("verification: passed", out.stdout)
+
+
 class HookTest(DelegateTestBase):
     def run_hook(self, env=None):
         out = subprocess.run([sys.executable, str(HOOK)], input=json.dumps({"cwd": str(self.repo)}),
@@ -924,8 +1141,16 @@ class HookTest(DelegateTestBase):
 
     def test_session_start_without_vibe(self):
         env = dict(self.env, PATH="/usr/bin:/bin")
+        env.pop("VIBE_BIN")
         context = self.run_hook(env)
         self.assertIn("not installed", context)
+        context = self.run_hook(dict(env, VIBE_BIN=str(self.vibe)))  # vibe outside PATH, named by VIBE_BIN
+        self.assertNotIn("not installed", context)
+
+    def test_session_start_mentions_a_broken_config(self):
+        (self.repo / ".mistral-delegate.toml").write_text("policy = balanced\n")
+        context = self.run_hook(self.env)
+        self.assertIn("Config problem", context)
 
 
 
@@ -963,16 +1188,18 @@ class GuardPolicyTest(unittest.TestCase):
 
     def test_refused_commands_explain_why(self):
         cases = {
-            "node -e 'console.log(1)'": "`node` isn't allowed",
-            "sed -i s/a/b/ frontend/src/router/index.ts": "`sed` isn't allowed",
-            "sed -n 'w out.txt' frontend/src/router/index.ts": "`sed` isn't allowed",
-            "sed 's/a/b/w out.txt' frontend/src/router/index.ts": "`sed` isn't allowed",
-            "sed -n -f script.sed frontend/src/router/index.ts": "`sed` isn't allowed",
-            "sed -n '1e rm -rf x' frontend/src/router/index.ts": "`sed` isn't allowed",
-            "sed -ie 's/a/b/' frontend/src/router/index.ts": "`sed` isn't allowed",
-            "sed -n '1r /etc/passwd' frontend/src/router/index.ts": "`sed` isn't allowed",
-            "ls; rm -rf frontend": "`rm` isn't allowed",
-            "ls\nrm -rf frontend": "`rm` isn't allowed",
+            "node -e 'console.log(1)'": "`node -e console.log(1)` isn't allowed",
+            "sed -i s/a/b/ frontend/src/router/index.ts": "`-i` edits files in place",
+            "sed -n 'w out.txt' frontend/src/router/index.ts": "isn't print-only",
+            "sed 's/a/b/w out.txt' frontend/src/router/index.ts": "isn't print-only",
+            "sed -n -f script.sed frontend/src/router/index.ts": "`-f` runs a script file",
+            "sed -n '1e rm -rf x' frontend/src/router/index.ts": "isn't print-only",
+            "sed -ie 's/a/b/' frontend/src/router/index.ts": "`-i` edits files in place",
+            "sed -n '1r /etc/passwd' frontend/src/router/index.ts": "isn't print-only",
+            "sed --in-place s/a/b/ frontend/x.ts": "`--in-place` edits files",
+            "sed -x p frontend/x.ts": "isn't one of the allowed sed options",
+            "ls; rm -rf frontend": "`rm -rf frontend` isn't allowed",
+            "ls\nrm -rf frontend": "`rm -rf frontend` isn't allowed",
             "echo $(whoami)": "Command substitution",
             "cat `ls`": "Command substitution",
             "ls > out.txt": "Redirection",
@@ -980,7 +1207,7 @@ class GuardPolicyTest(unittest.TestCase):
             "cat /etc/passwd": "outside the project",
             "cat ../../secret": "outside the project",
             "find . -name '*.ts' -delete": "-exec/-delete",
-            "env rm x": "`env` isn't allowed",
+            "env rm x": "`env rm x` isn't allowed",
         }
         for command, expected in cases.items():
             with self.subTest(command=command):
@@ -998,6 +1225,77 @@ class GuardPolicyTest(unittest.TestCase):
         self.assertIn("isn't allowed", guard.check_shell("uv run --no-sync python -c 1", policy, self.root))
         self.assertIn("outside the project", guard.check_shell("uv run --directory /etc pytest", policy, self.root))
 
+    def test_options_that_run_code_or_write_are_refused(self):
+        policy = dict(self.policy, allow_commands=self.policy["allow_commands"]
+                      + ["uv run pytest", "sort", "uniq", "tree", "git log", "diff"])
+        cases = {
+            "npm test --node-options=--require=./x.js": "`--node-options` isn't allowed",
+            "npm --script-shell=./x.sh test": "`--script-shell`",
+            "npm --userconfig=./npmrc test": "`--userconfig`",
+            "npx --package=evil vitest run": "`--package`",
+            "uv run --with requests pytest": "`--with` of `uv run`",
+            "uv run --python 3.9 pytest": "`--python` of `uv run`",
+            "GIT_EXTERNAL_DIFF=x git diff": "Setting `GIT_EXTERNAL_DIFF`",
+            "NODE_OPTIONS=--require=x npm test": "Setting `NODE_OPTIONS`",
+            "git diff --output=/tmp/pwned": "`git --output` writes a file",
+            "git log --output=frontend/x.ts": "`git --output` writes a file",
+            "sort -o frontend/x.ts frontend/src/router/index.ts": "`sort -o` writes a file",
+            "sort -uo frontend/x.ts frontend/src/router/index.ts": "`sort -o` writes a file",
+            "uniq frontend/src/router/index.ts frontend/x.ts": "`uniq` with an output file",
+            "grep -f/etc/passwd x": "outside the project",
+            "diff frontend/src/router/index.ts --to-file=/etc/passwd": "outside the project",
+            "cat $HOME/.bashrc": "Shell variables",
+            'cat "${HOME}"/.ssh/id_rsa': "Shell variables",
+            "cat .env": "may contain secrets",
+            "grep SECRET frontend/../.env": "may contain secrets",
+        }
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                self.assertIn(expected, guard.check_shell(command, policy, self.root) or "allowed")
+        self.assertIsNone(guard.check_shell("uv run --with pytest-cov pytest -q",
+                                            dict(policy, allow_commands=["uv run --with pytest-cov pytest"]), self.root))
+        for command in ["CI=1 npm test", "grep -n 'end$' frontend/src/router/index.ts", "sed -n '$p' frontend/x.ts",
+                        "npm test -- --run", "sort frontend/src/router/index.ts", "git log --oneline -3"]:
+            with self.subTest(command=command):
+                self.assertIsNone(guard.check_shell(command, policy, self.root))
+
+    def test_writes_through_links_out_of_the_project_are_refused(self):
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        os.symlink(outside, os.path.join(self.root, "node_modules"))
+        policy = dict(self.policy, scope=[])
+        action, reason, _ = guard.check_tool("write_file", {"path": "node_modules/x.js", "content": "x"},
+                                             policy, self.root)
+        self.assertEqual(action, "deny")
+        self.assertIn("outside the project", reason)
+        self.assertFalse(os.path.exists(os.path.join(outside, "x.js")))
+
+    def test_shared_dependency_folders_are_protected(self):
+        Path(self.root, "frontend/node_modules/pkg").mkdir(parents=True)
+        policy = dict(self.policy, scope=[], protected=["frontend/node_modules"])
+        action, reason, _ = guard.check_tool("write_file", {"path": "frontend/node_modules/pkg/index.js",
+                                                            "content": "x"}, policy, self.root)
+        self.assertEqual(action, "deny")
+        self.assertIn("shared with the user's checkout", reason)
+        action, _r, _n = guard.check_tool("read_file", {"path": "frontend/node_modules/pkg/index.js"},
+                                          policy, self.root)
+        self.assertNotEqual(action, "deny")
+
+    def test_policies_are_found_by_run_id(self):
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, True)
+        os.environ["MISTRAL_DELEGATE_HOME"] = str(home)
+        self.addCleanup(os.environ.pop, "MISTRAL_DELEGATE_HOME", None)
+        a = dict(self.policy, run_id="read-a", mode="read", expires=time.time() + 60)
+        b = dict(self.policy, run_id="read-b", mode="write", expires=time.time() + 60)
+        guard.write_policy(self.root, a)
+        guard.write_policy(self.root, b)  # the same directory: the fallback file now holds b
+        self.assertEqual(guard.find_policy(self.root, "read-a")["mode"], "read")
+        self.assertEqual(guard.find_policy(self.root)["run_id"], "read-b")
+        guard.remove_policy(self.root, "read-b")
+        self.assertEqual(guard.find_policy(self.root, "read-a")["mode"], "read")  # b ending doesn't unguard a
+        self.assertTrue(guard.find_policy(self.root, "read-b")["expired"])  # a leftover Vibe of b is refused
+
     def test_unquoted_path_with_spaces_is_rejoined(self):
         spaced = os.path.join(self.root, "2TB SSD")
         Path(spaced, "src").mkdir(parents=True)
@@ -1006,6 +1304,32 @@ class GuardPolicyTest(unittest.TestCase):
         action, _r, new = guard.check_tool("bash", {"command": f"cat {spaced}/src/a.ts | grep x"}, policy, spaced)
         self.assertEqual(action, "rewrite")
         self.assertIn(shlex.quote(os.path.join(spaced, "src/a.ts")), new["command"])
+
+    def test_package_script_spellings_match(self):
+        policy = dict(self.policy, allow_commands=["cd", "npm --prefix frontend test"])
+        for command in [f"cd {self.root} && npm --prefix frontend run test", "npm --prefix frontend test -- --run",
+                        "npm run test", "npm t"]:
+            with self.subTest(command=command):
+                self.assertIsNone(guard.check_shell(command, policy, self.root))
+        reason = guard.check_shell("npm --prefix frontend run lint", policy, self.root)
+        self.assertIn("`npm --prefix frontend run …` isn't allowed", reason)
+
+    def test_noop_edits_are_refused_with_an_explanation(self):
+        action, reason, _ = guard.check_tool("search_replace", {"file_path": "frontend/x.ts", "old_string": "a",
+                                                                "new_string": "a"}, self.policy, self.root)
+        self.assertEqual(action, "deny")
+        self.assertIn("changes nothing", reason)
+        action, _r, _n = guard.check_tool("search_replace", {"file_path": "frontend/src/x.ts", "content": [
+            {"old_str": "a", "new_str": "b"}]}, self.policy, self.root)
+        self.assertEqual(action, "allow")
+        same = "<<<<<<< SEARCH\nfoo()\n=======\nfoo()\n>>>>>>> REPLACE"
+        action, _r, _n = guard.check_tool("search_replace", {"file_path": "frontend/x.ts", "content": same},
+                                          self.policy, self.root)
+        self.assertEqual(action, "deny")
+        changed = same.replace("=======\nfoo()", "=======\nbar()")
+        action, _r, _n = guard.check_tool("search_replace", {"file_path": "frontend/src/x.ts", "content": changed},
+                                          self.policy, self.root)
+        self.assertEqual(action, "allow")
 
     def test_allow_shell_allows_everything(self):
         self.assertIsNone(guard.check_shell("node -e 1", dict(self.policy, allow_shell=True), self.root))
@@ -1067,6 +1391,7 @@ class GuardPolicyTest(unittest.TestCase):
 
 
 class GuardInstallTest(unittest.TestCase):
+    @unittest.skipIf(sys.version_info < (3, 11), "reads the result with tomllib")
     def test_install_keeps_existing_hooks_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
             vibe_home, home = Path(tmp, "vibe"), Path(tmp, "md")
@@ -1125,8 +1450,187 @@ class UnfinishedRunTest(unittest.TestCase):
         self.assertIn("mid-sentence", f([msg("AppLayout triggers advisors.load()…")], "AppLayout triggers advisors.load()…"))
         self.assertEqual(f([msg("Added tests in src/a.test.ts.")], "Added tests in src/a.test.ts."), "")
         self.assertEqual(f([msg("- src/a.test.ts: new tests")], "- src/a.test.ts: new tests"), "")
+        for text in ("Added a test for the export command", "Added the `export` subcommand", "Set it to auto"):
+            self.assertEqual(f([msg(text)], text), "", text)
+        self.assertIn("mid-sentence", f([msg("Then I updated the")], "Then I updated the"))
         summary = "Added tests for the shop list: paused shops, renamed shops, and the empty state. Files: a.test.ts."
         self.assertEqual(f([msg(summary), tool], summary), "")  # a trailing read after a real summary is fine
+
+
+def _alive(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            return "\nState:\tZ" not in f.read()
+    except OSError:
+        pass
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+class GitOpsTest(unittest.TestCase):
+    def test_a_rename_out_of_scope_lists_both_paths(self):
+        from mdelegate import gitops
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp, "repo")
+            (repo / "src").mkdir(parents=True)
+            (repo / "src" / "core.py").write_text("x = 1\n" * 20)
+            run = lambda *a, cwd=repo: subprocess.run(["git", "-C", str(cwd), *a], check=True, capture_output=True)
+            run("init", "-q")
+            run("add", "-A")
+            run("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "init")
+            os.environ["MISTRAL_DELEGATE_HOME"] = str(Path(tmp, "home"))
+            self.addCleanup(os.environ.pop, "MISTRAL_DELEGATE_HOME", None)
+            wt = gitops.prepare_worktree(str(repo), "mistral-x", snapshot=True, link_deps=False, extra_links=[])
+            (Path(wt["path"]) / "tests").mkdir()
+            run("mv", "src/core.py", "tests/core.py", cwd=wt["path"])
+            self.assertEqual(sorted(gitops.changed_files(wt)), ["src/core.py", "tests/core.py"])
+
+    def test_check_timeouts_stop_the_whole_process_group(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import delegate
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp, "pid")
+            results = delegate.run_checks([f"sleep 30 & echo $! > {pid_file}; wait"], tmp, 1)
+            self.assertEqual(results[next(iter(results))][0], 124)
+            pid = int(pid_file.read_text())
+            deadline = time.time() + 5
+            while time.time() < deadline and _alive(pid):
+                time.sleep(0.05)
+            self.assertFalse(_alive(pid))
+
+    def test_checks_with_non_utf8_output_dont_crash(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import delegate
+        results = delegate.run_checks(["printf 'x\\377\\n'"], tempfile.gettempdir(), 10)
+        self.assertEqual(results[next(iter(results))][0], 0)
+
+
+class SessionWatcherTest(unittest.TestCase):
+    def test_parallel_runs_track_their_own_session(self):
+        from mdelegate import vibe
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["VIBE_HOME"] = tmp
+            self.addCleanup(os.environ.pop, "VIBE_HOME", None)
+            unified = Path(tmp, "logs", "session", "unified")
+
+            def session(name, marker, tokens):
+                d = unified / name
+                (d / "journal").mkdir(parents=True)
+                (d / "meta.json").write_text(json.dumps({"session_id": name, "environment": {
+                    "working_directory": tmp}}))
+                prompt = {"type": "projection_delta", "payload": {"delta": [{"op": "append_entry", "entry": {
+                    "type": "message", "role": "user", "content": [{"type": "text", "text": f"Task\n\n{marker}"}]}},
+                    {"op": "set_envelope", "state": {"session": {"tokenUsage": {"inputTokens": tokens,
+                                                                                "outputTokens": 0}}}}]}}
+                (d / "journal" / "0001.jsonl").write_text(json.dumps(prompt) + "\n")
+
+            session("old", "", 5)
+            watcher = vibe.SessionWatcher(tmp, time.time() - 5, marker="read-bbbb")
+            session("A-session", vibe.run_marker("read-aaaa"), 900_000)
+            self.assertIsNone(watcher.poll())  # another run's session
+            session("B-session", vibe.run_marker("read-bbbb"), 1_000)
+            snap = watcher.poll()
+            self.assertEqual(snap["session_id"], "B-session")
+            self.assertEqual(snap["tokens_in"], 1_000)
+            self.assertEqual(watcher.found_id, "B-session")
+
+
+class LedgerTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["MISTRAL_DELEGATE_HOME"] = self.tmp.name
+        self.addCleanup(os.environ.pop, "MISTRAL_DELEGATE_HOME", None)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_odd_lines_dont_break_status_or_stats(self):
+        from mdelegate import ledger
+        path = Path(self.tmp.name, "ledger.jsonl")
+        path.write_text("\n".join(["null", "[1, 2]", '{"id": ["a"]}', '{"event": "start", "id": "r1", "time": "x",'
+                                    ' "kind": null, "task": 5}', '{"event": "end", "id": "r1", "status": "ok",'
+                                    ' "effective": "lots", "denied": [1, "bash: x"]}', '{"event": "start", "id": "r2"'])
+                        )  # the last line was cut short by a killed writer
+        ledger.append({"event": "start", "id": "r3", "kind": "tests", "mode": "write", "pid": 0})
+        ledger.append({"event": "end", "id": "r3", "status": "ok", "verification": "passed_except_preexisting"})
+        runs = ledger.load_runs()
+        self.assertEqual(runs["r3"]["status"], "ok")  # not swallowed by the torn line
+        self.assertIn("r1", ledger.format_status(runs, currency="€"))
+        self.assertIn("1/1", ledger.format_stats(runs))  # passed_except_preexisting counts as passed
+        ledger.month_spend(runs)
+
+    def test_status_uses_the_currency(self):
+        from mdelegate import ledger
+        runs = {"a": {"id": "a", "status": "ok", "cost": 0.5, "tokens": 10, "started": time.time()}}
+        self.assertIn("€0.500", ledger.format_status(runs, currency="€"))
+
+    def test_credit_reset_day_past_the_end_of_a_month(self):
+        from mdelegate import ledger
+        at = lambda day: time.mktime(time.strptime(day, "%Y-%m-%d"))
+        self.assertEqual(time.strftime("%Y-%m-%d", ledger.month_start(31, at("2026-01-29"))), "2025-12-31")
+        self.assertEqual(time.strftime("%Y-%m-%d", ledger.month_start(31, at("2026-04-30"))), "2026-04-30")
+        self.assertEqual(time.strftime("%Y-%m-%d", ledger.month_start(31, at("2026-03-15"))), "2026-02-28")
+        self.assertEqual(time.strftime("%Y-%m-%d", ledger.month_start(30, at("2026-03-01"))), "2026-02-28")
+
+    def test_a_reused_pid_isnt_taken_for_a_running_run(self):
+        from mdelegate import ledger
+        run = {"id": "a", "pid": os.getpid(), "pid_started": "Thu Jan  1 00:00:00 1970"}
+        self.assertEqual(ledger.state(run), "died")
+        self.assertEqual(ledger.state(dict(run, pid_started=ledger.process_started(os.getpid()))), "running")
+
+
+class VibeStatsTest(unittest.TestCase):
+    def test_zero_prices_count_only_when_configured(self):
+        from mdelegate import vibe
+        snap = {"model": "devstral-free", "price": (0.0, 0.0, 0.0), "tokens_in": 1000, "cached": 0, "tokens_out": 10}
+        self.assertEqual(vibe.snapshot_cost(snap), (None, False))  # Vibe's 0 means "no price"
+        vibe.EXTRA_PRICES["devstral-free"] = (0.0, 0.0, 0.0)
+        self.addCleanup(vibe.EXTRA_PRICES.pop, "devstral-free")
+        self.assertEqual(vibe.snapshot_cost(snap), (0.0, False))
+
+    def test_journals_are_read_in_numeric_order(self):
+        from mdelegate import vibe
+        names = [Path(f"{n}.jsonl") for n in (10, 9, 2)]
+        self.assertEqual([p.stem for p in sorted(names, key=vibe._journal_order)], ["2", "9", "10"])
+
+
+class MiniTomlTest(unittest.TestCase):
+    @unittest.skipIf(sys.version_info < (3, 11), "compares with tomllib")
+    def test_reads_the_example_config_like_tomllib(self):
+        import tomllib
+        from mdelegate import minitoml
+        example = (PLUGIN.parent.parent / "examples" / ".mistral-delegate.toml").read_text()
+        self.assertEqual(minitoml.loads(example), tomllib.loads(example))
+        text = textwrap.dedent('''
+            verify = ["npm test", { cmd = "ruff check .", paths = ["backend/"] }]
+            model_prices = { "glm-5-3" = [1.0, 4.0] }
+            [write]
+            max_price = 1.50
+            token_budget = 1_000_000
+            [[models]]
+            name = "m"
+            input_price = 0.4
+            ''')
+        self.assertEqual(minitoml.loads(text), tomllib.loads(text))
+        with self.assertRaises(minitoml.TOMLDecodeError):
+            minitoml.loads("policy = balanced\n")
+
+
+class TestRunnerDetectionTest(unittest.TestCase):
+    def test_only_real_test_runners_count(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import delegate
+        f = lambda cmd, extra=(): delegate._test_runner(cmd, list(extra))
+        for cmd in ("ruff check src tests", "test -f x", "npx tsc --noEmit -p tests", "eslint spec/", "npm run lint"):
+            with self.subTest(command=cmd):
+                self.assertIsNone(f(cmd))
+        self.assertEqual(f("uv run --no-sync pytest -q"), "pytest")
+        self.assertEqual(f("python -m pytest tests"), "pytest")
+        self.assertEqual(f("npx vitest run"), "vitest")
+        self.assertEqual(f("npm --prefix frontend test"), "npm run test")
+        self.assertEqual(f("cd api && go test ./..."), "go test")
+        self.assertEqual(f("make check", ["make check"]), "configured")
 
 
 class CostStatsTest(unittest.TestCase):
@@ -1153,6 +1657,13 @@ class CommandFormsTest(unittest.TestCase):
                      "python -m pytest", "uv run pytest"):
             self.assertIn(form, forms)
         self.assertNotIn("npx eslint", forms)  # lint wasn't allowed
+
+    def test_normalised_spellings_expand(self):
+        from mdelegate import commands
+        with tempfile.TemporaryDirectory() as tmp:
+            forms = commands.expand(["npm --prefix frontend test", "pnpm -C web run lint"], tmp)
+        for form in ("npm run test", "pnpm test", "yarn run test", "npm t", "yarn run lint", "bun lint"):
+            self.assertIn(form, forms)
 
     def test_denied_call_labels_come_from_any_detail_shape(self):
         from mdelegate import vibe

@@ -9,6 +9,7 @@ any error results in no output.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -22,7 +23,8 @@ def build_context(cwd: str) -> str:
     from mdelegate import config, gitops, ledger
 
     wrapper = SCRIPTS / "delegate.py"
-    if shutil.which("vibe") is None:
+    vibe_bin = os.environ.get("VIBE_BIN") or "vibe"
+    if shutil.which(vibe_bin) is None and not Path(vibe_bin).is_file():
         return ("mistral-delegate plugin: the Vibe CLI is not installed, so delegating to Mistral is "
                 "unavailable. If the user asks for it, tell them to run `uv tool install mistral-vibe` "
                 "and `vibe --setup`.")
@@ -35,6 +37,8 @@ def build_context(cwd: str) -> str:
         "delegate-to-mistral skill or the mistral-worker subagent. Mistral runs cost cents to about a "
         "dollar and run alongside you, so your time goes to design and review.",
         f"Delegation policy: {policy}. {config.POLICY_GUIDANCE[policy]}",
+        *[f"Config problem (delegations refuse to run until it's fixed; tell the user): {e}" for e in settings["errors"]],
+        *[f"Config warning (tell the user if they ask about delegation settings): {w}" for w in settings["warnings"][:5]],
         "Habit: after planning a change, mark each step 'mine' or 'Mistral's'. Start Mistral's steps "
         "in the background first (always with --verify when the project has tests or a type check), "
         "then work on yours, then review and --adopt.",

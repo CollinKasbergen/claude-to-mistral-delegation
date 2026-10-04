@@ -15,8 +15,9 @@ Mistral gets back as a tool error, so it can work around it:
   * sensitive files (.env, keys) and network tools are refused.
 
 The hook is installed once in $VIBE_HOME/hooks.toml and does nothing unless a
-delegation run is active for the session's directory: delegate.py writes a
-policy file keyed by that directory and removes it when the run ends. It is
+delegation run is active: delegate.py writes a policy file for the run and
+starts Vibe with MISTRAL_DELEGATE_RUN set to the run id, which Vibe passes on to
+its hooks (a policy keyed by the session's directory is the fallback). It is
 deliberately stricter than Vibe's own permissions, which stay on, so if the hook
 is missing, runs fall back to Vibe's behaviour instead of allowing more.
 
@@ -64,16 +65,34 @@ def policy_path(cwd: str, home: Path | None = None) -> Path:
     return (home or guard_home()) / "guards" / f"{key}.json"
 
 
-def write_policy(cwd: str, policy: dict, home: Path | None = None) -> Path:
-    path = policy_path(cwd, home)
+RUN_ENV = "MISTRAL_DELEGATE_RUN"
+
+
+def run_policy_path(run_id: str, home: Path | None = None) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", run_id)
+    return (home or guard_home()) / "guards" / "runs" / f"{safe}.json"
+
+
+def _write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(policy))
+    tmp.write_text(json.dumps(data))
     tmp.replace(path)
+
+
+def write_policy(cwd: str, policy: dict, home: Path | None = None) -> Path:
+    """Write the run's policy (found by run id) and the directory fallback for hooks without the run id."""
+    _write_json(policy_path(cwd, home), policy)
+    path = run_policy_path(policy["run_id"], home)
+    _write_json(path, policy)
     return path
 
 
 def remove_policy(cwd: str, run_id: str, home: Path | None = None) -> None:
+    try:
+        run_policy_path(run_id, home).unlink()
+    except OSError:
+        pass
     path = policy_path(cwd, home)
     try:
         if json.loads(path.read_text()).get("run_id") == run_id:
@@ -82,8 +101,20 @@ def remove_policy(cwd: str, run_id: str, home: Path | None = None) -> None:
         pass
 
 
-def find_policy(cwd: str) -> dict | None:
-    """The active policy for cwd or the nearest parent directory that has one."""
+def find_policy(cwd: str, run_id: str | None = None) -> dict | None:
+    """The active policy: the run's own when Vibe passed its id on, else the one for cwd or its nearest parent.
+
+    A run id without a live policy (the wrapper is gone, or the policy expired) gives a policy
+    that refuses everything, so a Vibe process that outlived its wrapper can't act unguarded.
+    """
+    if run_id:
+        try:
+            policy = json.loads(run_policy_path(run_id).read_text())
+            if time.time() < policy.get("expires", 0):
+                return policy
+        except (OSError, ValueError):
+            pass
+        return {"run_id": run_id, "expired": True}
     current = os.path.realpath(cwd)
     while True:
         try:
@@ -160,7 +191,10 @@ def install(vibe_home: Path, home: Path, python: str | None = None) -> str | Non
     if updated == current:
         return None
     try:
-        import tomllib
+        try:
+            import tomllib
+        except ImportError:  # Python < 3.11
+            from . import minitoml as tomllib
         tomllib.loads(updated)
     except ImportError:
         pass
@@ -196,6 +230,14 @@ def _sensitive(path: str) -> bool:
     return any(fnmatch.fnmatch(name, p) for p in SENSITIVE) and not name.endswith((".example", ".sample", ".template"))
 
 
+def _protected(rel: str, policy: dict) -> str | None:
+    """The dependency folder shared with the user's checkout that rel is in, if any."""
+    for link in policy.get("protected") or []:
+        if rel == link or rel.startswith(link.rstrip("/") + "/"):
+            return link
+    return None
+
+
 def correct_path(value: str, root: str, write: bool = False) -> str | None:
     """Map a path that points outside the project back into it, if a suffix of it exists there.
 
@@ -209,6 +251,8 @@ def correct_path(value: str, root: str, write: bool = False) -> str | None:
         if ".." in rest or (i > 0 and len(rest) < 2):
             continue
         candidate = os.path.join(root, *rest)
+        if not _inside(os.path.realpath(candidate), root):
+            continue  # through a symlink that leaves the project
         if os.path.exists(candidate) or (write and os.path.isdir(os.path.dirname(candidate))):
             return candidate
     return None
@@ -270,8 +314,8 @@ def _sed_script_safe(script: str) -> bool:
     return True
 
 
-def _sed_files(words: list[str]) -> list[str] | None:
-    """The file arguments of a sed call that only prints (no -i, no writing commands), or None."""
+def _sed_check(words: list[str]) -> tuple[list[str] | None, str]:
+    """(file arguments, "") for a sed call that only prints, or (None, why it isn't allowed)."""
     scripts, files, expect_script = [], [], False
     for word in words[1:]:
         if expect_script:
@@ -282,21 +326,35 @@ def _sed_files(words: list[str]) -> list[str] | None:
         elif word.startswith("--expression="):
             scripts.append(word.split("=", 1)[1])
         elif word.startswith("--"):
+            if word.startswith("--in-place"):
+                return None, "`--in-place` edits files; use the edit tools to change files"
             if word not in SED_SAFE_LONG_FLAGS:
-                return None
+                return None, f"`{word}` isn't one of the allowed sed options ({', '.join(sorted(SED_SAFE_LONG_FLAGS))})"
         elif word.startswith("-") and len(word) > 1:
             letters = word[1:]
             if letters.endswith("e") and set(letters[:-1]) <= SED_SAFE_SHORT:
                 expect_script = True  # e.g. -ne 'script'
+            elif "i" in letters:
+                return None, "`-i` edits files in place; use the edit tools to change files"
+            elif "f" in letters:
+                return None, "`-f` runs a script file; give the script inline"
             elif not set(letters) <= SED_SAFE_SHORT:
-                return None  # -i, -f, -l, ... (in place, script files)
+                return None, f"`{word}` isn't one of the allowed sed options (-n, -E, -r, -s, -z)"
         elif not scripts:
             scripts.append(word)
         else:
             files.append(word)
-    if not scripts or not all(_sed_script_safe(s) for s in scripts):
-        return None
-    return files
+    if not scripts:
+        return None, "it has no script"
+    bad = next((s for s in scripts if not _sed_script_safe(s)), None)
+    if bad is not None:
+        return None, (f"the script `{bad}` uses a command that isn't print-only (w/W write, r/R read, e runs a "
+                      "command)")
+    return files, ""
+
+
+def _sed_files(words: list[str]) -> list[str] | None:
+    return _sed_check(words)[0]
 
 
 def _shell_tokens(command: str) -> list[str]:
@@ -314,16 +372,85 @@ RUNNER_VALUE_OPTIONS = {"--directory", "--project", "--python", "-p", "--with", 
                         "--index-url", "--extra-index-url", "--prefix", "-C", "--cwd", "--dir", "--filter",
                         "-F", "--workspace", "-w", "--config", "--package-manager"}
 
+# The runner options a delegated command may use. Anything else between a runner and its command
+# is refused: options such as `uv run --with <pkg>`, `npm --script-shell=<file>` or
+# `npx --package=<pkg>` install packages or run arbitrary code.
+_PY_SAFE = ({"--no-sync", "--frozen", "--locked", "--offline", "--quiet", "-q", "--verbose", "-v", "--no-dev",
+             "--all-extras", "--all-groups", "--exact", "--isolated", "--no-project", "--active"},
+            {"--directory", "--project", "--package", "--extra", "--group", "--only-group", "--no-group", "--env-file",
+             "--with-editable"})  # --with-editable takes a local path, which the path checks keep in the project
+_NPM_SAFE = ({"--silent", "-s", "--if-present", "--workspaces", "-ws", "--include-workspace-root", "--yes", "-y",
+              "--quiet", "-q", "--no-color", "--color"}, {"--prefix", "--workspace", "-w"})
+_PNPM_SAFE = ({"--silent", "-s", "--if-present", "-r", "--recursive", "-w", "--workspace-root", "--parallel",
+               "--stream", "--sequential"}, {"-C", "--dir", "--filter", "-F", "--reporter"})
+RUNNER_SAFE_OPTIONS = {
+    ("uv", "run"): _PY_SAFE, ("poetry", "run"): _PY_SAFE, ("pdm", "run"): _PY_SAFE, ("hatch", "run"): _PY_SAFE,
+    ("pipenv", "run"): _PY_SAFE, ("npm",): _NPM_SAFE, ("npm", "exec"): _NPM_SAFE, ("pnpm",): _PNPM_SAFE,
+    ("pnpm", "exec"): _PNPM_SAFE, ("yarn",): ({"--silent", "-s"}, {"--cwd"}),
+    ("bun",): ({"--silent", "--bun"}, {"--cwd"}), ("npx",): ({"--yes", "-y", "--quiet", "-q", "--no"}, set()),
+    ("bunx",): ({"--bun"}, set()),
+}
+# npm reads its own config options anywhere before a bare `--`, after the script name too.
+NPM_UNSAFE_ANYWHERE = ("--node-options", "--script-shell", "--userconfig", "--globalconfig", "--registry", "--call",
+                       "--package", "--shell", "--init-module", "--cache")
+# Variables a command may be prefixed with (CI=1 npm test). Others can make tools run programs
+# (GIT_EXTERNAL_DIFF, LESSOPEN, NODE_OPTIONS, PATH, LD_PRELOAD, ...).
+SAFE_ENV_VARS = {"CI", "NODE_ENV", "FORCE_COLOR", "NO_COLOR", "TZ", "LANG", "LC_ALL", "DEBUG", "TERM", "COLUMNS",
+                 "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED", "PYTHONHASHSEED", "PYTHONWARNINGS"}
+# Options that make print-only commands write files.
+WRITE_OPTIONS = {"sort": ("-o", "--output"), "tree": ("-o",), "git": ("--output",)}
+
+
+def runner_option_problem(words: list[str]) -> str | None:
+    """Why a runner option in words isn't allowed, or None."""
+    for runner in sorted(RUNNERS, key=len, reverse=True):
+        if tuple(words[:len(runner)]) != runner:
+            continue
+        flags, valued = RUNNER_SAFE_OPTIONS.get(runner, (set(), set()))
+        rest, i = words[len(runner):], 0
+        while i < len(rest) and rest[i].startswith("-") and rest[i] != "--":
+            option = rest[i].split("=", 1)[0]
+            if option in valued:
+                i += 1 if "=" in rest[i] else 2
+            elif option in flags and "=" not in rest[i]:
+                i += 1
+            else:
+                return f"the option `{option}` of `{' '.join(runner)}` isn't allowed in this run"
+        if runner[0] in ("npm", "pnpm", "yarn", "npx"):
+            for word in words[len(runner):]:
+                if word == "--":
+                    break
+                if word.split("=", 1)[0] in NPM_UNSAFE_ANYWHERE:
+                    return f"the option `{word.split('=', 1)[0]}` isn't allowed in this run"
+        return None
+    return None
+
+
+PACKAGE_MANAGER_BUILTINS = {"add", "install", "i", "ci", "remove", "rm", "uninstall", "exec", "dlx", "x", "create",
+                            "update", "upgrade", "link", "publish", "init", "run", "run-script", "test", "t", "tst",
+                            "start", "stop", "restart", "audit", "outdated", "why", "pack"}
+
 
 def normalize_command(words: list[str]) -> list[str]:
-    """Drop a runner's own options: ["uv", "run", "--no-sync", "pytest", "-q"] -> ["uv", "run", "pytest", "-q"]."""
+    """Drop a runner's own options and spell package scripts one way:
+    ["uv", "run", "--no-sync", "pytest", "-q"] -> ["uv", "run", "pytest", "-q"];
+    ["npm", "--prefix", "frontend", "test"] and ["npm", "run", "test"] -> ["npm", "run", "test"]."""
     for runner in RUNNERS:
         if tuple(words[:len(runner)]) == runner:
             rest, i = words[len(runner):], 0
             while i < len(rest) and rest[i].startswith("-") and rest[i] != "--":
                 option = rest[i].split("=", 1)[0]
                 i += 2 if option in RUNNER_VALUE_OPTIONS and "=" not in rest[i] else 1
-            return list(runner) + rest[i:]
+            out = list(runner) + rest[i:]
+            if len(runner) == 1 and runner[0] in ("npm", "pnpm", "yarn", "bun") and len(out) >= 2:
+                pm, cmd = out[0], out[1]
+                if cmd in ("test", "t", "tst"):
+                    out = [pm, "run", "test"] + out[2:]
+                elif cmd == "run-script":
+                    out = [pm, "run"] + out[2:]
+                elif pm != "npm" and cmd not in PACKAGE_MANAGER_BUILTINS:
+                    out = [pm, "run"] + out[1:]
+            return out
     return words
 
 
@@ -368,6 +495,9 @@ def analyze_shell(command: str, policy: dict, cwd: str) -> tuple[str | None, dic
             else "Use the read_file and grep tools to inspect files and the edit/write tools to change them.")
     if "`" in command or "$(" in command or "<(" in command or ">(" in command:
         return f"Command substitution isn't allowed in this run. {hint}", corrections
+    if re.search(r"\$[A-Za-z_{0-9@*#?!$-]", re.sub(r"'[^']*'", "", command)):
+        return (f"Shell variables (`$NAME`) aren't allowed in this run; write the value or path out. "
+                f"{hint}"), corrections
     try:
         tokens = _shell_tokens(command)
     except ValueError:
@@ -401,16 +531,45 @@ def analyze_shell(command: str, policy: dict, cwd: str) -> tuple[str | None, dic
         i += 1
 
     for words in segments:
-        while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
+        while words and (assignment := re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=", words[0])):
+            if assignment.group(1) not in SAFE_ENV_VARS:
+                return (f"Setting `{assignment.group(1)}` for a command isn't allowed in this run "
+                        f"(allowed: {', '.join(sorted(SAFE_ENV_VARS))}). {hint}"), corrections
             words = words[1:]
         if not words:
             continue
         sed_files = _sed_files(words) if words[0] == "sed" else None
+        # Options the user wrote into an allowed command themselves (`uv run --with pytest-cov pytest`) stand.
+        given = any(words[:len(p.split())] == p.split() and any(w.startswith("-") for w in p.split()) for p in allowed)
+        if sed_files is None and not given and (problem := runner_option_problem(words)):
+            return f"{problem}. {hint}", corrections
         if sed_files is None and not command_allowed(words, allowed):
-            return f"`{words[0]}` isn't allowed in this run. {hint}", corrections
+            if words[0] == "sed":
+                return (f"This `sed` isn't allowed: {_sed_check(words)[1]}. Only sed calls that just print are "
+                        f"allowed. {hint}"), corrections
+            shown = " ".join(words[:4]) + (" …" if len(words) > 4 else "")
+            return f"`{shown}` isn't allowed in this run. {hint}", corrections
         if words[0] == "find" and FIND_UNSAFE & set(words):
             return "`find` with -exec/-delete isn't allowed in this run. Use plain `find` to list files.", corrections
+        for option in WRITE_OPTIONS.get(words[0], ()):
+            if any(w == option or w.startswith(option + "=") or (len(option) == 2 and w.startswith("-")
+                   and not w.startswith("--") and option[1] in w[1:]) for w in words[1:]):
+                return (f"`{words[0]} {option}` writes a file; write files with the edit/write tools. {hint}"), \
+                    corrections
+        if words[0] == "uniq" and len([w for w in words[1:] if not w.startswith("-")]) > 1:
+            return "`uniq` with an output file writes it; write files with the edit/write tools.", corrections
         args = sed_files if sed_files is not None else words[1:]
+        for word in args:
+            # A path attached to an option: --output=/tmp/x, -f/etc/passwd.
+            attached = word.split("=", 1)[1] if word.startswith("--") and "=" in word else (
+                word[2:] if re.match(r"^-[A-Za-z][/~.]", word) else "")
+            if attached and (attached.startswith(("/", "~")) or ".." in attached.split("/")) \
+                    and not _inside(_resolve(attached, cwd), policy["root"]):
+                return (f"`{attached}` is outside the project. Use paths relative to your working directory, the "
+                        f"project root ({policy['root']})."), corrections
+            if not word.startswith("-") and _sensitive(word) and (
+                    os.path.exists(os.path.join(cwd, word)) or "/" in word or word.startswith(".env")):
+                return f"`{word}` may contain secrets and is off limits in this run.", corrections
         i = 0
         while i < len(args):
             word = args[i]
@@ -450,6 +609,22 @@ def analyze_shell(command: str, policy: dict, cwd: str) -> tuple[str | None, dic
     return None, corrections
 
 
+def _is_noop_edit(tool_input: dict) -> bool:
+    """A search-and-replace whose old and new text are the same (either argument shape Vibe uses)."""
+    if "old_string" in tool_input and tool_input.get("old_string") == tool_input.get("new_string"):
+        return True
+    blocks = tool_input.get("content")
+    if isinstance(blocks, list) and blocks and all(isinstance(b, dict) and "old_str" in b for b in blocks):
+        return all(b.get("old_str") == b.get("new_str") for b in blocks)
+    if isinstance(blocks, str) and "<<<<<<< SEARCH" in blocks:
+        pairs = re.findall(r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE", blocks, re.S)
+        return bool(pairs) and all(old == new for old, new in pairs)
+    changes = tool_input.get("changes")
+    if isinstance(changes, list) and changes and all(isinstance(c, dict) and "old_string" in c for c in changes):
+        return all(c.get("old_string") == c.get("new_string") for c in changes)
+    return False
+
+
 def _is_write(tool: str, tool_input: dict) -> bool:
     name = tool.lower()
     return any(w in name for w in WRITE_WORDS) or any(k in tool_input for k in WRITE_KEYS)
@@ -464,12 +639,16 @@ def check_tool(tool: str, tool_input: dict, policy: dict, cwd: str) -> tuple[str
         return "deny", ("No one can answer questions during this run. Make a reasonable choice, "
                         "and list it in your final summary."), None
 
+    if _is_noop_edit(tool_input):
+        return "deny", ("This edit changes nothing: the old and new text are identical. Check whether the change "
+                        "is already in place, then move on."), None
     root = policy["root"]
     new_input = dict(tool_input)
     rewritten = False
     command = tool_input.get("command")
     if isinstance(command, str):
-        reason, corrections = analyze_shell(command, policy, tool_input.get("cwd") or cwd)
+        # Vibe runs commands in the session's directory; a cwd in the tool input doesn't change that.
+        reason, corrections = analyze_shell(command, policy, cwd)
         if reason:
             return "deny", reason, None
         for wrong, fixed in corrections.items():
@@ -489,6 +668,9 @@ def check_tool(tool: str, tool_input: dict, policy: dict, cwd: str) -> tuple[str
         if not isinstance(values, str) or not values:
             continue
         resolved = _resolve(values, cwd)
+        if write and _inside(resolved, root) and (link := _protected(os.path.relpath(resolved, root), policy)):
+            return "deny", (f"`{link}` is shared with the user's checkout; don't change files in it. If the task "
+                            "needs a dependency change, say so in your final summary."), None
         if _inside(resolved, root) and not os.path.exists(resolved) and not write:
             candidate = correct_path(values, root)
             if candidate and os.path.realpath(candidate) != resolved:
@@ -532,15 +714,18 @@ def main() -> None:
     except ValueError:
         return
     cwd = event.get("cwd") or os.getcwd()
-    policy = find_policy(cwd)
+    policy = find_policy(cwd, os.environ.get(RUN_ENV))
     if not policy:
         return  # not a delegation run: do nothing
+    if policy.get("expired"):
+        print(json.dumps({"decision": "deny", "reason": "This delegation run has ended; stop and write your summary."}))
+        return
     tool = str(event.get("tool_name") or "")
     tool_input = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
     try:
         action, reason, new_input = check_tool(tool, tool_input, policy, cwd)
-    except Exception as e:  # never break a run on a guard bug; Vibe's own permissions still apply
-        action, reason, new_input = "allow", f"guard error: {e}", None
+    except Exception as e:  # a guard bug refuses the call rather than letting it through unchecked
+        action, reason, new_input = "deny", f"The guard couldn't check this call ({e}); try another way.", None
     target = tool_input.get("command") or next((tool_input[k] for k in PATH_KEYS if isinstance(tool_input.get(k), str)), "")
     try:
         os.makedirs(os.path.dirname(policy["log"]), exist_ok=True)

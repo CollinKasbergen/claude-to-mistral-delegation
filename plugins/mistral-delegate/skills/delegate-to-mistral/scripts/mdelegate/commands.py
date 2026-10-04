@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import os
 
+from .guard import normalize_command
+
 PACKAGE_MANAGERS = ("npm", "pnpm", "yarn", "bun")
 # Tools that only test, lint, type-check or format; `npx <tool>` is allowed when a
 # script that is already allowed runs one of them.
@@ -29,7 +31,8 @@ def package_scripts(root: str) -> dict[str, str]:
         dirnames[:] = [d for d in dirnames if d not in ("node_modules", ".git") and not d.startswith(".") and depth < 2]
         if "package.json" in filenames:
             try:
-                data = json.load(open(os.path.join(dirpath, "package.json"), encoding="utf-8"))
+                with open(os.path.join(dirpath, "package.json"), encoding="utf-8") as f:
+                    data = json.load(f)
             except (OSError, ValueError):
                 continue
             for name, body in (data.get("scripts") or {}).items():
@@ -39,16 +42,12 @@ def package_scripts(root: str) -> dict[str, str]:
 
 
 def _script_name(words: list[str]) -> str | None:
+    """The package script of a command already passed through normalize_command (`pm run <script>`)."""
     if len(words) < 2 or words[0] not in PACKAGE_MANAGERS:
         return None
-    if words[1] in ("run", "run-script") and len(words) >= 3:
+    if words[1] == "run" and len(words) >= 3:
         return words[2]
-    if words[1] in ("test", "t", "tst"):
-        return "test"
-    if words[1] in ("start", "stop", "restart"):
-        return words[1]
-    if words[0] != "npm" and words[1] not in ("add", "install", "i", "remove", "rm", "exec", "dlx", "x", "create",
-                                               "update", "upgrade", "link", "publish"):
+    if words[0] == "npm" and words[1] in ("start", "stop", "restart"):
         return words[1]
     return None
 
@@ -88,7 +87,7 @@ def expand(allowed: list[str], root: str) -> list[str]:
                                            for c in allowed) else {}
     out = list(allowed)
     for command in allowed:
-        words = command.split()
+        words = normalize_command(command.split())  # `npm --prefix frontend test` -> `npm run test`
         script = _script_name(words)
         tool = _tool_of(words)
         if script:
