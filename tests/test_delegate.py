@@ -336,9 +336,24 @@ class ReadModeTest(DelegateTestBase):
         self.assertIn("Long task from stdin", self.last()["prompt"])
 
     def test_write_only_flags_rejected_in_read_mode(self):
-        out = self.run_delegate("--verify", "true", "Task")
+        out = self.run_delegate("--mode", "read", "--verify", "true", "Task")
         self.assertEqual(out.returncode, 2)
         self.assertIn("only apply to --mode write", out.stdout)
+        out = self.run_delegate("--verify", "true", "Task")  # without --mode, write flags mean a write run
+        self.assertIn("mode: write", out.stdout)
+
+    def test_a_resume_continues_in_the_mode_it_resumes(self):
+        first = self.run_delegate("--mode", "write", "Task")
+        self.assertIn(f"follow up with: --mode write --resume sess-1234567890 --worktree-name "
+                      f"{self.value(first, 'worktree_name')}", first.stdout)
+        again = self.run_delegate("--resume", "sess-1234567890", "--worktree-name", self.value(first, "worktree_name"),
+                                  "More")
+        self.assertIn("mode: write", again.stdout)
+        self.assertIn("continues:", again.stdout)
+        again = self.run_delegate("--resume", "sess-1234567890", "More")  # mode of the resumed run
+        self.assertIn("mode: write", again.stdout)
+        refused = self.run_delegate("--mode", "read", "--worktree-name", "x", "Task")
+        self.assertIn("--worktree-name is for write runs", refused.stdout)
 
     def test_limit_reached_still_reports_cost(self):
         out = self.run_delegate("Big task", behaviour="limit")
@@ -944,6 +959,18 @@ class WriteModeTest(DelegateTestBase):
         self.assertIn("worktree_base: your HEAD when the worktree was made", out.stdout)
         out = self.run_delegate("--mode", "write", "Task\nFAKE_FILE tests/test_q.py assert first == (a if a < b else b)")
         self.assertIn("tests/test_q.py: assert first == (a if a < b else b)", out.stdout)
+
+    def test_checks_mistral_may_run_and_checks_that_cant_run_yet(self):
+        check = "cd . && python3 -c \"open('new_test_file.py')\""  # fails like pytest on a file that isn't there yet
+        out = self.run_delegate("--mode", "write", "--verify", check, "Task")
+        prompt = self.calls()[0]["prompt"]  # the first call's rules (a fix round's prompt is just the failures)
+        self.assertIn("`python3 -c \"open('new_test_file.py')\"`",
+                      prompt.split("You may run these shell commands yourself:")[1])
+        self.assertIn("baseline_note: couldn't run before Mistral's change", out.stdout)
+        self.assertIn("verification: failed", out.stdout)  # still failing afterwards: Mistral's to fix
+        self.assertIn("Run them yourself before you finish", prompt)
+        self.assertNotIn("already failing before Mistral", out.stdout)  # the file it tests didn't exist yet: new
+        self.assertNotIn("baseline_warning", out.stdout)
 
     def test_no_changes_is_its_own_status(self):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_NO_WRITE="1")
@@ -1977,6 +2004,12 @@ class UnfinishedRunTest(unittest.TestCase):
             self.assertEqual(f([msg(text)], text), "", text)
         self.assertIn("mid-sentence", f([msg("Then I updated the")], "Then I updated the"))
         self.assertIn("without a final message", f([msg("")], ""))
+        sys.path.insert(0, str(SCRIPT.parent))
+        import delegate
+        for output in ("FAILED tests/t.py::test_a - AttributeError: x has no attribute y\n9 failed, 2 passed in 0.3s",
+                       "Tests  9 failed | 2 passed (11)"):
+            self.assertTrue(delegate.REAL_FAILURE.search(output), output)
+        self.assertFalse(delegate.REAL_FAILURE.search("ModuleNotFoundError: No module named x\n1 error in 0.1s"))
         answer = "Open loans are counted in Store.count_open_loans; tests/test_service.py covers the limit."
         refused = {"type": "effect", "title": "Denied tool 'bash'", "detail": {"input": {"command": "ls"}},
                    "state": {"status": "skipped", "reason": "denied"}}

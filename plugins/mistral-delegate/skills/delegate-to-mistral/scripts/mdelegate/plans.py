@@ -62,6 +62,7 @@ class PlanRun:
         self.children: dict[str, tuple] = {}  # step id -> (process, log file handle, log path)
         self.started = time.monotonic()
         self.all_runs: list[dict] = []
+        self.notes: list[str] = []
         scoped = all(s.scope for s in steps)
         self.scope = list(dict.fromkeys(e for s in steps for e in s.scope)) if scoped else []
 
@@ -327,7 +328,7 @@ class PlanRun:
         status = ("failed" if not merged else "partial" if not all_merged
                   else "checks_failed" if verification == "failed" else "ok")
         lines = [f"plan_id: {self.plan_id}", f"status: {status}",
-                 f"plan: {self.plan.title} ({len(merged)} of {len(self.steps)} steps merged)"]
+                 f"plan: {self.plan.title} ({len(merged)} of {len(self.steps)} steps merged)", *self.notes]
         for warning in self.settings["warnings"]:
             lines.append(f"config_warning: {warning}")
         lines.append("steps:")
@@ -381,7 +382,10 @@ class PlanRun:
     def step_line(self, step: Step, integration: dict) -> str:
         result = self.results.get(step.id) or {"status": "not_run"}
         record = result.get("record") or {}
-        parts = [f"{step.id}: {result.get('status')}"]
+        # Vibe's "ok" only means it finished; a step whose checks failed didn't succeed.
+        shown = "checks failed" if result.get("status") == "ok" and result.get("verification") == "failed" \
+            else result.get("status")
+        parts = [f"{step.id}: {shown}"]
         if result.get("verification") == "not_run" and result.get("status") == "ok":
             parts.append("no checks")
         elif result.get("verification"):
@@ -389,8 +393,14 @@ class PlanRun:
             parts.append(f"checks {result['verification']}" + (f" after {used} fix round(s)" if used else ""))
         if record.get("files_changed") is not None:
             parts.append(f"{record['files_changed']} file(s)")
-        if isinstance(record.get("cost"), (int, float)):
-            parts.append(f"~{self.settings['currency']}{record['cost']:.4f}")
+        # The step's cost over all its runs (a failed attempt and its follow-up), as in the plan's total.
+        wt = self.step_wts.get(step.id)
+        step_runs = [r for r in self.every_run() if wt and (r.get("worktree") or {}).get("path") == wt["path"]] \
+            or ([record] if record else [])
+        costs = [c for c in (ledger.run_cost(r, vibe.model_prices()) for r in step_runs) if c is not None]
+        if costs:
+            parts.append(f"~{self.settings['currency']}{sum(costs):.4f}"
+                         + (f" over {len(step_runs)} runs" if len(step_runs) > 1 else ""))
         if result.get("run_id"):
             parts.append(f"run {result['run_id']}")
         line = ", ".join(parts)
@@ -402,7 +412,8 @@ class PlanRun:
             line += f" ({result['note']})"
         wt = self.step_wts.get(step.id)
         if record.get("session_id") and wt and os.path.isdir(wt["path"]):
-            line += (f" -> not merged. To finish it: --resume {record['session_id']} --worktree-name {wt['name']} "
+            line += (f" -> not merged. To finish it: --mode write --resume {record['session_id']} "
+                     f"--worktree-name {wt['name']} "
                      f"\"<what to fix>\", then --integrate {self.plan_id}")
         else:
             line += " -> not merged"
@@ -635,6 +646,11 @@ def integrate_again(args, script: Path, script_cmd) -> int:
                 gitops.commit_all(wt, f"mistral-delegate: {record['id']} step {step.id}")
             run.results[step.id] = result
         run.run_steps()
+        latest_runs = {k: r.get("run_id") for k, r in run.results.items() if r.get("run_id")}
+        if latest_runs == (record.get("step_runs") or {}):
+            run.notes.append("note: nothing changed since the last integration: no step was resumed or run. Resume "
+                             "the step that failed (with --mode write and the --resume command its line gives), "
+                             "then --integrate again.")
         run.use_worktree_code()
         integration = run.integrate()
         report, end = run.report(integration)

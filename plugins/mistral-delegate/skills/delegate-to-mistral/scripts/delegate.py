@@ -75,8 +75,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("task", nargs="?", help="Task for Vibe. Use '-' to read it from stdin.")
 
     run = p.add_argument_group("running a task")
-    run.add_argument("--mode", choices=["read", "write"], default="read",
-                     help="read: read-only tools, runs in place. write: edits, in an isolated git worktree.")
+    run.add_argument("--mode", choices=["read", "write"],
+                     help="read: read-only tools, runs in place. write: edits, in an isolated git worktree. Default: "
+                          "read, or write with --worktree-name, --verify, --scope, --allow-command or --in-place, "
+                          "and a --resume continues in the mode of the run it resumes.")
     run.add_argument("--kind", choices=KINDS, help="Kind of task, for the track record (default: search/other).")
     run.add_argument("--workdir", default=os.getcwd(), help="Project directory (default: cwd).")
     run.add_argument("--spec", metavar="FILE", help="Include this spec/plan file in the prompt.")
@@ -549,6 +551,9 @@ def runner_tests(runner: str, tests: list[str]) -> list[str]:
     return [t for t in tests if t.endswith(suffixes)] if suffixes else tests
 
 
+# Tests that ran and failed (pytest "9 failed, 2 passed in", vitest "Tests  9 failed", an assertion).
+REAL_FAILURE = re.compile(r"(^|\s)\d+ failed(,| in )|Tests\s+\d+ failed|AssertionError|FAILED \S+::|AssertError|"
+                          r"\bexpected\b.*\b(to|but|received)\b", re.I | re.M)
 FILE_ARG_RUNNERS = {"pytest", "vitest", "jest"}
 
 
@@ -635,7 +640,7 @@ def test_strength(wt: dict, run_dir: str, checks: list[dict], baseline: dict, se
     for run, out in failing[:2]:
         last = [ln.strip() for ln in out.splitlines() if ln.strip()][-1:] or ["no output"]
         shown.append(f"{run}: {last[0][:160]}")
-    if all(LOAD_ERROR.search(out) for _run, out in failing):
+    if all(LOAD_ERROR.search(out) and not REAL_FAILURE.search(out) for _run, out in failing):
         # The tests can't even load without the new code: that says nothing about their assertions.
         return ("test_strength: not conclusive: Mistral's tests fail on the original code only because they can't "
                 "load there (" + "; ".join(shown) + "), so this doesn't show they would catch a broken change. "
@@ -643,7 +648,23 @@ def test_strength(wt: dict, run_dir: str, checks: list[dict], baseline: dict, se
     return ("test_strength: Mistral's tests fail on the original code, as they should (" + "; ".join(shown) + ").")
 
 
+def resolve_mode(args: argparse.Namespace) -> str:
+    """The mode when --mode isn't given: what the other flags mean, or the mode of the resumed run."""
+    if args.mode:
+        return args.mode
+    if args.worktree_name or args.in_place or args.verify or args.add_verify or args.scope or args.allow_command:
+        return "write"
+    if args.resume:
+        resumed = [r for r in ledger.load_runs().values() if r.get("session_id") == args.resume]
+        if resumed:
+            return max(resumed, key=lambda r: r.get("started") or 0).get("mode") or "read"
+    return "read"
+
+
 def run_task(args: argparse.Namespace) -> int:
+    args.mode = resolve_mode(args)
+    if args.mode == "read" and args.worktree_name:
+        raise DelegateError("--worktree-name is for write runs: a read run works in place. Add --mode write.")
     workdir = str(Path(args.workdir).resolve())
     if args.task == "-":
         args.task = sys.stdin.read()
@@ -685,7 +706,11 @@ def run_task(args: argparse.Namespace) -> int:
         for command in args.verify + args.add_verify:
             if command not in {v["cmd"] for v in verify}:
                 verify.append({"cmd": command, "paths": []})
-    allow_commands = list(dict.fromkeys(settings["allow_commands"] + args.allow_command)) if write else []
+    # Mistral may run the run's own checks, so it can see a lint or type error before it says it's done.
+    check_commands = [seg.strip() for c in verify for seg in re.split(r"&&|\|\||;", c["cmd"])
+                      if seg.strip() and "{files" not in seg]
+    allow_commands = list(dict.fromkeys(settings["allow_commands"] + args.allow_command + check_commands)) \
+        if write else []
     # `npm test` also covers `npm run test`, `npx vitest` (when that's the test script), etc.
     settings["allow_commands_as_given"] = allow_commands
     allow_commands = cmdforms.expand(allow_commands, top or workdir) if allow_commands else []
@@ -833,7 +858,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     # Run the checks once before Mistral changes anything, so failures that were
     # already there (or come from the worktree environment) aren't blamed on it.
     # A failing check is rerun once, so a flaky one isn't reported as broken.
-    baseline, flaky, baseline_source = {}, [], ""
+    baseline, flaky, baseline_source, not_runnable = {}, [], "", []
     if commands and baseline_on:
         stored = {c: CheckResult.load(v) for c, v in (gitops.load_state(wt["path"]).get("baseline") or {}).items()} \
             if wt else {}
@@ -846,12 +871,13 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                 rel = os.path.relpath(run_dir, wt["path"])
                 try:
                     with gitops.clean_copy(wt, settings["deps_mode"]) as clean:
-                        baseline.update(measure_baseline(missing, str(clean / rel), args.verify_timeout, flaky))
+                        baseline.update(measure_baseline(missing, str(clean / rel), args.verify_timeout, flaky,
+                                                         not_runnable))
                 except DelegateError as e:
                     baseline_source = f"could not build a clean copy for the baseline ({e}); those checks have none"
             baseline_source = baseline_source or "from before Mistral's earlier changes in this worktree"
         else:
-            baseline = measure_baseline(commands, run_dir, args.verify_timeout, flaky)
+            baseline = measure_baseline(commands, run_dir, args.verify_timeout, flaky, not_runnable)
         if wt:
             gitops.save_state(wt["path"], {"baseline": {c: v.stored() for c, v in {**stored, **baseline}.items()}})
     preexisting = [cmd for cmd, (code, _out) in baseline.items() if code != 0]
@@ -1059,6 +1085,9 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append("final_message_warning: " + run.unfinished)
     if baseline_source:
         lines.append("baseline: " + baseline_source)
+    if not_runnable:
+        lines.append("baseline_note: couldn't run before Mistral's change (the files it tests didn't exist yet), so "
+                     "its result is all Mistral's: " + ", ".join(not_runnable))
     if preexisting:
         lines.append("baseline_warning: these checks already failed in the untouched "
                      + ("worktree" if wt else "checkout") + " before Mistral changed anything: "
@@ -1101,7 +1130,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     if scope:
         lines.append("scope: " + ", ".join(scope))
     if run.session_id:
-        lines.append(f"session_id: {run.session_id}  (follow up with: --resume {run.session_id}"
+        lines.append(f"session_id: {run.session_id}  (follow up with: --mode {args.mode} --resume {run.session_id}"
                      + (f" --worktree-name {wt['name']})" if wt else ")"))
 
     files: list[str] = []
