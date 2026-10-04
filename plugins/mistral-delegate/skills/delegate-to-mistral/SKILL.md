@@ -16,7 +16,7 @@ The session context names the active **policy** (`conservative`, `balanced` or `
 
 If both are yes, delegate it, even if you know exactly how you'd write it. Writing the code yourself is the expensive path. Keep design decisions, data-model choices, anything visual, and anything you can't check. Also keep small changes with subtle logic, such as URL or state synchronisation and edge-case handling, where reviewing Mistral's version properly takes about as long as writing it.
 
-**Habit:** after planning a change, label each step "mine" or "Mistral's". Start Mistral's steps in the background first, then do yours, then review and adopt.
+**Habit:** after planning a change, label each step "mine" or "Mistral's". Put Mistral's steps in **one plan file** and start it with `--plan` in the background (see Plans below), then do your steps, then review the plan's one report and adopt. A single isolated step can be a plain run instead.
 
 The session context may also show:
 
@@ -58,9 +58,42 @@ python3 <wrapper> --mode write --kind feature \
 - Allowed commands may carry their runner's harmless options: `uv run --directory . --no-sync pytest` counts as `uv run pytest`, and `npm --prefix frontend test` as `npm test`. Paths in those options must still be inside the project. Options that install or run other code (`uv run --with`, `--python`, `npm --node-options`/`--script-shell`, `npx --package`) are refused unless the allowed command itself contains them.
 - `--worktree-name` only reuses a worktree the plugin made. Never pass the name of a branch the user works on.
 
-### Parallel work
+### Plans: several steps in one call
 
-Split a change into independent steps that touch different files, and start each as its own background run (Bash `run_in_background`) or its own `mistral-worker` subagent. Several can run at once (`max_parallel`, default 3). `python3 <wrapper> --status` lists them, and `--result <id>` prints a finished report. Adopt them one at a time.
+For two or more steps, write one plan file instead of a spec per step, and run it with one call. The wrapper runs each step as its own Mistral run in its own worktree (up to `max_parallel` at a time, each after the steps it `depends` on, starting from their results), with the step's checks and fix rounds. It then merges the steps that succeeded into one worktree, runs the checks on the combined result, and if only the combination fails, has Mistral fix it once. You get one report and adopt once. This costs you far fewer tokens than a `mistral-worker` subagent per step, which repeats the reading and reviewing for every step.
+
+```markdown
+# Teams page
+verify: npm test
+kind: feature
+
+Shared context every step gets: conventions, files to follow (src/api/users.ts), test setup, what's out of scope.
+
+## step: api - Teams endpoint
+scope: src/api/teams.ts, src/api/teams.test.ts
+context: src/api/users.ts
+verify: npx vitest run src/api
+allow: npx vitest run
+
+What to build in this step: endpoints, cases to cover, insertion points.
+
+## step: ui - Teams page
+depends: api
+scope: src/pages/Teams.vue, src/pages/Teams.test.ts
+
+What to build in this step.
+```
+
+- **Format:** `# Title`, then optional plan settings (`verify:` checks for the merged result, `kind:` default kind), then the shared context. Each `## step: <id> - <title>` starts with its settings: `scope`, `context`, `depends` (comma-separated), `verify`, `allow` (one command per line, may repeat), `kind`. The rest is that step's instructions. A step gets the shared context, its own instructions, and one line about every other step; write each step as you'd write a spec.
+- **Split by file:** steps that change the same file conflict when merged (the report says so, and the later step isn't merged). Give each step its own files, and make a step that builds on another `depends` on it.
+- **Run it in the background:** `python3 <wrapper> --plan /tmp/plan-teams.md` (Bash `run_in_background`; it takes as long as its slowest chain of steps). `--steps api,ui` runs only some. Caps and flags (`--fix-attempts`, `--max-price`, ...) apply to each step. `--status` shows the plan and its steps while they run.
+- **The report:** `status: ok` (every step merged), `partial` or `failed`. One line per step (`-> merged`, `not merged: conflicts with ... in <files>`, `skipped: needs <step>`, or how to resume it), `step_notes` (warnings from the steps' own reports), `verification` of the merged result, usage and credit, the combined diff, and `adopt_with`. `--result <step run id>` prints a step's own report when you need detail.
+- **Finishing a step that failed:** resume it with the `--resume <session> --worktree-name <name>` the report gives, then `--integrate <plan id>` to merge again and recheck. Its report comes back like the first.
+- **Adopt or discard the plan, never a step:** `--adopt <plan id>` applies the merged result; `--adopt <plan id> --steps api` only those steps (with what they depend on); `--discard <plan id>` drops it all. `--include-out-of-scope` / `--skip-out-of-scope` work as for a run.
+
+### Single steps and subagents
+
+A single step is a plain run, in the background or through the `mistral-worker` subagent when you want its review done outside your context. Several plain runs can run at once (`max_parallel`, default 3); `--status` lists them and `--result <id>` prints a finished report. Adopt them one at a time.
 
 ### Project settings
 

@@ -1,6 +1,6 @@
 ---
 name: mistral-worker
-description: Use proactively to hand one well-defined implementation step to Mistral (Vibe CLI) while you keep working. Give it the step, the files involved, the checks that prove it works (e.g. "npm test"), and the wrapper path from the session context. It writes a spec, runs Mistral in an isolated worktree, has the checks run (with one automatic fix round), reviews the diff, and reports back a run id with an adopt or discard recommendation. It never applies changes to the checkout itself. Launch several in parallel for independent steps.
+description: Use to hand one isolated implementation step to Mistral (Vibe CLI) while you keep working. For two or more steps, write one plan and run it with `delegate.py --plan` instead of starting a worker per step: that is much cheaper. Give it the step, the files involved, the checks that prove it works (e.g. "npm test"), and the wrapper path from the session context. It writes a spec, runs Mistral in an isolated worktree, has the checks run (with one automatic fix round), reviews the diff, and reports back a run id with an adopt or discard recommendation. It never applies changes to the checkout itself. Launch several in parallel for independent steps.
 tools: Bash, Read, Grep, Glob, Write
 ---
 
@@ -33,7 +33,7 @@ Proofread the spec before running: Mistral copies names, paths and wording from 
 ## 3. Run it
 
 ```bash
-python3 <wrapper> --mode write --kind <tests|feature|bugfix|refactor|migration|boilerplate|docs|other> \
+python3 <wrapper> --via-worker --mode write --kind <tests|feature|bugfix|refactor|migration|boilerplate|docs|other> \
   --spec /tmp/mistral-spec-....md --context <file> --context <file> \
   --scope "<file or glob Mistral may change>" [--scope "..."] \
   --verify "<check command>" [--verify "<another>"] \
