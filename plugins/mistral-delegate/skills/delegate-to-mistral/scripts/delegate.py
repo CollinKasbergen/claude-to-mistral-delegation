@@ -8,6 +8,11 @@ Running a task:
       --allow-command "npm test" --verify "npm test" --verify "npx tsc --noEmit" -
   delegate.py --mode write --worktree-name mistral-ab12cd34 --resume <session-id> "Also cover empty strings"
 
+Several steps at once (one plan file, one report):
+  delegate.py --plan plan.md           run every step, merge them, check the result together
+  delegate.py --integrate PLAN_ID      merge again after resuming a step
+  delegate.py --adopt PLAN_ID [--steps a,b]
+
 Managing runs:
   delegate.py --status             running and recent delegations
   delegate.py --result ID          the full report of a run
@@ -47,12 +52,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mdelegate import commands as cmdforms, config, gitops, guard, ledger, vibe  # noqa: E402
+from mdelegate.checks import (EDITABLE_SOURCES, check_lines, measure_baseline, new_failures,  # noqa: E402
+                              python_path_env, run_checks, stop_process_group)
 from mdelegate.gitops import DelegateError  # noqa: E402
 
-KINDS = ("tests", "feature", "bugfix", "refactor", "migration", "boilerplate", "docs", "search", "other")
+KINDS = ("tests", "feature", "bugfix", "refactor", "migration", "boilerplate", "docs", "search", "other",
+         "integration")
 MAX_RESULT_CHARS = 12_000
-CHECK_OUTPUT_LINES = 60
-CHECK_OUTPUT_CHARS = 5_000
 def _env_number(name: str, default, cast=int):
     try:
         return cast(os.environ.get(name) or default)
@@ -120,6 +126,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--diff-lines", type=int, default=300,
                      help="Include the full diff in the report when it is at most this many lines (0: never).")
     run.add_argument("--vibe-bin", default=os.environ.get("VIBE_BIN", "vibe"))
+    run.add_argument("--via-worker", action="store_true",
+                     help="Set by the mistral-worker subagent, so --stats can tell its runs apart.")
+    run.add_argument("--plan-step", metavar="PLAN:STEP", help=argparse.SUPPRESS)  # set by the plan runner
+
+    plans = p.add_argument_group("plans (several steps in one call)")
+    plans.add_argument("--plan", metavar="FILE",
+                       help="Run every step of a plan file: steps in parallel worktrees (after the steps they "
+                            "depend on), each checked, then merged and checked together. One report.")
+    plans.add_argument("--steps", metavar="ID,ID",
+                       help="With --plan: run only these steps. With --adopt PLAN: apply only these steps.")
+    plans.add_argument("--integrate", metavar="PLAN_ID",
+                       help="Merge a plan's steps again (after you resumed one) and rerun the combined checks.")
 
     manage = p.add_argument_group("managing runs")
     manage.add_argument("--status", action="store_true", help="List running and recent delegations.")
@@ -146,12 +164,6 @@ def truncate(text: str, limit: int = MAX_RESULT_CHARS) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n\n[... truncated {len(text) - limit} chars ...]"
-
-
-def tail(text: str) -> str:
-    lines = text.rstrip().splitlines()[-CHECK_OUTPUT_LINES:]
-    out = "\n".join(lines)
-    return out[-CHECK_OUTPUT_CHARS:]
 
 
 # --- managing runs -------------------------------------------------------------
@@ -191,8 +203,19 @@ def refuse_while_running(run: dict) -> None:
                             + ". Wait for it to finish (see --status).")
 
 
+def plan_of(run: dict) -> str | None:
+    """The plan a run belongs to: a step's run, or a follow-up of one in the step's worktree."""
+    return next((r.get("plan") for r in runs_on_worktree(run) if r.get("plan")), None)
+
+
 def cmd_adopt(args: argparse.Namespace) -> int:
     run = find_run(args.adopt)
+    if run.get("mode") == "plan":
+        from mdelegate import plans
+        return plans.adopt(args, run, script_cmd)
+    if (plan := plan_of(run)):
+        raise DelegateError(f"{run['id']} is part of plan {plan}. Adopt the plan: --adopt {plan} (add --steps to "
+                            f"take only some steps; after resuming a step, run --integrate {plan} first).")
     refuse_while_running(run)
     wt = run.get("worktree")
     if not wt:
@@ -257,6 +280,11 @@ def cmd_adopt(args: argparse.Namespace) -> int:
 
 def cmd_discard(args: argparse.Namespace) -> int:
     run = find_run(args.discard)
+    if run.get("mode") == "plan":
+        from mdelegate import plans
+        return plans.discard(args, run)
+    if (plan := plan_of(run)):
+        raise DelegateError(f"{run['id']} is part of plan {plan}. Discard the plan: --discard {plan}.")
     refuse_while_running(run)
     wt = run.get("worktree")
     if wt and os.path.isdir(wt["path"]):
@@ -403,26 +431,6 @@ class Run:
             self.status = "error"
 
 
-def stop_process_group(proc: subprocess.Popen, grace: float = 10) -> None:
-    """Stop a process started with start_new_session=True and every process in its group."""
-    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, None)):
-        try:
-            os.killpg(proc.pid, sig)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-        try:
-            proc.wait(wait)
-            if sig == signal.SIGTERM:
-                # The leader is gone; make sure nothing it started lingers.
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-            return
-        except subprocess.TimeoutExpired:
-            continue
-
-
 CONTINUE_PROMPT = ("You stopped before finishing. Continue the task from where you left off, then end with "
                    "the summary: every file you changed and why, and anything you couldn't do.")
 
@@ -564,74 +572,6 @@ def test_strength(wt: dict, run_dir: str, checks: list[dict], baseline: dict, se
             + "). If that's an import or setup error rather than an assertion, it proves less.")
 
 
-def measure_baseline(commands: list[str], cwd: str, timeout: int, flaky: list[str]) -> dict:
-    """Run checks before Mistral changes anything; a failing check is rerun once (flaky ones pass then)."""
-    baseline = run_checks(commands, cwd, timeout)
-    failing = [cmd for cmd, (code, _out) in baseline.items() if code != 0]
-    if failing:
-        rerun = run_checks(failing, cwd, timeout)
-        flaky += [cmd for cmd, (code, _out) in rerun.items() if code == 0]
-        baseline.update(rerun)
-    return baseline
-
-
-# Folders (relative to the repo) that the linked virtualenv installs in editable mode from the user's
-# checkout: checks put the copy in the folder they run in first on PYTHONPATH.
-EDITABLE_SOURCES: list[str] = []
-
-
-def python_path_env(root: str | None) -> dict | None:
-    if not EDITABLE_SOURCES or not root:
-        return None
-    paths = [str(Path(root, rel)) for rel in EDITABLE_SOURCES]
-    return dict(os.environ, PYTHONPATH=os.pathsep.join(paths + [p for p in [os.environ.get("PYTHONPATH")] if p]))
-
-
-def run_checks(commands: list[str], cwd: str, timeout: int) -> dict[str, tuple[int, str]]:
-    """Run every check. Returns {command: (exit code, end of output)}."""
-    results = {}
-    env = python_path_env(gitops.toplevel(cwd)) if EDITABLE_SOURCES else None
-    for command in commands:
-        # Its own process group, so a timeout also stops what the check started (test workers, servers).
-        proc = subprocess.Popen(command, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True, env=env)
-        timed_out = False
-        try:
-            out, _ = proc.communicate(timeout=timeout)
-            code = proc.returncode
-        except subprocess.TimeoutExpired:
-            stop_process_group(proc, grace=2)
-            out, _ = proc.communicate()
-            code, timed_out = 124, True
-        except BaseException:
-            stop_process_group(proc, grace=2)
-            raise
-        output = (out or b"").decode("utf-8", errors="replace")
-        if timed_out:
-            output += f"\n[timed out after {timeout}s]"
-        results[command] = (code, tail(output))
-    return results
-
-
-def new_failures(results: dict, baseline: dict) -> list[tuple[str, int, str]]:
-    """Failing checks that passed (or weren't run) before Mistral changed anything."""
-    return [(cmd, code, out) for cmd, (code, out) in results.items()
-            if code != 0 and not (cmd in baseline and baseline[cmd][0] != 0)]
-
-
-def check_lines(results: dict, baseline: dict) -> list[str]:
-    lines = []
-    for cmd, (code, _out) in results.items():
-        if code == 0:
-            note = " (was failing before Mistral)" if cmd in baseline and baseline[cmd][0] != 0 else ""
-            lines.append(f"  pass: {cmd}{note}")
-        elif cmd in baseline and baseline[cmd][0] != 0:
-            lines.append(f"  FAIL: {cmd} (exit {code}; already failing before Mistral changed anything)")
-        else:
-            lines.append(f"  FAIL: {cmd} (exit {code})")
-    return lines
-
-
 def run_task(args: argparse.Namespace) -> int:
     workdir = str(Path(args.workdir).resolve())
     if args.task == "-":
@@ -691,14 +631,18 @@ def run_task(args: argparse.Namespace) -> int:
 
     prefix = "read" if not write else ("inplace" if args.in_place else "mistral")
     run_id = f"{prefix}-{uuid.uuid4().hex[:8]}"
+    plan_id, _, plan_step = (args.plan_step or "").partition(":")
     start = {"event": "start", "id": run_id, "time": time.time(), "pid": os.getpid(),
              "pid_started": ledger.process_started(os.getpid()), "mode": args.mode, "kind": kind,
              "repo": Path(top or workdir).name, "workdir": workdir, "task": task[:500], "policy": settings["policy"],
-             "model": model, "scope": scope, "continues": None, "worktree": None}
+             "model": model, "scope": scope, "continues": None, "worktree": None,
+             **({"plan": plan_id, "step": plan_step} if args.plan_step else {}),
+             **({"via": "worker"} if args.via_worker else {})}
     # Counting the running delegations and recording this one happen under one lock, so two runs
     # started at the same moment can't both slip under max_parallel.
     with ledger.locked():
-        active = ledger.running(ledger.load_runs())
+        # A plan's own record doesn't take a slot: its steps do.
+        active = [r for r in ledger.running(ledger.load_runs()) if r.get("mode") != "plan"]
         if len(active) >= settings["max_parallel"]:
             raise DelegateError(f"{len(active)} delegations are already running (max_parallel = "
                                 f"{settings['max_parallel']}): {', '.join(r['id'] for r in active)}. "
@@ -716,6 +660,8 @@ def run_task(args: argparse.Namespace) -> int:
                            "error": f"worktree: {e}"[:300]})
             print(f"status: error\n\nCould not prepare the worktree: {e}")
             return 2
+        if plan_step and plan_step != "integration":
+            wt["reused"] = False  # the plan runner made this step's worktree for this run
         if not Path(wt["path"], Path(workdir).relative_to(top)).is_dir():
             if not wt["reused"]:
                 gitops.remove_worktree(wt)
@@ -739,8 +685,13 @@ def run_task(args: argparse.Namespace) -> int:
         continues = max(same, key=lambda r: r.get("started") or 0)["id"] if same else None
     settings["continues"] = continues
     # A follow-up is listed under the task it continues, not under its resume message.
-    original = (ledger.load_runs().get(continues) or {}).get("task") if continues else None
+    parent = (ledger.load_runs().get(continues) or {}) if continues else {}
+    original = parent.get("task")
     label = f"{original.split(' [follow-up')[0]} [follow-up]" if original else task
+    # A follow-up of a plan step belongs to the plan too: it's adopted with the plan, after --integrate.
+    if parent.get("plan") and not args.plan_step:
+        start.update(plan=parent["plan"], step=parent.get("step"))
+    settings["plan"] = start.get("plan")
     # The full start record, now that the worktree and the run it continues are known.
     ledger.append(dict(start, task=label[:500], continues=continues,
                        worktree={k: wt[k] for k in ("name", "path", "toplevel", "base", "links")} if wt else None))
@@ -1064,7 +1015,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
             worktree_removed = True
             lines.append(f"worktree: removed {wt['name']} (Vibe failed before changing anything)")
         else:
-            lines += worktree_section(wt, run_id, files, out_of_scope, args.diff_lines)
+            lines += worktree_section(wt, run_id, files, out_of_scope, args.diff_lines, plan=settings.get("plan") or "")
     elif write:
         files = files_now
         out_of_scope = [f for f in files if scope and not vibe.matches_scope(f, scope)]
@@ -1104,7 +1055,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     report = "\n".join(lines)
     # What delegating cost Claude (writing the task and spec, reading this report) against what doing it
     # itself would have taken (Mistral's work, scaled by claude_relative_effort). Recorded for --stats.
-    overhead = vibe.effective_tokens(len(report) // 4, 0, (len(task) + len(spec or "")) // 4)
+    # A plan step's report is read by the plan runner, not Claude: the plan records Claude's overhead.
+    overhead = 0 if args.plan_step else vibe.effective_tokens(len(report) // 4, 0, (len(task) + len(spec or "")) // 4)
     equivalent = int((use["effective"] if use else run.effective) * settings["claude_relative_effort"])
     ledger.save_report(run_id, report)
     ledger.append({"event": "end", "id": run_id, "status": run.status, "verification": verification,
@@ -1169,7 +1121,8 @@ def credit_line(settings: dict, use: dict | None) -> str | None:
             + (f"; {unpriced} run(s) without a price aren't included" if unpriced else ""))
 
 
-def worktree_section(wt: dict, run_id: str, files: list[str], out_of_scope: list[str], diff_lines: int) -> list[str]:
+def worktree_section(wt: dict, run_id: str, files: list[str], out_of_scope: list[str], diff_lines: int,
+                     plan: str = "") -> list[str]:
     lines = [f"worktree_name: {wt['name']}" + ("  (reused)" if wt["reused"] else ""),
              f"worktree_path: {wt['path']}"]
     snap = wt.get("snapshot")
@@ -1214,7 +1167,14 @@ def worktree_section(wt: dict, run_id: str, files: list[str], out_of_scope: list
                             f"git -C {shlex.quote(wt['path'])} diff --cached {wt['base'][:12]}"))
         if diff_file and 0 < n <= diff_lines:
             lines.append(f"diff_file: {diff_file}")
+        if plan:
+            lines.append(f"part_of_plan: {plan} (adopt or discard the plan, not this step; after a follow-up, "
+                         f"run --integrate {plan} first)")
+            return lines
         lines.append(f"adopt_with: {script_cmd('--adopt', run_id)}   (add --paths ... to take only some files)")
+    if plan:
+        lines.append(f"part_of_plan: {plan} (adopt or discard the plan, not this step)")
+        return lines
     lines.append(f"discard_with: {script_cmd('--discard', run_id, '--note', 'why')}")
     return lines
 
@@ -1248,6 +1208,9 @@ def main(argv: list[str]) -> int:
             top = gitops.toplevel(str(Path(args.workdir).resolve()))
             print(config.describe(config.load(top or args.workdir)))
             return 0
+        if args.plan or args.integrate:
+            from mdelegate import plans
+            return plans.main(args, SCRIPT, KINDS, script_cmd)
         if args.adopt:
             return cmd_adopt(args)
         if args.discard:

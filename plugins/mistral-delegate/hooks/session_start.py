@@ -39,9 +39,10 @@ def build_context(cwd: str) -> str:
         f"Delegation policy: {policy}. {config.POLICY_GUIDANCE[policy]}",
         *[f"Config problem (delegations refuse to run until it's fixed; tell the user): {e}" for e in settings["errors"]],
         *[f"Config warning (tell the user if they ask about delegation settings): {w}" for w in settings["warnings"][:5]],
-        "Habit: after planning a change, mark each step 'mine' or 'Mistral's'. Start Mistral's steps "
-        "in the background first (always with --verify when the project has tests or a type check), "
-        "then work on yours, then review and --adopt.",
+        "Habit: after planning a change, mark each step 'mine' or 'Mistral's'. Put Mistral's steps in one "
+        "plan file and start it with --plan in the background (each step with its checks; see the skill), "
+        "then work on yours, then review the plan's report and --adopt it. A single isolated step can be "
+        "a plain run.",
         f"Wrapper: python3 {wrapper}  (pass this path to mistral-worker subagents)",
     ]
     if settings["verify"] or settings["allow_commands"]:

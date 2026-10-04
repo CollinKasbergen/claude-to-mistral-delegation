@@ -1,7 +1,8 @@
 """Append-only record of delegations: ~/.mistral-delegate/ledger.jsonl.
 
-Each line is one event: "start" when a run begins, "end" when it finishes, and
-"outcome" when Claude adopts or discards its result. Runs are rebuilt by folding
+Each line is one event: "start" when a run begins, "end" when it finishes,
+"outcome" when Claude adopts or discards its result, and "update" for facts
+learned later (a plan's step runs, Claude's share of a plan's overhead). Runs are rebuilt by folding
 the events in order. Full reports are kept in ~/.mistral-delegate/runs/<id>.txt.
 """
 
@@ -80,6 +81,8 @@ def load_runs() -> dict[str, dict]:
         elif run_id in runs and kind == "end":
             runs[run_id].update({k: v for k, v in event.items() if k not in ("event", "time")})
             runs[run_id]["finished"] = event.get("time")
+        elif run_id in runs and kind == "update":
+            runs[run_id].update({k: v for k, v in event.items() if k not in ("event", "time", "id")})
         elif run_id in runs and kind == "outcome":
             runs[run_id]["outcome"] = event.get("outcome")
             runs[run_id]["outcome_note"] = event.get("note")
@@ -150,7 +153,7 @@ def _age(seconds: float) -> str:
 def pending_review(runs: dict[str, dict]) -> list[dict]:
     """Finished write runs in a worktree that still await adopt or discard."""
     return [r for r in runs.values()
-            if r.get("worktree") and r.get("status") and not r.get("outcome")
+            if r.get("worktree") and r.get("status") and not r.get("outcome") and not r.get("plan")
             and r.get("files_changed") and os.path.isdir(r["worktree"].get("path", ""))]
 
 
@@ -226,8 +229,8 @@ def month_spend(runs: dict[str, dict], reset_day: int = 1, prices: dict | None =
     cutoff = time.mktime(start)
     spent, unpriced = 0.0, 0
     for r in runs.values():
-        if (r.get("started") or 0) < cutoff or not r.get("status"):
-            continue
+        if (r.get("started") or 0) < cutoff or not r.get("status") or r.get("mode") == "plan":
+            continue  # a plan's cost is its steps' costs, counted with them
         cost = run_cost(r, prices)
         if cost is None:
             unpriced += 1 if (r.get("tokens_in") or r.get("tokens")) else 0
@@ -247,7 +250,7 @@ def compute_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = N
                                                     "adopted": 0, "partial": 0, "discarded": 0, "cost": 0.0,
                                                     "costed": 0, "effective": 0, "saved": 0, "overhead": 0})
     for r in runs.values():
-        if (r.get("started") or 0) < cutoff or not r.get("status"):
+        if (r.get("started") or 0) < cutoff or not r.get("status") or r.get("mode") == "plan":
             continue
         s = by_kind[str(r.get("kind") or "other")]
         s["runs"] += 1
@@ -316,11 +319,35 @@ def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = No
                  + (f" ({uncosted} run(s) without a price are left out of costs)" if uncosted else ""))
     lines.append("savings: Claude-equivalent work of adopted runs per token Claude spent delegating "
                  "(writing specs, reading reports); x1 means delegating saved nothing.")
+    overhead = claude_overhead_per_step(runs, days)
+    if overhead:
+        lines.append(overhead)
     denied = top_denied(runs, days)
     if denied:
         lines.append("most denied commands (add to allow_commands if Mistral needs them):")
         lines += [f"  {n}x  {cmd}" for cmd, n in denied]
     return "\n".join(lines)
+
+
+def claude_overhead_per_step(runs: dict[str, dict], days: int = 90) -> str | None:
+    """Claude's tokens per delegated step: in plans versus single runs, to compare the two ways of delegating."""
+    cutoff = time.time() - days * 86400
+    groups: dict[str, list[int]] = {"plan": [], "single": [], "worker": []}
+    for r in runs.values():
+        if (r.get("started") or 0) < cutoff or not r.get("status") or r.get("mode") in ("plan", "read"):
+            continue
+        overhead = r.get("claude_overhead")
+        if not isinstance(overhead, (int, float)) or (r.get("plan") and r.get("step") == "integration"):
+            continue
+        groups["plan" if r.get("plan") else "worker" if r.get("via") == "worker" else "single"].append(int(overhead))
+    parts = [f"{label} ~{sum(v) // len(v):,} ({len(v)})" for label, v in
+             (("in plans", groups["plan"]), ("single runs", groups["single"]),
+              ("via mistral-worker", groups["worker"])) if v]
+    if not parts:
+        return None
+    return ("Claude tokens per delegated step (writing the task, reading the report; effective tokens): "
+            + ", ".join(parts) + (". Runs via the mistral-worker subagent also pay for the subagent's own context, "
+                                  "which isn't measured here." if groups["worker"] else "."))
 
 
 def compact_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = None, currency: str = "$") -> str:

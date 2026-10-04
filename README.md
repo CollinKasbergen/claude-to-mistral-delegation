@@ -1,6 +1,6 @@
 # claude-to-mistral-delegation
 
-A Claude Code plugin that lets Claude hand implementation steps to [Mistral Vibe](https://github.com/mistralai/mistral-vibe) through its programmatic mode (`vibe --prompt`). Claude splits the work, writes a spec for each step it delegates, and runs Mistral in an isolated git worktree while it keeps working. The wrapper then runs your project's checks, sends failures back to Mistral for a fix, and reports a short summary with the diff, what it cost, and a one-line adopt command.
+A Claude Code plugin that lets Claude hand implementation steps to [Mistral Vibe](https://github.com/mistralai/mistral-vibe) through its programmatic mode (`vibe --prompt`). Claude splits the work, writes one plan (or a spec for a single step), and runs Mistral in isolated git worktrees while it keeps working. The wrapper then runs your project's checks, sends failures back to Mistral for a fix, and reports a short summary with the diff, what it cost, and a one-line adopt command.
 
 ## Install
 
@@ -42,9 +42,9 @@ Claude delegates on its own, following the active policy. You can also ask ("hav
 | Piece | Path | Role |
 |---|---|---|
 | Skill | `skills/delegate-to-mistral/SKILL.md` | When to delegate, how to write specs, how to review and adopt |
-| Subagent | `agents/mistral-worker.md` | Runs one delegation end to end (spec, run, check, review) and recommends adopt or discard. Launch several in parallel. |
+| Subagent | `agents/mistral-worker.md` | Runs one isolated delegation end to end (spec, run, check, review) and recommends adopt or discard. For several steps, a plan is cheaper. |
 | Hook | `hooks/session_start.py` | At session start, tells Claude the policy, the wrapper path, the track record and runs awaiting review |
-| Wrapper | `skills/delegate-to-mistral/scripts/delegate.py` | Runs Vibe and checks, manages worktrees, records the ledger |
+| Wrapper | `skills/delegate-to-mistral/scripts/delegate.py` | Runs Vibe and checks, manages worktrees, records the ledger; `--plan` runs a whole plan (`mdelegate/plans.py`) |
 | Command | `commands/delegate-mistral.md` | `/delegate-mistral [read\|write] <task> \| status \| stats \| config` |
 
 (All paths are relative to `plugins/mistral-delegate/`.)
@@ -128,9 +128,20 @@ The model must be an alias Vibe knows: the built-ins are `mistral-medium-3.5` an
 
 Environment variables: `MISTRAL_DELEGATE_POLICY`, `MISTRAL_DELEGATE_MODEL`, `MISTRAL_DELEGATE_MAX_TURNS`, `MISTRAL_DELEGATE_TOKEN_BUDGET`, `MISTRAL_DELEGATE_MAX_TOOL_CALLS`, `MISTRAL_DELEGATE_MAX_PRICE`, `MISTRAL_DELEGATE_MAX_TOKENS`, `MISTRAL_DELEGATE_TIMEOUT`, `MISTRAL_DELEGATE_HOME` (default `~/.mistral-delegate`), `MISTRAL_DELEGATE_WORKTREES` (same as `worktrees_dir`), `VIBE_BIN`.
 
+## Plans: several steps in one call
+
+For a change with several steps, Claude writes one Markdown plan and runs it with `delegate.py --plan plan.md` (see [`examples/plan.md`](examples/plan.md)): a title, optional `verify:`/`kind:` settings, shared context, and `## step: <id>` sections with their own `scope`, `context`, `verify`, `allow` and `depends`.
+
+1. **Steps run in parallel worktrees**, up to `max_parallel` at a time. A step that `depends` on others waits for them and starts from their result. Each step is an ordinary run: it gets the shared context, its own instructions and one line about every other step, plus the guard, caps, checks and fix rounds. A step whose dependency failed is skipped.
+2. **Merging:** steps that succeeded are merged into the plan's own worktree. A step that conflicts with the steps merged before it isn't merged, and the report names the files.
+3. **Checks on the combined result:** the plan's `verify` (or every merged step's checks plus the configured ones) run on the merged result, with a baseline from the starting code. If only the combination fails, one Mistral run fixes it there.
+4. **One report:** a line per step, warnings from the steps' reports, the combined verification, usage and credit, and the combined diff. `--adopt <plan id>` applies it all (or `--steps a,b` for some), `--discard <plan id>` drops it. A failed step can be resumed and merged again with `--integrate <plan id>`.
+
+This replaces a `mistral-worker` subagent per step: Claude writes one plan and reads one report, and the wrapper does the coordination without spending Claude's tokens. `--stats` shows Claude's tokens per delegated step for plans and single runs, so you can compare.
+
 ## Parallel runs and the track record
 
-- **Parallel runs.** Every run gets its own worktree, so Claude can start several at once, up to `max_parallel`. `--status` lists running and recent runs, and `--result <id>` prints a finished report.
+- **Parallel runs.** Every run gets its own worktree, so Claude can start several at once, up to `max_parallel` (a plan's steps count, the plan itself doesn't). `--status` lists running and recent runs and plans, and `--result <id>` prints a finished report.
 - **Ledger.** Every run is recorded in `~/.mistral-delegate/ledger.jsonl`: kind of task, cost, check results, and whether it was adopted or discarded.
 - **Track record.** `--stats` shows the track record per kind of task. The session-start hook gives Claude a summary, so it can delegate more of what works.
 

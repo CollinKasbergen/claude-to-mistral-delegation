@@ -4,6 +4,7 @@ Run with: python3 -m unittest discover -s tests
 """
 
 import json
+import re
 import os
 import shlex
 import shutil
@@ -31,16 +32,22 @@ FAKE_VIBE = textwrap.dedent('''\
     cwd = os.getcwd()
     prompt = argv[argv.index("--prompt") + 1]
     calls_path = os.environ["FAKE_VIBE_CALLS"]
+    import fcntl, hashlib, re
+    lock = open(calls_path + ".lock", "w")  # plan steps run in parallel
+    fcntl.flock(lock, fcntl.LOCK_EX)
     calls = json.load(open(calls_path)) if os.path.exists(calls_path) else []
-    calls.append({"argv": argv, "cwd": cwd, "prompt": prompt,
+    calls.append({"argv": argv, "cwd": cwd, "prompt": prompt, "files": sorted(os.listdir(".")),
                   "sees_draft": os.path.exists("draft.py"),
                   "sees_edit": open("app.py").read() if os.path.exists("app.py") else None,
                   "has_node_modules": os.path.isdir("node_modules"),
                   "node_modules_is_link": os.path.islink("node_modules")})
     json.dump(calls, open(calls_path, "w"))
+    fcntl.flock(lock, fcntl.LOCK_UN)
 
     resumed = "--resume" in argv
-    session_id = argv[argv.index("--resume") + 1] if resumed else "sess-1234567890"
+    session_id = argv[argv.index("--resume") + 1] if resumed else (
+        "sess-" + hashlib.md5(cwd.encode()).hexdigest()[:10] if os.environ.get("FAKE_VIBE_UNIQUE_SESSION")
+        else "sess-1234567890")
     root = os.path.join(os.environ["VIBE_HOME"], "logs", "session")
     tokens_in, tokens_out = 1000, 200
     if os.environ.get("FAKE_VIBE_STORAGE") == "unified":
@@ -133,6 +140,9 @@ FAKE_VIBE = textwrap.dedent('''\
             open("fixed.txt", "w").write("fixed\\n")
         else:
             open("test_app.py", "w").write("def test_app():\\n    assert True\\n")
+            for path, content in re.findall(r"^FAKE_FILE (\\S+) (.*)$", prompt, re.M):  # files a plan step asks for
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                open(path, "w").write(content + "\\n")
             if os.environ.get("FAKE_VIBE_TOUCH_APP"):
                 open("app.py", "a").write("# changed by vibe\\n")
     entry = {"sessionId": session_id, "createdAt": 0, "updatedAt": 0, "generationStatus": "completed"}
@@ -198,7 +208,7 @@ class DelegateTestBase(unittest.TestCase):
                     "FAKE_VIBE_TOUCH_APP", "FAKE_VIBE_HOOK_CALLS", "FAKE_VIBE_NO_WRITE", "FAKE_VIBE_CANCEL",
                     "FAKE_VIBE_MODEL", "FAKE_VIBE_EXPERIMENT_PRICE", "FAKE_VIBE_SPEND", "FAKE_VIBE_EFFECTS",
                     "FAKE_VIBE_UNFINISHED", "FAKE_VIBE_CACHED", "FAKE_VIBE_CACHED_COMPLETION", "FAKE_VIBE_REWRITE_NOTICES",
-                    "FAKE_VIBE_CHILD", "FAKE_VIBE_OLD_CANCEL", "GIT_CONFIG_GLOBAL"):
+                    "FAKE_VIBE_CHILD", "FAKE_VIBE_OLD_CANCEL", "GIT_CONFIG_GLOBAL", "FAKE_VIBE_UNIQUE_SESSION"):
             self.env.pop(var, None)
 
     def tearDown(self):
@@ -1085,6 +1095,274 @@ class ConfigTest(DelegateTestBase):
         self.assertEqual(out.returncode, 2)
         self.assertIn("already running", out.stdout)
         self.assertEqual(self.calls(), [])
+
+
+class PlanParserTest(unittest.TestCase):
+    PLAN = textwrap.dedent("""\
+        # Teams page
+        verify: npm test
+        kind: feature
+
+        Use the patterns in src/api/users.ts.
+        Note: tests use vitest.
+
+        ## step: api - Teams endpoint
+        scope: src/api/teams.ts, tests/api/teams.test.ts
+        verify: npx vitest run tests/api
+        verify: npx tsc --noEmit
+        allow: `npx vitest run`
+
+        Build GET /api/teams.
+        Note: keep it small.
+
+        ## Step: ui
+        depends: api
+
+        Build the page.
+        """)
+
+    def test_parses_settings_shared_context_and_steps(self):
+        from mdelegate import plan as plans
+        p = plans.parse(self.PLAN)
+        self.assertEqual((p.title, p.verify, p.kind), ("Teams page", ["npm test"], "feature"))
+        self.assertIn("Note: tests use vitest.", p.shared)  # an unknown "key:" line is text
+        api = p.step("api")
+        self.assertEqual(api.title, "Teams endpoint")
+        self.assertEqual(api.scope, ["src/api/teams.ts", "tests/api/teams.test.ts"])
+        self.assertEqual(api.verify, ["npx vitest run tests/api", "npx tsc --noEmit"])
+        self.assertEqual(api.allow, ["npx vitest run"])
+        self.assertIn("Note: keep it small.", api.text)
+        self.assertEqual(p.step("ui").depends, ["api"])
+        spec = plans.step_spec(p, p.step("ui"))
+        self.assertIn("Use the patterns in src/api/users.ts.", spec)
+        self.assertIn("Already done in the code you start from\n\n- api: Teams endpoint", spec)
+        self.assertNotIn("Build GET /api/teams.", spec)  # only its own step's instructions
+
+    def test_the_example_plan_parses(self):
+        from mdelegate import plan as plans
+        p = plans.parse((PLUGIN.parent.parent / "examples" / "plan.md").read_text())
+        self.assertEqual([s.id for s in p.order()], ["api", "store", "page", "docs"])
+
+    def test_rejects_broken_plans(self):
+        from mdelegate import plan as plans
+        for text, problem in [("# T\n\nno steps", "at least one"), ("## step: a\nx", "starts with"),
+                              ("# T\n## step: a\ndepends: b\nx", "isn't a step"),
+                              ("# T\n## step: a\ndepends: b\nx\n## step: b\ndepends: a\ny", "cycle"),
+                              ("# T\n## step: a\n\n## step: a\nx", "used twice")]:
+            with self.subTest(text=text):
+                with self.assertRaises(plans.PlanError) as ctx:
+                    plans.parse(text)
+                self.assertIn(problem, str(ctx.exception))
+        p = plans.parse(self.PLAN)
+        with self.assertRaises(plans.PlanError):
+            plans.select(p, ["ui"])  # needs api
+        self.assertEqual([s.id for s in plans.select(p, ["api"])], ["api"])
+
+
+class PlanRunTest(DelegateTestBase):
+    def setUp(self):
+        super().setUp()
+        self.env["FAKE_VIBE_UNIQUE_SESSION"] = "1"
+
+    def plan(self, text):
+        path = self.tmpdir / "plan.md"
+        path.write_text(textwrap.dedent(text))
+        return path
+
+    def runs(self):
+        return {e["id"]: e for e in map(json.loads, (self.home / "ledger.jsonl").read_text().splitlines())
+                if e.get("event") == "start"}
+
+    def test_steps_run_after_what_they_need_and_merge(self):
+        plan = self.plan("""\
+            # Two files
+            Shared rule: keep it short.
+
+            ## step: a - File A
+            scope: a.txt, test_app.py
+            verify: test -f a.txt
+            FAKE_FILE a.txt A
+
+            ## step: b - File B
+            scope: b.txt, test_app.py
+            depends: a
+            FAKE_FILE b.txt B
+
+            ## step: c
+            scope: c.txt, test_app.py
+            FAKE_FILE c.txt C
+            """)
+        out = self.run_delegate("--plan", str(plan))
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("status: ok", out.stdout)
+        self.assertIn("(3 of 3 steps merged)", out.stdout)
+        calls = {Path(c["cwd"]).name.rsplit("-", 1)[1]: c for c in self.calls()}
+        self.assertIn("a.txt", calls["b"]["files"])  # b starts from a's result
+        self.assertNotIn("a.txt", calls["c"]["files"])
+        self.assertIn("Shared rule: keep it short.", calls["c"]["prompt"])
+        self.assertNotIn("FAKE_FILE a.txt", calls["c"]["prompt"])  # only its own step
+        self.assertIn("pass: test -f a.txt", out.stdout)  # a's check, run again on the merged result
+        plan_id = self.value(out, "plan_id")
+        step_run = next(r["id"] for r in self.runs().values() if r.get("step") == "a")
+        refused = self.run_delegate("--adopt", step_run)
+        self.assertIn(f"part of plan {plan_id}", refused.stdout)
+        adopt = self.run_delegate("--adopt", plan_id)
+        self.assertEqual(adopt.returncode, 0, adopt.stdout)
+        for name in ("a.txt", "b.txt", "c.txt", "test_app.py"):
+            self.assertTrue((self.repo / name).exists(), name)
+        self.assertEqual(list((self.home / "worktrees").glob("*/plan-*")), [])
+        status = self.run_delegate("--status").stdout
+        self.assertNotIn("pending", status.split("started:")[0])
+
+    def test_conflicts_skips_and_an_integration_fix(self):
+        plan = self.plan("""\
+            # Conflicts
+            verify: test -f fixed.txt || test $(ls step_*.txt | wc -l) -le 1
+
+            ## step: a
+            scope: *.txt, test_app.py
+            FAKE_FILE step_a.txt A
+            FAKE_FILE shared.txt from-a
+
+            ## step: b
+            scope: *.txt, test_app.py
+            FAKE_FILE step_b.txt B
+
+            ## step: c
+            scope: *.txt, test_app.py
+            FAKE_FILE shared.txt from-c
+
+            ## step: d
+            depends: c
+            scope: d.txt, test_app.py
+            FAKE_FILE d.txt D
+            """)
+        out = self.run_delegate("--plan", str(plan))
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("status: partial", out.stdout)
+        self.assertIn("c: ok", out.stdout)
+        self.assertIn("not merged: conflicts with the steps merged before it in shared.txt", out.stdout)
+        self.assertIn("not merged: needs c, which wasn't merged", out.stdout)
+        self.assertIn("after an integration fix run", out.stdout)  # a + b together failed, then were fixed
+        self.assertIn("verification: passed", out.stdout)
+        fix = next(r for r in self.runs().values() if r.get("step") == "integration")
+        self.assertIn("failed (exit code", next(c["prompt"] for c in self.calls()
+                                                 if Path(c["cwd"]).name == self.value(out, "plan_id")))
+        adopt = self.run_delegate("--adopt", self.value(out, "plan_id"), "--steps", "a")
+        self.assertEqual(adopt.returncode, 0, adopt.stdout)
+        self.assertTrue((self.repo / "step_a.txt").exists())
+        self.assertFalse((self.repo / "step_b.txt").exists())
+        self.assertFalse((self.repo / "fixed.txt").exists())  # the fix belonged to a + b together
+        outcomes = {e["id"]: e["outcome"] for e in map(json.loads, (self.home / "ledger.jsonl").read_text().splitlines())
+                    if e.get("event") == "outcome"}
+        steps = {r.get("step"): r["id"] for r in self.runs().values() if r.get("step")}
+        self.assertEqual(outcomes[steps["a"]], "adopted")
+        self.assertEqual(outcomes[steps["b"]], "discarded")
+        self.assertEqual(outcomes[fix["id"]], "discarded")
+        self.assertEqual(outcomes[self.value(out, "plan_id")], "adopted_partial")
+
+    def test_a_resumed_step_joins_after_integrate(self):
+        plan = self.plan("""\
+            # Resume
+            ## step: a
+            scope: a.txt, test_app.py
+            FAKE_FILE a.txt A
+
+            ## step: b
+            scope: b.txt, test_app.py, fixed.txt
+            verify: test -f fixed.txt
+            FAKE_FILE b.txt B
+            """)
+        out = self.run_delegate("--plan", str(plan), "--fix-attempts", "0")
+        self.assertIn("status: partial", out.stdout)
+        plan_id = self.value(out, "plan_id")
+        resume = re.search(r"--resume (\S+) --worktree-name (\S+)", out.stdout)
+        follow = self.run_delegate("--mode", "write", "--resume", resume.group(1), "--worktree-name", resume.group(2),
+                                   "The check `test -f fixed.txt` failed (exit code 1). Fix it.")
+        self.assertIn(f"part_of_plan: {plan_id}", follow.stdout)
+        early = self.run_delegate("--adopt", plan_id, "--steps", "a")
+        self.assertEqual(early.returncode, 0, early.stdout)  # a alone is fine; b isn't merged yet
+        self.assertTrue((self.repo / "a.txt").exists())
+        self.assertFalse((self.repo / "b.txt").exists())
+
+    def test_integrate_merges_a_finished_step(self):
+        plan = self.plan("""\
+            # Resume
+            ## step: a
+            scope: a.txt, test_app.py
+            FAKE_FILE a.txt A
+
+            ## step: b
+            scope: b.txt, test_app.py, fixed.txt
+            verify: test -f fixed.txt
+            FAKE_FILE b.txt B
+            """)
+        out = self.run_delegate("--plan", str(plan), "--fix-attempts", "0")
+        plan_id = self.value(out, "plan_id")
+        stale = self.run_delegate("--adopt", plan_id, "--steps", "a,b")
+        self.assertIn("Not merged in this plan", stale.stdout)
+        resume = re.search(r"--resume (\S+) --worktree-name (\S+)", out.stdout)
+        self.run_delegate("--mode", "write", "--resume", resume.group(1), "--worktree-name", resume.group(2),
+                          "The check `test -f fixed.txt` failed (exit code 1). Fix it.")
+        again = self.run_delegate("--integrate", plan_id)
+        self.assertEqual(again.returncode, 0, again.stdout)
+        self.assertIn("(2 of 2 steps merged)", again.stdout)
+        adopt = self.run_delegate("--adopt", plan_id)
+        self.assertEqual(adopt.returncode, 0, adopt.stdout)
+        for name in ("a.txt", "b.txt", "fixed.txt"):
+            self.assertTrue((self.repo / name).exists(), name)
+        stats = self.run_delegate("--stats").stdout
+        self.assertIn("Claude tokens per delegated step", stats)
+        self.assertIn("in plans ~", stats)
+
+    def test_a_stopped_plan_stops_its_steps(self):
+        plan = self.plan("""\
+            # Slow
+            ## step: a
+            FAKE_FILE a.txt A
+            ## step: b
+            FAKE_FILE b.txt B
+            """)
+        env = dict(self.env, FAKE_VIBE_BEHAVIOUR="ok", FAKE_VIBE_STORAGE="unified", FAKE_VIBE_EFFECTS="1")
+        proc = subprocess.Popen([sys.executable, str(SCRIPT), "--workdir", str(self.repo), "--plan", str(plan)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        deadline = time.time() + 20
+        while time.time() < deadline and len(self.calls()) < 2:
+            time.sleep(0.05)
+        proc.terminate()
+        proc.communicate(timeout=90)
+        states = {r["id"]: r for r in map(json.loads, (self.home / "ledger.jsonl").read_text().splitlines())
+                  if r.get("event") == "end"}
+        plan_id = next(i for i in self.runs() if i.startswith("plan-"))
+        self.assertEqual(states[plan_id]["status"], "interrupted")
+        self.assertEqual(sorted(s["status"] for i, s in states.items() if i != plan_id), ["interrupted"] * 2)
+        out = self.run_delegate("--discard", plan_id)
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertEqual(list((self.home / "worktrees").glob("*/plan-*")), [])
+
+    def test_steps_wait_for_free_slots(self):
+        (self.home).mkdir(parents=True, exist_ok=True)
+        (self.home / "config.toml").write_text("max_parallel = 2\n")
+        with open(self.home / "ledger.jsonl", "a") as f:  # another delegation holds one slot (this process)
+            f.write(json.dumps({"event": "start", "id": "mistral-other", "pid": os.getpid(), "mode": "write",
+                                "time": time.time()}) + "\n")
+        plan = self.plan("""\
+            # Slots
+            ## step: a
+            FAKE_FILE a.txt A
+            ## step: b
+            FAKE_FILE b.txt B
+            """)
+        out = self.run_delegate("--plan", str(plan))
+        self.assertIn("(2 of 2 steps merged)", out.stdout)
+
+    def test_a_broken_plan_runs_nothing(self):
+        out = self.run_delegate("--plan", str(self.plan("# T\n## step: a\ndepends: zz\nx\n")))
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("The plan has a problem", out.stdout)
+        self.assertEqual(self.calls(), [])
+        out = self.run_delegate("--plan", str(self.plan("# T\nkind: chores\n## step: a\nx\n")))
+        self.assertIn("Unknown kind chores", out.stdout)
 
 
 class EditableInstallTest(DelegateTestBase):

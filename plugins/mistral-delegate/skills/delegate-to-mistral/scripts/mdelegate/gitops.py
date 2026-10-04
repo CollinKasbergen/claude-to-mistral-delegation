@@ -286,7 +286,13 @@ def prepare_dependencies(top: str, worktree: Path, extra: list[str], auto: bool,
 
 
 def prepare_worktree(top: str, name: str, *, snapshot: bool, link_deps: bool, extra_links: list[str],
-                     deps_mode: str = "hardlink", worktrees_dir: str | None = None) -> dict:
+                     deps_mode: str = "hardlink", worktrees_dir: str | None = None, start: str = "HEAD",
+                     merge: list[str] | tuple = ()) -> dict:
+    """A new worktree on branch `name` (or the plugin's existing one with that name).
+
+    It starts from `start` (HEAD by default, plus a snapshot of the user's uncommitted work), with
+    the branches in `merge` merged in: a plan step starts from the steps it depends on.
+    """
     if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
         raise DelegateError(f"Invalid worktree name: {name!r} (use letters, digits, '.', '_' and '-')")
 
@@ -314,8 +320,12 @@ def prepare_worktree(top: str, name: str, *, snapshot: bool, link_deps: bool, ex
 
     path = worktree_root(top, worktrees_dir) / name
     path.parent.mkdir(parents=True, exist_ok=True)
-    git_checked(top, "worktree", "add", "-q", "-b", name, str(path), "HEAD")
+    git_checked(top, "worktree", "add", "-q", "-b", name, str(path), start)
     try:
+        for branch in merge:
+            conflicts = merge_branch(str(path), branch, f"mistral-delegate: start from {branch}")
+            if conflicts:
+                raise DelegateError(f"{branch} doesn't merge cleanly with the rest ({', '.join(conflicts[:5])})")
         snap = snapshot_uncommitted(top, path) if snapshot else None
         methods: dict = {}
         links, notes = prepare_dependencies(top, path, extra_links, auto=link_deps, mode=deps_mode, methods=methods)
@@ -429,6 +439,31 @@ def changed_since(top: str, before: dict[str, str | None]) -> list[str]:
     after = checkout_state(top)
     missing = object()
     return sorted(p for p in set(before) | set(after) if before.get(p, missing) != after.get(p, missing))
+
+
+def merge_branch(path: str, branch: str, message: str) -> list[str]:
+    """Merge a branch into the worktree at path. Returns [] or the conflicting files (the merge is undone)."""
+    try:
+        git_checked(path, *GIT_IDENTITY, "merge", "--no-ff", "--no-edit", "-m", message, branch)
+        return []
+    except DelegateError as e:
+        conflicts = [f for f in git(path, "diff", "--name-only", "--diff-filter=U").splitlines() if f]
+        git(path, "merge", "--abort")
+        return conflicts or [str(e).splitlines()[-1][:200]]
+
+
+def commit_all(wt: dict, message: str) -> str | None:
+    """Commit everything Vibe changed in a worktree (not its dependency links). Returns the new HEAD."""
+    stage_changes(wt)
+    staged = subprocess.run(["git", *GIT_DEFAULTS, "-C", wt["path"], "diff", "--cached", "--quiet",
+                             "--ignore-submodules"], capture_output=True)
+    if staged.returncode == 0:  # nothing to commit
+        return git(wt["path"], "rev-parse", "HEAD").strip() or None
+    try:
+        git_checked(wt["path"], *GIT_IDENTITY, "commit", "-q", "--no-verify", "-m", message)
+    except DelegateError:
+        return None
+    return git(wt["path"], "rev-parse", "HEAD").strip() or None
 
 
 def commit_applied(wt: dict, files: list[str]) -> None:
