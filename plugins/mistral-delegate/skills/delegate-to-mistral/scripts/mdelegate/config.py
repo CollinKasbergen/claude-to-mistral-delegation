@@ -41,7 +41,10 @@ POLICY_GUIDANCE = {
     ),
 }
 
-KEYS = ("policy", "model", "verify", "allow_commands", "fix_attempts", "max_parallel")
+KEYS = ("policy", "model", "verify", "allow_commands", "fix_attempts", "max_parallel", "deps_mode", "baseline",
+        "scope", "vibe_args")
+
+DEPS_MODES = ("hardlink", "copy", "symlink", "none")
 
 
 def home() -> Path:
@@ -79,6 +82,10 @@ def load(repo_root: str | None) -> dict:
         "allow_commands": [],
         "fix_attempts": 1,
         "max_parallel": 3,
+        "deps_mode": "hardlink",
+        "baseline": True,
+        "scope": [],
+        "vibe_args": [],
         "read": {},
         "write": {},
         "sources": {},
@@ -111,7 +118,13 @@ def load(repo_root: str | None) -> dict:
         settings["policy"] = "balanced"
     settings["verify"] = _as_list(settings["verify"])
     settings["allow_commands"] = _as_list(settings["allow_commands"])
+    settings["scope"] = _as_list(settings["scope"])
+    settings["vibe_args"] = _as_list(settings["vibe_args"])
     settings["model"] = settings["model"] or None
+    if settings["deps_mode"] not in DEPS_MODES:
+        settings["warnings"].append(f"unknown deps_mode {settings['deps_mode']!r}, using 'hardlink'")
+        settings["deps_mode"] = "hardlink"
+    settings["baseline"] = bool(settings["baseline"])
     try:
         settings["fix_attempts"] = max(0, int(settings["fix_attempts"]))
         settings["max_parallel"] = max(1, int(settings["max_parallel"]))
@@ -146,6 +159,10 @@ def describe(settings: dict) -> str:
         f"allow_commands: {', '.join(settings['allow_commands']) or '(none)'}",
         f"fix_attempts: {settings['fix_attempts']}",
         f"max_parallel: {settings['max_parallel']}",
+        f"deps_mode: {settings['deps_mode']}",
+        f"baseline: {'on' if settings['baseline'] else 'off'} (run checks on the untouched worktree first)",
+        f"scope: {', '.join(settings['scope']) or '(set per task with --scope)'}",
+        f"vibe_args: {' '.join(settings['vibe_args']) or '(none)'}",
     ]
     for mode in ("read", "write"):
         c = caps(settings, mode)

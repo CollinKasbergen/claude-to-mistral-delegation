@@ -27,16 +27,20 @@ The wrapper path is in the session context (or `scripts/delegate.py` in this ski
 ```bash
 python3 <wrapper> --mode write --kind feature \
   --spec /tmp/spec.md --context src/api/users.ts --context src/api/users.test.ts \
+  --scope "src/api/teams.ts" --scope "src/api/teams.test.ts" \
   --verify "npm test" --verify "npx tsc --noEmit" \
   --allow-command "npm test" \
   "Add the /api/teams endpoint as described in the spec"
 ```
 
 - `--mode read` (default): read-only tools, runs in place. Use it for codebase questions.
-- `--mode write`: a new worktree starting from the current code (uncommitted and untracked files included), with `node_modules`, `.venv` and similar folders linked from the checkout. `--link .env` adds others. `--in-place` edits the checkout directly; use it only when the user asks.
+- `--mode write`: a new worktree starting from the current code (uncommitted and untracked files included). Ignored `node_modules`, `.venv` and similar folders are hard-linked in by default: real folders whose files are shared with the checkout, so tools like Vite accept them. `--deps-mode copy|symlink|none` changes that, and `--link .env` adds a symlink to another path. `--in-place` edits the checkout directly; use it only when the user asks.
+- `--scope GLOB` (repeatable, relative to the repo root): the files Mistral may create or change. **Always set it for write tasks.** Mistral is told to stay inside it, changes outside it are flagged as `out_of_scope_changes`, and `--adopt` leaves them out unless you add `--include-out-of-scope`. A tests-only task gets only the test files as scope. `*` also matches `/`.
 - `--kind`: one of `tests feature bugfix refactor migration boilerplate docs search other`. It feeds the track record, so always set it.
 - `--spec FILE`: the plan, included in the prompt. Write it to a temp file outside the repo. `--context PATH` (repeatable) names files Mistral should read first.
 - `--verify CMD` (repeatable): checks the wrapper runs after Mistral finishes. On a failure, the output goes back to the same Mistral session for a fix (`--fix-attempts N`, default 1). **Always pass the project's real checks when they exist.** Configured checks apply automatically (see below).
+  - Before Mistral starts, the checks also run once on the untouched worktree (the baseline; `--no-baseline` turns it off). Checks that already fail there are reported as `already failing before Mistral changed anything`. Mistral is told not to work around them, and they never trigger a fix round.
+  - A `baseline_warning` usually means the worktree environment differs from the checkout (dependencies, `.env`), or the checks were already broken. Check that before blaming Mistral's change.
 - `--allow-command CMD` (repeatable): command prefixes Mistral may run itself while working, e.g. the test command, so it can iterate. Each part of a chained command must match. Anything else stays refused. `--allow-shell` allows every command; use it only with the user's OK.
 - `--model ALIAS`: a Vibe model alias from the user's Vibe config, for this run.
 - Caps come from the policy (`--show-config` shows them). Override with `--max-turns`, `--max-price` or `--max-tokens` and tell the user when you raise them. Fix rounds add half the price cap each.
@@ -56,6 +60,8 @@ verify = ["npm test", "npx tsc --noEmit"]   # checks after every write run
 allow_commands = ["npm test", "npx vitest"] # commands Mistral may run itself
 fix_attempts = 1
 max_parallel = 3
+deps_mode = "hardlink"                      # hardlink | copy | symlink | none
+baseline = true                             # run checks on the untouched worktree first
 # model = "mistral-medium-3.5"
 [write]
 max_price = 1.50
@@ -81,9 +87,13 @@ The wrapper adds the rules itself: which commands may run, which checks must pas
 
 The report starts with `run_id`, `status` and `verification`, then `usage` (cost, steps, tokens), the change list, and the full diff when it is short.
 
+- **verification: passed_except_preexisting.** Mistral broke nothing new, but some checks were already failing. Treat it like passed for Mistral's work, and look at the `baseline_warning`.
 - **verification: passed.** Review the diff for scope and quality, then run `adopt_with`. That applies only Mistral's changes to the checkout, leaves the user's uncommitted work alone, and removes the worktree. Use `--paths` to take part of it.
 - **verification: failed.** Read `failing_check_output`. Either follow up with `--resume … --worktree-name …` and a precise instruction, fix it yourself after adopting, or discard.
 - **status: limit_reached / timeout.** Resume with a higher cap, or finish it yourself.
+- **out_of_scope_changes.** Mistral edited files outside the scope. `--adopt` leaves them out. Look at them before deciding whether to add `--include-out-of-scope`, and never take them just to make a check pass.
+- **denied_commands.** Commands Mistral tried to run but wasn't allowed to. If one is a check it needs (e.g. `npx vitest run`), suggest adding it to `allow_commands`. `--stats` lists the most denied commands.
+- **usage.** `cost $…` is exact. `cost ~$…` is estimated from token counts at list prices. If it keeps saying "cost unknown", suggest `vibe_args = ["--legacy-harness"]` in the config.
 - **Not worth keeping.** `--discard <id> --note "why"`. The note feeds the track record.
 - Always adopt or discard, so worktrees don't pile up. The session context lists runs still awaiting a decision.
 

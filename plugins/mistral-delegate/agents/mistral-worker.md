@@ -31,12 +31,14 @@ Out of scope: <what not to touch>.
 ```bash
 python3 <wrapper> --mode write --kind <tests|feature|bugfix|refactor|migration|boilerplate|docs|other> \
   --spec /tmp/mistral-spec-....md --context <file> --context <file> \
+  --scope "<file or glob Mistral may change>" [--scope "..."] \
   --verify "<check command>" [--verify "<another>"] \
   [--allow-command "<test command>"] \
   "<one-line task summary>"
 ```
 
 - Use `--verify` with the project's real checks whenever they exist (tests, type check, lint). Settings from `.mistral-delegate.toml` apply automatically; `python3 <wrapper> --show-config` shows them.
+- Always pass `--scope` with exactly the files the step should touch (for a tests-only step, only the test files).
 - Add `--allow-command` for the test command when Mistral should iterate on failures itself.
 - Don't raise the caps unless the caller asked to.
 
@@ -45,6 +47,9 @@ python3 <wrapper> --mode write --kind <tests|feature|bugfix|refactor|migration|b
 Read the report. If the diff wasn't included, read it with the `Review with:` command. Check that:
 - the change does what the spec asked, and nothing unrelated;
 - tests weren't deleted or weakened;
+- nothing is listed under `out_of_scope_changes` (if something is, explain it; `--adopt` leaves those files out);
+- checks marked "already failing before Mistral" or a `baseline_warning` are reported to the main agent as an environment or pre-existing problem, not as Mistral's failure;
+- `denied_commands` doesn't include a command Mistral needed (if it does, say which, so it can be added to `allow_commands`);
 - the code follows the patterns of the surrounding code.
 
 If something small is wrong, you may follow up once with `--resume <session_id> --worktree-name <name>` and a precise instruction.

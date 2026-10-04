@@ -20,12 +20,31 @@ verify = ["npm test", "npx tsc --noEmit"]
 # mistakes before handing back. These are prefixes: "npm test" also allows
 # "npm test -- src/foo.test.ts". Anything not listed is refused.
 allow_commands = ["npm test", "npx tsc --noEmit"]
+# Tip: the report's denied_commands section (and --stats) shows commands Mistral
+# tried but wasn't allowed to run; add the useful ones here.
 
 # How many times a failing check goes back to Mistral (0 turns this off).
 fix_attempts = 1
 
 # Maximum number of Mistral tasks running at the same time.
 max_parallel = 3
+
+# How dependency folders (node_modules, .venv, ...) get into Mistral's worktree:
+#   hardlink - real folders whose files are shared with your checkout (default;
+#              fast, and tools like Vite accept them)
+#   copy     - full independent copy (slow for big folders)
+#   symlink  - a link to your checkout's folder (instant, but Vite rejects files
+#              that resolve outside the project)
+#   none     - nothing
+deps_mode = "hardlink"
+
+# Run the checks once on the untouched worktree before Mistral starts, so
+# failures that were already there aren't blamed on Mistral.
+baseline = true
+
+# Extra flags for every Vibe call. If reports keep saying "cost unknown",
+# this one makes Vibe record exact costs:
+# vibe_args = ["--legacy-harness"]
 
 # Mistral model alias from your Vibe config. Leave unset for Vibe's default.
 # model = "mistral-medium-3.5"

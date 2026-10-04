@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from . import config
 
@@ -118,7 +118,7 @@ def format_status(runs: dict[str, dict], limit: int = 15) -> str:
         task = " ".join((r.get("task") or "").split())[:60]
         lines.append(
             f"{r['id']:<18} {st:<14} {r.get('verification') or '-':<8} {cost:<8} "
-            f"{r.get('outcome') or ('pending' if r['id'] in pending else '-'):<10} "
+            f"{OUTCOME_LABELS.get(r.get('outcome'), r.get('outcome')) or ('pending' if r['id'] in pending else '-'):<10} "
             f"{_age(now - (r.get('started') or now)):<5} {r.get('kind', '?') + '/' + r.get('mode', '?'):<17} {task}")
     active = running(runs)
     if active:
@@ -126,10 +126,14 @@ def format_status(runs: dict[str, dict], limit: int = 15) -> str:
     return "\n".join(lines)
 
 
+OUTCOME_LABELS = {"adopted_partial": "partial"}
+
+
 def compute_stats(runs: dict[str, dict], days: int = 90) -> dict:
     cutoff = time.time() - days * 86400
     by_kind: dict[str, dict] = defaultdict(lambda: {"runs": 0, "ok": 0, "verified": 0, "passed": 0,
-                                                    "adopted": 0, "discarded": 0, "cost": 0.0})
+                                                    "adopted": 0, "partial": 0, "discarded": 0, "cost": 0.0,
+                                                    "costed": 0})
     for r in runs.values():
         if (r.get("started") or 0) < cutoff or not r.get("status"):
             continue
@@ -139,13 +143,37 @@ def compute_stats(runs: dict[str, dict], days: int = 90) -> dict:
         if r.get("verification") in ("passed", "failed"):
             s["verified"] += 1
             s["passed"] += r["verification"] == "passed"
-        if r.get("outcome") in ("adopted", "adopted_partial"):
+        if r.get("outcome") == "adopted":
             s["adopted"] += 1
+        elif r.get("outcome") == "adopted_partial":
+            s["partial"] += 1
         elif r.get("outcome") == "discarded":
             s["discarded"] += 1
         if isinstance(r.get("cost"), (int, float)):
             s["cost"] += r["cost"]
+            s["costed"] += 1
     return dict(by_kind)
+
+
+def _adopted(s: dict) -> str:
+    decided = s["adopted"] + s["partial"] + s["discarded"]
+    if not decided:
+        return "-"
+    text = f"{s['adopted']}/{decided}"
+    return text + (f" (+{s['partial']} partial)" if s["partial"] else "")
+
+
+def _avg_cost(s: dict) -> str:
+    return f"${s['cost'] / s['costed']:.3f}" if s["costed"] else "?"
+
+
+def top_denied(runs: dict[str, dict], days: int = 90, limit: int = 5) -> list[tuple[str, int]]:
+    cutoff = time.time() - days * 86400
+    counts: Counter = Counter()
+    for r in runs.values():
+        if (r.get("started") or 0) >= cutoff:
+            counts.update(r.get("denied") or [])
+    return counts.most_common(limit)
 
 
 def format_stats(runs: dict[str, dict], days: int = 90) -> str:
@@ -153,17 +181,19 @@ def format_stats(runs: dict[str, dict], days: int = 90) -> str:
     if not stats:
         return f"No finished delegations in the last {days} days."
     lines = [f"Delegations in the last {days} days:",
-             "kind          runs  ok   verify-pass  adopted/decided  avg-cost  total-cost"]
+             "kind          runs  ok   verify-pass  adopted/decided       avg-cost  total-cost"]
     total_runs, total_cost = 0, 0.0
     for kind, s in sorted(stats.items(), key=lambda kv: -kv[1]["runs"]):
-        decided = s["adopted"] + s["discarded"]
         verify = f"{s['passed']}/{s['verified']}" if s["verified"] else "-"
-        adopted = f"{s['adopted']}/{decided}" if decided else "-"
-        lines.append(f"{kind:<13} {s['runs']:<5} {s['ok']:<4} {verify:<12} {adopted:<16} "
-                     f"${s['cost'] / s['runs']:<8.3f} ${s['cost']:.2f}")
+        lines.append(f"{kind:<13} {s['runs']:<5} {s['ok']:<4} {verify:<12} {_adopted(s):<21} "
+                     f"{_avg_cost(s):<9} ${s['cost']:.2f}")
         total_runs += s["runs"]
         total_cost += s["cost"]
-    lines.append(f"total: {total_runs} runs, ${total_cost:.2f}")
+    lines.append(f"total: {total_runs} runs, ${total_cost:.2f} (runs with unknown cost not included)")
+    denied = top_denied(runs, days)
+    if denied:
+        lines.append("most denied commands (add to allow_commands if Mistral needs them):")
+        lines += [f"  {n}x  {cmd}" for cmd, n in denied]
     return "\n".join(lines)
 
 
@@ -171,12 +201,12 @@ def compact_stats(runs: dict[str, dict], days: int = 90) -> str:
     stats = compute_stats(runs, days)
     parts = []
     for kind, s in sorted(stats.items(), key=lambda kv: -kv[1]["runs"]):
-        decided = s["adopted"] + s["discarded"]
         bit = f"{kind}: {s['runs']} runs"
-        if decided:
-            bit += f", {s['adopted']}/{decided} adopted"
+        if s["adopted"] + s["partial"] + s["discarded"]:
+            bit += f", {_adopted(s)} adopted"
         if s["verified"]:
             bit += f", {s['passed']}/{s['verified']} passed checks"
-        bit += f", ${s['cost'] / s['runs']:.2f} avg"
+        if s["costed"]:
+            bit += f", {_avg_cost(s)} avg"
         parts.append(bit)
     return "; ".join(parts)

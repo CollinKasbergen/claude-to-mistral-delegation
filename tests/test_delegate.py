@@ -32,21 +32,42 @@ FAKE_VIBE = textwrap.dedent('''\
     calls.append({"argv": argv, "cwd": cwd, "prompt": prompt,
                   "sees_draft": os.path.exists("draft.py"),
                   "sees_edit": open("app.py").read() if os.path.exists("app.py") else None,
-                  "has_node_modules": os.path.isdir("node_modules")})
+                  "has_node_modules": os.path.isdir("node_modules"),
+                  "node_modules_is_link": os.path.islink("node_modules")})
     json.dump(calls, open(calls_path, "w"))
 
-    session_id = argv[argv.index("--resume") + 1] if "--resume" in argv else "sess-1234567890"
-    log_dir = os.path.join(os.environ["VIBE_HOME"], "logs", "session", "session_20260101_" + session_id[:8])
-    os.makedirs(log_dir, exist_ok=True)
-    meta_path = os.path.join(log_dir, "meta.json")
-    stats = {"steps": 0, "session_prompt_tokens": 0, "session_completion_tokens": 0, "session_cost": 0.0}
-    if os.path.exists(meta_path):
-        stats = json.load(open(meta_path))["stats"]
-    stats = {"steps": stats["steps"] + 4, "session_prompt_tokens": stats["session_prompt_tokens"] + 1000,
-             "session_completion_tokens": stats["session_completion_tokens"] + 200,
-             "session_cost": stats["session_cost"] + 0.0125}
-    json.dump({"session_id": session_id, "environment": {"working_directory": cwd}, "stats": stats},
-              open(meta_path, "w"))
+    resumed = "--resume" in argv
+    session_id = argv[argv.index("--resume") + 1] if resumed else "sess-1234567890"
+    root = os.path.join(os.environ["VIBE_HOME"], "logs", "session")
+    tokens_in, tokens_out = 1000, 200
+    if os.environ.get("FAKE_VIBE_STORAGE") == "unified":
+        sdir = os.path.join(root, "unified", session_id)
+        os.makedirs(os.path.join(sdir, "journal"), exist_ok=True)
+        os.makedirs(os.path.join(sdir, "generations", "0001"), exist_ok=True)
+        json.dump({"session_id": session_id, "environment": {"working_directory": cwd}},
+                  open(os.path.join(sdir, "meta.json"), "w"))
+        json.dump({"session_metadata": {"active_model": "mistral-medium-3.5"}},
+                  open(os.path.join(sdir, "generations", "0001", "runtime-state.json"), "w"))
+        journal = os.path.join(sdir, "journal", "0001.jsonl")
+        prev = 0
+        if os.path.exists(journal):
+            prev = len(open(journal).read().splitlines())
+        usage = {"inputTokens": tokens_in * (prev + 1), "outputTokens": tokens_out * (prev + 1), "totalTokens": 0}
+        with open(journal, "a") as f:
+            f.write(json.dumps({"type": "projection_delta", "payload": {"delta": [
+                {"op": "set_envelope", "state": {"session": {"id": session_id, "tokenUsage": usage}}}]}}) + "\\n")
+    else:
+        log_dir = os.path.join(root, "session_20260101_" + session_id[:8])
+        os.makedirs(log_dir, exist_ok=True)
+        meta_path = os.path.join(log_dir, "meta.json")
+        stats = {"steps": 0, "session_prompt_tokens": 0, "session_completion_tokens": 0, "session_cost": 0.0}
+        if os.path.exists(meta_path):
+            stats = json.load(open(meta_path))["stats"]
+        stats = {"steps": stats["steps"] + 4, "session_prompt_tokens": stats["session_prompt_tokens"] + tokens_in,
+                 "session_completion_tokens": stats["session_completion_tokens"] + tokens_out,
+                 "session_cost": stats["session_cost"] + 0.0125}
+        json.dump({"session_id": session_id, "environment": {"working_directory": cwd}, "stats": stats},
+                  open(meta_path, "w"))
 
     behaviour = os.environ.get("FAKE_VIBE_BEHAVIOUR", "ok")
     if behaviour == "limit":
@@ -61,14 +82,29 @@ FAKE_VIBE = textwrap.dedent('''\
             open("fixed.txt", "w").write("fixed\\n")
         else:
             open("test_app.py", "w").write("def test_app():\\n    assert True\\n")
+            if os.environ.get("FAKE_VIBE_TOUCH_APP"):
+                open("app.py", "a").write("# changed by vibe\\n")
     entry = {"sessionId": session_id, "createdAt": 0, "updatedAt": 0, "generationStatus": "completed"}
-    history = [
-        dict(entry, id="1", type="message", role="user", content=[{"type": "text", "text": "task"}]),
-        dict(entry, id="2", type="effect", title="read_file", state={"status": "completed", "display": {}}),
-        dict(entry, id="3", type="effect", title="bash: pytest", state={"status": "skipped", "reason": "denied", "display": {}}),
-        dict(entry, id="4", type="message", role="assistant", content=[{"type": "text", "text": "Done: added test_app.py"}]),
+    turn = [
+        dict(entry, id=f"u{len(calls)}", type="message", role="user", source="turn_start",
+             content=[{"type": "text", "text": prompt}]),
+        dict(entry, id=f"r{len(calls)}", type="effect", title="Read file",
+             detail={"kind": "file_read", "toolName": "read_file", "input": {"filePath": "app.py"}},
+             state={"status": "completed", "display": {}}),
+        dict(entry, id=f"b{len(calls)}", type="effect", title="Run command",
+             detail={"kind": "shell", "toolName": "bash", "input": {"command": "npx vitest run"}},
+             state={"status": "skipped", "reason": "denied", "display": {}}),
+        dict(entry, id=f"a{len(calls)}", type="message", role="assistant",
+             content=[{"type": "text", "text": "Done: added test_app.py"},
+                      {"type": "text", "text": "Done: added test_app.py"}]),
     ]
-    print(json.dumps(history, indent=2))
+    # Like the real CLI, a resumed session prints the whole history, earlier turns included.
+    history = [dict(entry, id="old-u", type="message", role="user", source="turn_start",
+                    content=[{"type": "text", "text": "earlier"}]),
+               dict(entry, id="old-b", type="effect", title="Run command",
+                    detail={"kind": "shell", "toolName": "bash", "input": {"command": "rm -rf /tmp/x"}},
+                    state={"status": "skipped", "reason": "denied", "display": {}})] if resumed else []
+    print(json.dumps(history + turn, indent=2))
 ''')
 
 
@@ -95,7 +131,8 @@ class DelegateTestBase(unittest.TestCase):
                         VIBE_HOME=str(tmp / "vibe-home"), MISTRAL_DELEGATE_HOME=str(self.home),
                         PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}")
         for var in ("MISTRAL_DELEGATE_POLICY", "MISTRAL_DELEGATE_MODEL", "MISTRAL_DELEGATE_MAX_PRICE",
-                    "MISTRAL_DELEGATE_MAX_TURNS", "MISTRAL_DELEGATE_WORKTREES"):
+                    "MISTRAL_DELEGATE_MAX_TURNS", "MISTRAL_DELEGATE_WORKTREES", "FAKE_VIBE_STORAGE",
+                    "FAKE_VIBE_TOUCH_APP"):
             self.env.pop(var, None)
 
     def tearDown(self):
@@ -105,8 +142,8 @@ class DelegateTestBase(unittest.TestCase):
         return subprocess.run(["git", "-C", str(self.repo), *args], check=True,
                               capture_output=True, text=True).stdout
 
-    def run_delegate(self, *args, behaviour="ok", workdir=None, stdin=None):
-        env = dict(self.env, FAKE_VIBE_BEHAVIOUR=behaviour)
+    def run_delegate(self, *args, behaviour="ok", workdir=None, stdin=None, **extra_env):
+        env = dict(self.env, FAKE_VIBE_BEHAVIOUR=behaviour, **extra_env)
         return subprocess.run([sys.executable, str(SCRIPT), "--workdir", str(workdir or self.repo), *args],
                               capture_output=True, text=True, env=env, input=stdin)
 
@@ -142,11 +179,29 @@ class ReadModeTest(DelegateTestBase):
         self.assertIn("kind: search", out.stdout)
         self.assertIn("session_id: sess-1234567890", out.stdout)
         self.assertIn("Done: added test_app.py", out.stdout)
-        self.assertIn("bash: pytest: skipped (denied)", out.stdout)
+        self.assertIn("denied_commands (read mode runs no commands):\n  - bash: npx vitest run", out.stdout)
 
     def test_usage_reports_cost_steps_and_tokens(self):
         out = self.run_delegate("--max-price", "0.5", "Task")
-        self.assertIn("usage: cost $0.0125 (first-pass cap $0.50), 4 steps, 1,200 tokens", out.stdout)
+        self.assertIn("usage: cost $0.0125, first-pass cap $0.50, 1,200 tokens", out.stdout)
+        self.assertIn("turns: 4 (max_turns 15), tool calls: 2", out.stdout)
+
+    def test_cost_estimated_from_unified_harness_journal(self):
+        out = self.run_delegate("Task", FAKE_VIBE_STORAGE="unified")
+        # 1000 input tokens at $1.5/M + 200 output tokens at $7.5/M
+        self.assertIn("usage: cost ~$0.0030 (estimated from tokens at mistral-medium-3.5 list prices)", out.stdout)
+        self.assertIn("1,200 tokens", out.stdout)
+
+    def test_unified_follow_up_reports_this_runs_tokens(self):
+        self.run_delegate("Task", FAKE_VIBE_STORAGE="unified")
+        out = self.run_delegate("--resume", "sess-1234567890", "More", FAKE_VIBE_STORAGE="unified")
+        self.assertIn("usage: cost ~$0.0030", out.stdout)
+        self.assertIn("session total $0.0060", out.stdout)
+
+    def test_result_text_is_not_duplicated(self):
+        out = self.run_delegate("Task")
+        self.assertEqual(out.stdout.count("Done: added test_app.py"), 1)
+        self.assertEqual(out.stdout.count("--- result from Mistral Vibe ---"), 1)
 
     def test_model_generates_read_only_profile(self):
         self.run_delegate("--model", "mistral-small", "Task")
@@ -216,7 +271,8 @@ class WriteModeTest(DelegateTestBase):
         self.assertTrue(seen["has_node_modules"])
         self.assertIn("--trust", seen["argv"])
         self.assertIn("1 modified, 1 untracked", out.stdout)
-        self.assertIn("node_modules", out.stdout.split("linked_from_checkout")[1].split("\n")[0])
+        self.assertIn("dependencies (hard-linked copies from your checkout): node_modules", out.stdout)
+        self.assertFalse(seen["node_modules_is_link"])
         changes = out.stdout.split("changes_by_vibe:")[1].split("diff:")[0]
         self.assertIn("test_app.py", changes)
         self.assertNotIn("draft.py", changes)
@@ -246,7 +302,8 @@ class WriteModeTest(DelegateTestBase):
         self.assertEqual(len(self.calls()), 1)
 
     def test_failed_check_goes_back_to_vibe_for_a_fix(self):
-        out = self.run_delegate("--mode", "write", "--verify", "test -f fixed.txt || (echo 'missing fixed.txt'; exit 3)", "Task")
+        check = "test ! -f test_app.py || test -f fixed.txt || (echo 'missing fixed.txt'; exit 3)"
+        out = self.run_delegate("--mode", "write", "--verify", check, "Task")
         self.assertEqual(out.returncode, 0, out.stdout)
         self.assertIn("verification: passed (after 1 fix attempt)", out.stdout)
         calls = self.calls()
@@ -261,12 +318,82 @@ class WriteModeTest(DelegateTestBase):
         self.assertIn("usage: cost $0.0250", out.stdout)
 
     def test_check_still_failing_is_reported(self):
-        out = self.run_delegate("--mode", "write", "--fix-attempts", "0", "--verify", "echo boom; exit 1", "Task")
+        check = "test ! -f test_app.py || (echo boom; exit 1)"
+        out = self.run_delegate("--mode", "write", "--fix-attempts", "0", "--verify", check, "Task")
         self.assertEqual(out.returncode, 1)
         self.assertIn("verification: failed (first try)", out.stdout)
-        self.assertIn("FAIL: echo boom; exit 1 (exit 1)", out.stdout)
+        self.assertIn(f"FAIL: {check} (exit 1)", out.stdout)
         self.assertIn("failing_check_output", out.stdout)
         self.assertIn("boom", out.stdout.split("failing_check_output")[1])
+
+    def test_preexisting_failure_is_not_blamed_on_mistral(self):
+        out = self.run_delegate("--mode", "write", "--verify", "test -f never.txt", "--verify", "true", "Task")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("verification: passed_except_preexisting (first try)", out.stdout)
+        self.assertIn("already failing before Mistral changed anything", out.stdout)
+        self.assertIn("baseline_warning:", out.stdout)
+        self.assertEqual(len(self.calls()), 1)  # no fix round for a failure that was already there
+        self.assertIn("These checks already fail before your change", self.last()["prompt"])
+
+    def test_no_baseline_flag(self):
+        out = self.run_delegate("--mode", "write", "--no-baseline", "--fix-attempts", "0",
+                                "--verify", "test -f never.txt", "Task")
+        self.assertIn("verification: failed", out.stdout)
+        self.assertNotIn("baseline_warning", out.stdout)
+
+    def test_denied_commands_are_named_once_per_turn(self):
+        check = "test ! -f test_app.py || test -f fixed.txt"
+        out = self.run_delegate("--mode", "write", "--verify", check, "Task")
+        self.assertEqual(len(self.calls()), 2)
+        denied = out.stdout.split("denied_commands")[1].split("\n\n")[0]
+        self.assertIn("bash: npx vitest run  (2x)", denied)  # once in each of the two turns
+        self.assertNotIn("rm -rf", denied)  # earlier turns repeated in resumed output are not recounted
+        self.assertIn("tool calls: 4", out.stdout)
+        stats = self.run_delegate("--stats").stdout
+        self.assertIn("most denied commands", stats)
+        self.assertIn("bash: npx vitest run", stats)
+
+    def test_scope_is_in_prompt_and_out_of_scope_changes_are_flagged_and_not_adopted(self):
+        out = self.run_delegate("--mode", "write", "--scope", "test_*.py", "Add tests", FAKE_VIBE_TOUCH_APP="1")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("Only create or change files matching: `test_*.py`", self.last()["prompt"])
+        self.assertIn("out_of_scope_changes", out.stdout)
+        self.assertIn("app.py", out.stdout.split("out_of_scope_changes")[1].split("\n")[0])
+        run_id = self.value(out, "run_id")
+        adopt = self.run_delegate("--adopt", run_id)
+        self.assertEqual(adopt.returncode, 0, adopt.stdout)
+        self.assertIn("Left out (outside the run's scope", adopt.stdout)
+        self.assertTrue((self.repo / "test_app.py").exists())
+        self.assertEqual((self.repo / "app.py").read_text(), "print('v1')\n")
+        self.assertIn("partial", self.run_delegate("--status").stdout)
+        self.assertIn("+1 partial", self.run_delegate("--stats").stdout)
+
+    def test_include_out_of_scope(self):
+        out = self.run_delegate("--mode", "write", "--scope", "test_*.py", "Add tests", FAKE_VIBE_TOUCH_APP="1")
+        adopt = self.run_delegate("--adopt", self.value(out, "run_id"), "--include-out-of-scope")
+        self.assertEqual(adopt.returncode, 0, adopt.stdout)
+        self.assertIn("# changed by vibe", (self.repo / "app.py").read_text())
+
+    def test_hardlinked_dependencies_share_files_but_skip_caches(self):
+        pkg = self.repo / "node_modules" / "left-pad"
+        (pkg / "index.js").write_text("module.exports = 1\n")
+        (self.repo / "node_modules" / ".vite").mkdir()
+        (self.repo / "node_modules" / ".vite" / "cache.json").write_text("{}")
+        out = self.run_delegate("--mode", "write", "Task")
+        wt = Path(self.value(out, "worktree_path"))
+        copy = wt / "node_modules" / "left-pad" / "index.js"
+        self.assertFalse((wt / "node_modules").is_symlink())
+        self.assertEqual(copy.stat().st_ino, (pkg / "index.js").stat().st_ino)
+        self.assertFalse((wt / "node_modules" / ".vite").exists())
+        self.assertNotIn("node_modules", out.stdout.split("changes_by_vibe:")[1].split("adopt_with")[0])
+
+    def test_symlink_and_copy_deps_modes(self):
+        out = self.run_delegate("--mode", "write", "--deps-mode", "symlink", "Task")
+        self.assertTrue(self.last()["node_modules_is_link"])
+        self.assertIn("dependencies (symlinks from your checkout)", out.stdout)
+        out = self.run_delegate("--mode", "write", "--deps-mode", "copy", "Task")
+        self.assertFalse(self.last()["node_modules_is_link"])
+        self.assertIn("dependencies (copies from your checkout)", out.stdout)
 
     def test_adopt_applies_changes_and_removes_worktree(self):
         (self.repo / "app.py").write_text("print('v2 uncommitted')\n")
@@ -397,6 +524,18 @@ class ConfigTest(DelegateTestBase):
         self.assertNotIn("verification", out.stdout)
         argv = self.last()["argv"]
         self.assertEqual(float(argv[argv.index("--max-price") + 1]), 0.4)
+
+    def test_vibe_args_are_passed_through(self):
+        (self.repo / ".mistral-delegate.toml").write_text('vibe_args = ["--legacy-harness"]\n')
+        self.run_delegate("Task")
+        self.assertEqual(self.last()["argv"][-1], "--legacy-harness")
+
+    def test_deps_mode_and_baseline_from_config(self):
+        (self.repo / ".mistral-delegate.toml").write_text('deps_mode = "symlink"\nbaseline = false\nscope = ["tests/**"]\n')
+        out = self.run_delegate("--show-config")
+        self.assertIn("deps_mode: symlink", out.stdout)
+        self.assertIn("baseline: off", out.stdout)
+        self.assertIn("scope: tests/**", out.stdout)
 
     def test_show_config(self):
         (self.repo / ".mistral-delegate.toml").write_text('policy = "conservative"\nmodel = "mistral-small"\n')
