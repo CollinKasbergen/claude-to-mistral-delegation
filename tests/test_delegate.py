@@ -509,7 +509,7 @@ class WriteModeTest(DelegateTestBase):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_UNFINISHED="1")
         self.assertEqual(len(self.calls()), 2)
         self.assertIn("You stopped before finishing", self.calls()[1]["prompt"])
-        self.assertIn("continued: Mistral stopped without a closing summary", out.stdout)
+        self.assertIn("continued: Mistral's work looked unfinished", out.stdout)
         self.assertNotIn("final_message_warning", out.stdout)
 
     def test_adopting_a_resume_settles_the_earlier_run_too(self):
@@ -615,6 +615,26 @@ class WriteModeTest(DelegateTestBase):
         self.assertNotIn("Rewrote tool_input for 'bash'", out.stdout)
         self.assertIn("3 tool-input rewrite notice(s)", out.stdout)
 
+    def test_resume_with_narrower_scope_keeps_the_earlier_runs_files(self):
+        first = self.run_delegate("--mode", "write", "--worktree-name", "mistral-narrow", "--scope", "test_app.py",
+                                  "--scope", "app.py", "Task", FAKE_VIBE_TOUCH_APP="1")
+        self.assertNotIn("out_of_scope_changes", first.stdout)
+        second = self.run_delegate("--mode", "write", "--worktree-name", "mistral-narrow", "--scope", "test_app.py",
+                                   "--resume", "sess-1234567890", "Fix the test")
+        self.assertNotIn("out_of_scope_changes", second.stdout)  # app.py is in the earlier run's scope
+        adopt = self.run_delegate("--adopt", self.value(second, "run_id"))
+        self.assertEqual(adopt.returncode, 0, adopt.stdout)
+        self.assertIn("# changed by vibe", (self.repo / "app.py").read_text())
+
+    def test_missing_file_named_in_scope_means_unfinished(self):
+        out = self.run_delegate("--mode", "write", "--scope", "tests/test_new.py", "--scope", "test_app.py",
+                                "--verify", "true", "Write the tests")
+        self.assertEqual(len(self.calls()), 2)  # asked once to create the missing file
+        self.assertIn("tests/test_new.py", self.calls()[1]["prompt"])
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("status: incomplete", out.stdout)
+        self.assertIn("missing_files (named in --scope but never created", out.stdout)
+
     def test_no_changes_is_its_own_status(self):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_NO_WRITE="1")
         self.assertEqual(out.returncode, 1)
@@ -665,10 +685,16 @@ class WriteModeTest(DelegateTestBase):
         self.assertIn("Only create or change files matching: `test_*.py`", self.last()["prompt"])
         self.assertIn("out_of_scope_changes", out.stdout)
         self.assertIn("app.py", out.stdout.split("out_of_scope_changes")[1].split("\n")[0])
+        self.assertLess(out.stdout.index("out_of_scope_changes"), out.stdout.index("usage:"))  # near the top
         run_id = self.value(out, "run_id")
-        adopt = self.run_delegate("--adopt", run_id)
+        refused = self.run_delegate("--adopt", run_id)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("Nothing applied: 1 changed file(s)", refused.stdout)
+        self.assertIn("  app.py", refused.stdout)
+        self.assertFalse((self.repo / "test_app.py").exists())
+        adopt = self.run_delegate("--adopt", run_id, "--skip-out-of-scope")
         self.assertEqual(adopt.returncode, 0, adopt.stdout)
-        self.assertIn("Left out (outside the run's scope", adopt.stdout)
+        self.assertIn("Left out", adopt.stdout)
         self.assertTrue((self.repo / "test_app.py").exists())
         self.assertEqual((self.repo / "app.py").read_text(), "print('v1')\n")
         self.assertIn("partial", self.run_delegate("--status").stdout)

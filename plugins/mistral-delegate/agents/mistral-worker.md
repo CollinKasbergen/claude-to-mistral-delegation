@@ -51,7 +51,8 @@ python3 <wrapper> --mode write --kind <tests|feature|bugfix|refactor|migration|b
 Read the report. If the diff wasn't included, read it with the `Review with:` command. Check that:
 - the change does what the spec asked, and nothing unrelated;
 - tests weren't deleted or weakened, and new tests would actually fail if the feature were broken (right object under test, no duplicated fixtures);
-- nothing is listed under `out_of_scope_changes` (if something is, explain it; `--adopt` leaves those files out);
+- nothing is listed under `out_of_scope_changes` (if something is, explain it and recommend `--include-out-of-scope` or `--skip-out-of-scope`, since `--adopt` stops until one is chosen);
+- every new file the spec named exists (a `missing_files` line or `status: incomplete` means it doesn't);
 - checks marked "already failing before Mistral" or a `baseline_warning` are reported to the main agent as an environment or pre-existing problem, not as Mistral's failure;
 - there is no `final_message_warning` (a cut-off run); if there is, treat the work as unfinished;
 - the status isn't `no_changes` (nothing was written), `stopped_by_refusal` (the session was cut short) or `budget_exceeded` / `tool_call_limit` (the wrapper stopped Mistral at a cap); if it is, say so plainly, with the `budget:` line;
