@@ -41,7 +41,7 @@ def build_context(cwd: str) -> str:
         f"Wrapper: python3 {wrapper}  (pass this path to mistral-worker subagents)",
     ]
     if settings["verify"] or settings["allow_commands"]:
-        lines.append(f"Configured checks: {', '.join(settings['verify']) or '(none)'}; "
+        lines.append(f"Configured checks: {'; '.join(config.check_label(c) for c in settings['verify']) or '(none)'}; "
                      f"commands Mistral may run: {', '.join(settings['allow_commands']) or '(none)'}.")
     runs = ledger.load_runs()
     record = ledger.compact_stats(runs)

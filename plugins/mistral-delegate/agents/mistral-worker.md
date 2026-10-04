@@ -23,6 +23,7 @@ Goal: <one sentence>.
 Files: <paths to read>, <paths to create or change>.
 Follow: <existing file whose patterns and style to match>.
 Requirements / cases: <bulleted list; be exhaustive, Mistral covers what you list and seldom more>.
+Test setup (for tests): <existing test file to copy; how to mount/render; what to stub and how; how to read results>.
 Out of scope: <what not to touch>.
 ```
 
@@ -49,6 +50,7 @@ Read the report. If the diff wasn't included, read it with the `Review with:` co
 - tests weren't deleted or weakened;
 - nothing is listed under `out_of_scope_changes` (if something is, explain it; `--adopt` leaves those files out);
 - checks marked "already failing before Mistral" or a `baseline_warning` are reported to the main agent as an environment or pre-existing problem, not as Mistral's failure;
+- there is no `final_message_warning` (a cut-off run); if there is, treat the work as unfinished;
 - the status isn't `no_changes` (nothing was written) or `stopped_by_refusal` (the session was cut short); if it is, say so plainly;
 - `denied_commands` / `refused_by_guard` don't include a command Mistral needed (if it does, say which, so it can be added to `allow_commands`);
 - the code follows the patterns of the surrounding code.

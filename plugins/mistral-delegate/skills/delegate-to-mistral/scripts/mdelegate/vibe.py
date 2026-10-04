@@ -120,14 +120,23 @@ def write_agent_profile(mode: str, model: str | None, allow_commands: list[str])
 
 def build_prompt(task: str, *, mode: str, spec: str | None, context: list[str], verify: list[str],
                  allow_commands: list[str], allow_shell: bool, scope: list[str] | None = None,
-                 preexisting_failures: list[str] | None = None) -> str:
+                 preexisting_failures: list[str] | None = None, root: str | None = None,
+                 cwd: str | None = None) -> str:
     parts = [task.strip()]
     if spec:
         if len(spec) > MAX_SPEC_CHARS:
             spec = spec[:MAX_SPEC_CHARS] + "\n[... spec truncated ...]"
         parts.append("## Spec\n\n" + spec.strip())
     if context:
-        parts.append("## Read these files first\n\n" + "\n".join(f"- {c}" for c in context))
+        parts.append("## Read these files first (paths relative to the project root)\n\n"
+                     + "\n".join(f"- {c}" for c in context))
+    if root:
+        where = (f"The project root is `{root}`"
+                 + (f"; your working directory is `{cwd}`" if cwd and cwd != root else " and it is your working directory")
+                 + ". Use paths relative to the project root (e.g. `src/app.ts`) or absolute paths inside it; "
+                   "never go above it. Read and search files with the read_file and grep tools rather than "
+                   "shell commands.")
+        parts.append("## Workspace\n\n" + where)
 
     if mode == "write":
         rules = []
@@ -443,3 +452,25 @@ def usage(after: dict | None, before: dict | None) -> dict | None:
 def matches_scope(path: str, scope: list[str]) -> bool:
     return any(fnmatch(path, pattern) or path == pattern.rstrip("/")
                or (pattern.endswith("/") and path.startswith(pattern)) for pattern in scope)
+
+
+def _literal_prefix(pattern: str) -> str:
+    """The part of a glob before its first wildcard."""
+    cut = min((pattern.find(c) for c in "*?[" if c in pattern), default=len(pattern))
+    return pattern[:cut]
+
+
+def check_applies(check_paths: list[str], scope: list[str], files: list[str]) -> bool:
+    """Whether a check limited to check_paths is relevant to this run's scope or changed files."""
+    if not check_paths:
+        return True
+    if any(matches_scope(f, check_paths) or any(f.startswith(_literal_prefix(p)) for p in check_paths)
+           for f in files):
+        return True
+    for s in scope:
+        a = _literal_prefix(s)
+        for p in check_paths:
+            b = _literal_prefix(p)
+            if a.startswith(b) or b.startswith(a):
+                return True
+    return False
