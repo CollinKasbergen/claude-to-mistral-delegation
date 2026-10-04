@@ -171,7 +171,9 @@ def build_prompt(task: str, *, mode: str, spec: str | None, context: list[str], 
                  + (f"; your working directory is `{cwd}`" if cwd and cwd != root else " and it is your working directory")
                  + ". Use paths relative to the project root (e.g. `src/app.ts`) or absolute paths inside it; "
                    "never go above it. Read and search files with the read_file and grep tools rather than "
-                   "shell commands.")
+                   "shell commands."
+                 + (" The absolute path contains spaces: use relative paths in shell commands, and quote any "
+                    "absolute path." if " " in root else ""))
         parts.append("## Workspace\n\n" + where)
 
     if mode == "write":
@@ -283,10 +285,37 @@ def _effect_tool(entry: dict) -> str:
     detail = entry.get("detail") or {}
     display = detail.get("display") if isinstance(detail.get("display"), dict) else {}
     for value in (detail.get("toolName"), detail.get("tool_name"), detail.get("name"), entry.get("title"),
-                  display.get("title"), detail.get("kind"), entry.get("toolName")):
+                  display.get("title"), entry.get("toolName"),
+                  detail.get("kind") if detail.get("kind") not in ("tool", None) else None):
         if isinstance(value, str) and value.strip():
             return value
     return "tool"
+
+
+def _label(entry: dict) -> str:
+    """'tool: command-or-path' for a tool call; falls back to its raw input so it is never just 'tool'."""
+    tool, target = _effect_tool(entry), _effect_target(entry)
+    if target:
+        return f"{tool}: {target}"
+    data = (entry.get("detail") or {}).get("input")
+    if data:
+        return f"{tool}: {json.dumps(data, ensure_ascii=False)[:160]}"
+    return tool
+
+
+def _callback_label(entry: dict) -> str | None:
+    """Label for a refused approval request (a 'callback' entry): the tool call it was about."""
+    detail = entry.get("detail") or {}
+    if detail.get("kind") != "approval":
+        return None
+    effect = detail.get("effect") or {}
+    label = _label({"detail": effect, "title": entry.get("title")})
+    if label in ("tool", None) or label.endswith(": "):
+        perms = detail.get("requiredPermissions") or detail.get("required_permissions") or []
+        pattern = next((p.get("invocationPattern") or p.get("label") for p in perms if isinstance(p, dict)), None)
+        if pattern:
+            label = f"{_effect_tool({'detail': effect}) if effect else 'tool'}: {pattern}"
+    return label
 
 
 def _is_denied(state: dict) -> bool:
@@ -303,6 +332,7 @@ def summarize_history(history: list) -> dict:
     tool_calls = 0
     assistant_messages = 0
     denied: list[str] = []
+    callback_denied: list[str] = []
     problems: list[str] = []
     notices: list[str] = []
 
@@ -319,17 +349,25 @@ def summarize_history(history: list) -> dict:
         elif kind == "effect":
             tool_calls += 1
             state = entry.get("state") or {}
-            tool = _effect_tool(entry)
-            target = _effect_target(entry)
             if _is_denied(state):
-                denied.append(f"{tool}: {target}" if target else str(entry.get("title") or tool))
+                denied.append(_label(entry))
             elif state.get("status") not in ("completed", None):
                 reason = state.get("reason") or (state.get("error") or {}).get("message") or ""
-                label = f"{tool}: {target}" if target else str(entry.get("title") or tool)
-                problems.append(f"{label} -> {state.get('status')}" + (f" ({reason})" if reason else ""))
+                problems.append(f"{_label(entry)} -> {state.get('status')}" + (f" ({reason})" if reason else ""))
+        elif kind == "callback":
+            state = entry.get("state") or {}
+            decision = ((state.get("output") or {}).get("decision") or {}).get("type") if isinstance(state.get("output"), dict) else None
+            if state.get("status") in ("cancelled", "expired") or decision in ("deny", "denied", "reject"):
+                label = _callback_label(entry)
+                if label:
+                    callback_denied.append(label)
         elif kind == "notice" and entry.get("level") in ("warning", "error"):
             notices.append(f"{entry.get('level')}: {entry.get('message', '')}")
 
+    # A refused approval shows up twice: as the approval request and as the skipped tool call.
+    # The request names the call properly, so when there are any, they are the list.
+    if callback_denied:
+        denied = callback_denied
     return {"session_id": session_id, "final_text": final_text, "tool_calls": tool_calls,
             "assistant_messages": assistant_messages, "denied": denied, "problems": problems,
             "notices": notices}
@@ -545,3 +583,146 @@ def check_applies(check_paths: list[str], scope: list[str], files: list[str]) ->
             if a.startswith(b) or b.startswith(a):
                 return True
     return False
+
+
+# --- live budget tracking -------------------------------------------------------------
+
+class SessionWatcher:
+    """Reads a running Vibe session's token usage and tool calls, incrementally.
+
+    Vibe enforces --max-price only with a known model price, and its turn limit
+    counts prompts rather than tool calls, so the wrapper watches the session
+    itself and stops it at the plugin's caps.
+    """
+
+    def __init__(self, cwd: str, since: float, session_id: str | None = None, model_hint: str | None = None):
+        self.cwd, self.since, self.session_id, self.model_hint = cwd, since, session_id, model_hint
+        self.config = vibe_config()
+        self.root = session_root(self.config)
+        self.dir: Path | None = None
+        self.kind = ""
+        self._offsets: dict[Path, int] = {}
+        self._partial: dict[Path, str] = {}
+        self._usage: dict | None = None
+        self._effects: set[str] = set()
+        self._meta: dict = {}
+
+    def _locate(self) -> bool:
+        if self.dir is not None:
+            return True
+        if not self.root.is_dir():
+            return False
+        unified = self.root / "unified"
+        if self.session_id:
+            if (unified / self.session_id).is_dir():
+                self.dir, self.kind = unified / self.session_id, "unified"
+                return True
+            for meta in self.root.glob(f"*_{self.session_id[:8]}/meta.json"):
+                self.dir, self.kind = meta.parent, "legacy"
+                return True
+            return False
+        candidates = []
+        for base, kind in ((unified, "unified"), (self.root, "legacy")):
+            if not base.is_dir():
+                continue
+            for d in base.iterdir():
+                try:
+                    if d.is_dir() and d.name != "unified" and d.stat().st_mtime >= self.since - 1:
+                        candidates.append((d.stat().st_mtime, d, kind))
+                except OSError:
+                    continue
+        for _mtime, d, kind in sorted(candidates, reverse=True):
+            try:
+                meta = json.loads((d / "meta.json").read_text())
+            except (OSError, ValueError):
+                continue
+            if _same_dir((meta.get("environment") or {}).get("working_directory"), self.cwd):
+                self.dir, self.kind, self._meta = d, kind, meta
+                self.session_id = meta.get("session_id") or d.name
+                return True
+        return False
+
+    def _read_journal(self) -> None:
+        for journal in sorted((self.dir / "journal").glob("*.jsonl")):
+            try:
+                with journal.open("r", encoding="utf-8", errors="replace") as f:
+                    f.seek(self._offsets.get(journal, 0))
+                    chunk = f.read()
+                    self._offsets[journal] = f.tell()
+            except OSError:
+                continue
+            lines = (self._partial.pop(journal, "") + chunk).split("\n")
+            self._partial[journal] = lines.pop()  # an incomplete last line waits for the next poll
+            for line in lines:
+                if '"tokenUsage"' not in line and '"effect"' not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                for delta in (record.get("payload") or {}).get("delta") or []:
+                    if not isinstance(delta, dict):
+                        continue
+                    session = (delta.get("state") or {}).get("session") or {}
+                    if isinstance(session.get("tokenUsage"), dict):
+                        self._usage = session["tokenUsage"]
+                    entry = delta.get("entry") or {}
+                    if entry.get("type") == "effect" and entry.get("id"):
+                        self._effects.add(entry["id"])
+
+    def poll(self) -> dict | None:
+        """{tokens_in, tokens_out, tool_calls, model, cost (exact or None), price (tuple or None)}, or None."""
+        if not self._locate():
+            return None
+        if self.kind == "unified":
+            self._read_journal()
+            if not self._meta:
+                try:
+                    self._meta = json.loads((self.dir / "meta.json").read_text())
+                except (OSError, ValueError):
+                    self._meta = {}
+            model = _unified_model(self.dir) or self.model_hint or DEFAULT_MODEL_ALIAS
+            usage = self._usage or {}
+            price = model_prices(self.config).get(model) or _find_model_price(
+                [self._meta.get("experiments"), self._meta.get("config")], model)
+            return {"tokens_in": int(usage.get("inputTokens") or 0), "tokens_out": int(usage.get("outputTokens") or 0),
+                    "tool_calls": len(self._effects), "model": model, "cost": None, "price": price}
+        try:
+            meta = json.loads((self.dir / "meta.json").read_text())
+        except (OSError, ValueError):
+            return None
+        stats = meta.get("stats") or {}
+        model = ((meta.get("config") or {}).get("active_model") if isinstance(meta.get("config"), dict) else None) \
+            or self.model_hint or DEFAULT_MODEL_ALIAS
+        tool_calls = sum(int(stats.get(k) or 0) for k in ("tool_calls_succeeded", "tool_calls_failed",
+                                                           "tool_calls_rejected", "tool_calls_hook_denied"))
+        price = None
+        if stats.get("input_price_per_million") or stats.get("output_price_per_million"):
+            price = (float(stats.get("input_price_per_million") or 0), float(stats.get("output_price_per_million") or 0))
+        price = price or model_prices(self.config).get(model)
+        cost = float(stats["session_cost"]) if stats.get("session_cost") else None
+        return {"tokens_in": int(stats.get("session_prompt_tokens") or 0),
+                "tokens_out": int(stats.get("session_completion_tokens") or 0),
+                "tool_calls": tool_calls, "model": model, "cost": cost, "price": price}
+
+
+def spent(snap: dict | None, base: dict | None) -> tuple[float, int, bool]:
+    """(cost, tool calls, priced_with_fallback) between two watcher snapshots.
+
+    Without a known price, tokens are priced at Mistral Medium's list price so the
+    cap still means something.
+    """
+    if not snap:
+        return 0.0, 0, False
+    if snap.get("model") == "local":
+        return 0.0, snap["tool_calls"] - (base or {}).get("tool_calls", 0), False
+    base = base or {"tokens_in": 0, "tokens_out": 0, "tool_calls": 0, "cost": None}
+    calls = snap["tool_calls"] - base.get("tool_calls", 0)
+    if snap.get("cost") is not None and snap.get("price") and any(snap["price"]):
+        return snap["cost"] - (base.get("cost") or 0.0), calls, False
+    price, fallback = snap.get("price"), False
+    if not price or not any(price):
+        price, fallback = BUILTIN_MODELS[DEFAULT_MODEL_ALIAS], True
+    tin = snap["tokens_in"] - base.get("tokens_in", 0)
+    tout = snap["tokens_out"] - base.get("tokens_out", 0)
+    return (tin * price[0] + tout * price[1]) / 1_000_000, calls, fallback

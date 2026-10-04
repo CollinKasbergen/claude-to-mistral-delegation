@@ -5,6 +5,7 @@ Run with: python3 -m unittest discover -s tests
 
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -76,6 +77,21 @@ FAKE_VIBE = textwrap.dedent('''\
         json.dump({"session_id": session_id, "environment": {"working_directory": cwd}, "stats": stats},
                   open(meta_path, "w"))
 
+    if os.environ.get("FAKE_VIBE_SPEND") or os.environ.get("FAKE_VIBE_EFFECTS"):
+        import time as _t
+        sdir = os.path.join(root, "unified", session_id)
+        journal = os.path.join(sdir, "journal", "0001.jsonl")
+        for step in range(1, 200):
+            delta = []
+            if os.environ.get("FAKE_VIBE_SPEND"):
+                delta.append({"op": "set_envelope", "state": {"session": {"tokenUsage": {
+                    "inputTokens": 100000 * step, "outputTokens": 0, "totalTokens": 0}}}})
+            if os.environ.get("FAKE_VIBE_EFFECTS"):
+                delta.append({"op": "append_entry", "entry": {"id": f"e{step}", "type": "effect"}})
+            with open(journal, "a") as f:
+                f.write(json.dumps({"type": "projection_delta", "payload": {"delta": delta}}) + "\\n")
+            _t.sleep(0.03)
+        sys.exit(0)
     behaviour = os.environ.get("FAKE_VIBE_BEHAVIOUR", "ok")
     if behaviour == "limit":
         print("I got halfway through.", file=sys.stderr)
@@ -121,6 +137,9 @@ FAKE_VIBE = textwrap.dedent('''\
              content=[{"type": "text", "text": "Done: added test_app.py"},
                       {"type": "text", "text": "Done: added test_app.py"}]),
     ]
+    if os.environ.get("FAKE_VIBE_UNFINISHED") and "You stopped before finishing" not in prompt:
+        turn.append(dict(entry, id=f"t{len(calls)}", type="effect", title="Read file",
+                         detail={"toolName": "read_file", "input": {"path": "app.py"}}, state={"status": "completed"}))
     if os.environ.get("FAKE_VIBE_CANCEL"):
         turn[-1] = dict(turn[-1], content=[{"type": "text", "text": "<user_cancellation>User cancelled the operation.</user_cancellation>"}])
     # Like the real CLI, a resumed session prints the whole history, earlier turns included.
@@ -154,11 +173,12 @@ class DelegateTestBase(unittest.TestCase):
         self.home = tmp / "md-home"
         self.env = dict(os.environ, VIBE_BIN=str(self.vibe), FAKE_VIBE_CALLS=str(self.calls_file),
                         VIBE_HOME=str(tmp / "vibe-home"), MISTRAL_DELEGATE_HOME=str(self.home),
-                        PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}")
+                        PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}", MISTRAL_DELEGATE_WATCH_INTERVAL="0.05")
         for var in ("MISTRAL_DELEGATE_POLICY", "MISTRAL_DELEGATE_MODEL", "MISTRAL_DELEGATE_MAX_PRICE",
                     "MISTRAL_DELEGATE_MAX_TURNS", "MISTRAL_DELEGATE_WORKTREES", "FAKE_VIBE_STORAGE",
                     "FAKE_VIBE_TOUCH_APP", "FAKE_VIBE_HOOK_CALLS", "FAKE_VIBE_NO_WRITE", "FAKE_VIBE_CANCEL",
-                    "FAKE_VIBE_MODEL", "FAKE_VIBE_EXPERIMENT_PRICE"):
+                    "FAKE_VIBE_MODEL", "FAKE_VIBE_EXPERIMENT_PRICE", "FAKE_VIBE_SPEND", "FAKE_VIBE_EFFECTS",
+                    "FAKE_VIBE_UNFINISHED"):
             self.env.pop(var, None)
 
     def tearDown(self):
@@ -446,6 +466,56 @@ class WriteModeTest(DelegateTestBase):
         self.assertIn("took", status.splitlines()[0])
         self.assertIn("today ", status)
 
+    def test_price_cap_is_enforced_by_the_wrapper(self):
+        out = self.run_delegate("--mode", "write", "--max-price", "0.5", "Task",
+                                FAKE_VIBE_STORAGE="unified", FAKE_VIBE_MODEL="glm-5-3", FAKE_VIBE_SPEND="1")
+        self.assertIn("status: budget_exceeded", out.stdout)
+        self.assertIn("over this call's cap of $0.50", out.stdout)
+        self.assertIn("priced at mistral-medium-3.5 rates", out.stdout)
+        spent = float(out.stdout.split("budget: ~$")[1].split(" ")[0])
+        self.assertLess(spent, 1.0)  # stopped soon after crossing $0.50, not after $30
+
+    def test_tool_call_cap_is_enforced_by_the_wrapper(self):
+        out = self.run_delegate("--mode", "write", "--max-tool-calls", "5", "Task",
+                                FAKE_VIBE_STORAGE="unified", FAKE_VIBE_EFFECTS="1")
+        self.assertIn("status: tool_call_limit", out.stdout)
+        self.assertIn("over the cap of 5", out.stdout)
+
+    def test_resume_baseline_comes_from_before_mistrals_changes(self):
+        check = "test ! -f test_app.py"
+        first = self.run_delegate("--mode", "write", "--worktree-name", "mistral-bl", "--fix-attempts", "0",
+                                  "--verify", check, "Task")
+        self.assertIn("verification: failed", first.stdout)
+        second = self.run_delegate("--mode", "write", "--worktree-name", "mistral-bl", "--fix-attempts", "0",
+                                   "--resume", "sess-1234567890", "--verify", check, "--verify", "test ! -f test_app.py -o -f x",
+                                   "Fix it")
+        # Mistral's own failure stays Mistral's: not "already failing before Mistral".
+        self.assertIn("verification: failed", second.stdout)
+        self.assertNotIn("passed_except_preexisting", second.stdout)
+        self.assertNotIn("baseline_warning", second.stdout)
+        self.assertIn("baseline: from before Mistral's earlier changes in this worktree", second.stdout)
+        self.assertIn("continues: ", second.stdout)
+
+    def test_unfinished_run_is_asked_to_finish_once(self):
+        out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_UNFINISHED="1")
+        self.assertEqual(len(self.calls()), 2)
+        self.assertIn("You stopped before finishing", self.calls()[1]["prompt"])
+        self.assertIn("continued: Mistral stopped without a closing summary", out.stdout)
+        self.assertNotIn("final_message_warning", out.stdout)
+
+    def test_adopting_a_resume_settles_the_earlier_run_too(self):
+        first = self.run_delegate("--mode", "write", "--worktree-name", "mistral-pair", "Task")
+        second = self.run_delegate("--mode", "write", "--worktree-name", "mistral-pair",
+                                   "--resume", "sess-1234567890", "More")
+        self.assertIn(f"continues: {self.value(first, 'run_id')}", second.stdout)
+        self.run_delegate("--adopt", self.value(second, "run_id"))
+        status = self.run_delegate("--status").stdout
+        self.assertNotIn("pending", status.split("started:")[0].split("\n", 1)[1])
+
+    def test_runners_are_allowed_in_the_profile_with_the_guard(self):
+        self.run_delegate("--mode", "write", "--allow-command", "uv run pytest", "Task")
+        self.assertIn('"uv run"', self.profile(self.last()["argv"]))
+
     def test_no_changes_is_its_own_status(self):
         out = self.run_delegate("--mode", "write", "Task", FAKE_VIBE_NO_WRITE="1")
         self.assertEqual(out.returncode, 1)
@@ -679,7 +749,7 @@ class ConfigTest(DelegateTestBase):
         out = self.run_delegate("--show-config")
         self.assertIn("policy: conservative", out.stdout)
         self.assertIn("model: mistral-small", out.stdout)
-        self.assertIn("write_caps: max_turns=20 max_price=$0.50", out.stdout)
+        self.assertIn("write_caps: max_price=$0.50 max_tool_calls=50 max_turns=20", out.stdout)
         self.assertIn("source of policy: project", out.stdout)
 
     def test_max_parallel_is_enforced(self):
@@ -777,6 +847,24 @@ class GuardPolicyTest(unittest.TestCase):
                 self.assertIsNotNone(reason)
                 self.assertIn(expected, reason)
         self.assertIn("`npm test`", self.shell("node -e 1"))  # tells Mistral what it may run
+
+    def test_runner_options_are_tolerated(self):
+        policy = dict(self.policy, allow_commands=self.policy["allow_commands"] + ["cd", "uv run pytest"])
+        for command in ["cd frontend && uv run --directory . --no-sync pytest -q", "npm --prefix frontend test",
+                        "npx --yes vitest run x.test.ts", "uv run --with-editable . pytest"]:
+            with self.subTest(command=command):
+                self.assertIsNone(guard.check_shell(command, policy, self.root))
+        self.assertIn("isn't allowed", guard.check_shell("uv run --no-sync python -c 1", policy, self.root))
+        self.assertIn("outside the project", guard.check_shell("uv run --directory /etc pytest", policy, self.root))
+
+    def test_unquoted_path_with_spaces_is_rejoined(self):
+        spaced = os.path.join(self.root, "2TB SSD")
+        Path(spaced, "src").mkdir(parents=True)
+        Path(spaced, "src/a.ts").write_text("x\n")
+        policy = dict(self.policy, root=spaced)
+        action, _r, new = guard.check_tool("bash", {"command": f"cat {spaced}/src/a.ts | grep x"}, policy, spaced)
+        self.assertEqual(action, "rewrite")
+        self.assertIn(shlex.quote(os.path.join(spaced, "src/a.ts")), new["command"])
 
     def test_allow_shell_allows_everything(self):
         self.assertIsNone(guard.check_shell("node -e 1", dict(self.policy, allow_shell=True), self.root))
@@ -930,6 +1018,18 @@ class CommandFormsTest(unittest.TestCase):
                  "state": {"status": "skipped", "reason": "denied"}}
         info = vibe.summarize_history([entry])
         self.assertEqual(info["denied"], ["Run: npm run test"])
+
+
+class CallbackLabelTest(unittest.TestCase):
+    def test_refused_approvals_name_the_command(self):
+        from mdelegate import vibe
+        history = [
+            {"type": "effect", "detail": {"kind": "tool"}, "state": {"status": "skipped", "reason": "denied"}},
+            {"type": "callback", "title": "Approve?", "detail": {"kind": "approval", "effect": {
+                "kind": "shell", "toolName": "bash", "input": {"command": "uv run --no-sync pytest"}}},
+             "state": {"status": "answered", "output": {"decision": {"type": "deny"}}}},
+        ]
+        self.assertEqual(vibe.summarize_history(history)["denied"], ["bash: uv run --no-sync pytest"])
 
 
 class ManifestTest(unittest.TestCase):

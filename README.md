@@ -57,8 +57,9 @@ Claude delegates on its own, following the active policy. You can also ask ("hav
 4. **Guard.** A Vibe `pre_tool` hook checks every tool call during the run. Disallowed commands, paths outside the project, writes outside the scope, secrets and network tools are refused with an error Mistral sees and can work around. Paths that point to the right file under the wrong base (`/src/app.ts`, or a worktree path missing its run folder) are corrected to the project. `sed` calls that only print are allowed alongside Vibe's read-only commands (no `-i`, script files or `w`/`r`/`e`), allowed commands are accepted in their common spellings (`npm test` = `npm run test` = `npx vitest` when that's the test script), and the prompt gives Mistral the absolute project root and steers it to the read_file and grep tools. Without it, Vibe's programmatic mode treats a refused approval as the user cancelling and ends the whole session.
 5. **Vibe runs** with a generated agent profile that auto-approves file edits and only the commands you allowed (`--allow-command` / `allow_commands`). Each part of a chained command must be allowed, and everything else is refused.
 6. **Checks.** The wrapper runs each `--verify` command in the worktree. If one fails, its output goes back to the same Vibe session for a fix (`--fix-attempts`, default 1), and the checks run again.
-7. **Report.** It shows status, verification, cost, turns and tokens, the change list, files changed outside the scope, commands Mistral was refused, the diff when short, and `adopt_with` / `discard_with` commands.
-8. **Adopt or discard.** `--adopt <id>` applies Mistral's changes inside the scope to your checkout (your own uncommitted work is left alone) and removes the worktree. `--paths` takes only some files, `--include-out-of-scope` also takes changes outside the scope, and `--discard <id> --note "why"` drops the run.
+7. **Resumes.** `--resume <session> --worktree-name <name>` continues in the same worktree under a new run id. The report shows which run it continues, and adopting or discarding either id settles both. Its baseline is the one stored before Mistral's first changes. A check that wasn't measured then runs on a clean copy of the original snapshot, so Mistral's own failures are never counted as already failing.
+8. **Report.** It shows status, verification, cost, turns and tokens, the change list, files changed outside the scope, commands Mistral was refused, the diff when short, and `adopt_with` / `discard_with` commands.
+9. **Adopt or discard.** `--adopt <id>` applies Mistral's changes inside the scope to your checkout (your own uncommitted work is left alone) and removes the worktree. `--paths` takes only some files, `--include-out-of-scope` also takes changes outside the scope, and `--discard <id> --note "why"` drops the run.
 
 Read tasks (`--mode read`) run in place with read-only tools.
 
@@ -86,8 +87,9 @@ baseline = true              # run the checks on the untouched worktree first
 #                                                    # <repo parent>/.mistral-worktrees if the repo is on another disk
 
 [write]
-max_turns = 30
-max_price = 1.00
+max_price = 1.00      # stop Mistral when a run has spent this much (enforced by the wrapper)
+max_tool_calls = 80   # stop Mistral after this many tool calls (enforced by the wrapper)
+max_turns = 30        # passed to Vibe
 
 [read]
 max_price = 0.25
@@ -95,11 +97,11 @@ max_price = 0.25
 
 | Policy | What Claude delegates | Default write cap | Default read cap |
 |---|---|---|---|
-| conservative | tests, docs, boilerplate, read-only searches | 20 turns, $0.50 | 10 turns, $0.15 |
-| balanced | any step with a short spec and an automatic check | 30 turns, $1.00 | 15 turns, $0.25 |
-| aggressive | every such step by default, in parallel | 50 turns, $2.50 | 20 turns, $0.50 |
+| conservative | tests, docs, boilerplate, read-only searches | $0.50, 50 tool calls | $0.15, 25 tool calls |
+| balanced | any step with a short spec and an automatic check | $1.00, 80 tool calls | $0.25, 40 tool calls |
+| aggressive | every such step by default, in parallel | $2.50, 150 tool calls | $0.50, 60 tool calls |
 
-Each fix round may spend up to half the cap again.
+**Caps are enforced by the wrapper.** Vibe's own `--max-price` only works when it knows the model's price, and its turn limit doesn't limit tool calls. So the wrapper watches each run's token usage and tool calls while Vibe works, and stops it at `max_price` or `max_tool_calls` (`status: budget_exceeded` / `tool_call_limit`). Without a known price, usage is priced at mistral-medium-3.5 rates for this. A continuation, when a run stops without a closing summary, or a fix round gets half of each cap.
 
 **Model.** The report's `model:` line says which model ran. With no `model` set, Vibe uses its own default, and a server-side experiment can route that to a non-Mistral model (e.g. `glm-5-3`); `model_note` flags it. Pin `model = "mistral-medium-3.5"` to always use Mistral.
 
