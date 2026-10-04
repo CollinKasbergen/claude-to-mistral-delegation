@@ -24,13 +24,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from fnmatch import fnmatch
 from pathlib import Path
 
 try:
     import tomllib
 except ModuleNotFoundError:  # Python < 3.11
-    tomllib = None
+    from . import minitoml as tomllib
 
 READ_ONLY_TOOLS = ["read_file", "grep", "todo"]
 
@@ -64,8 +65,6 @@ def vibe_home() -> Path:
 
 
 def vibe_config() -> dict:
-    if tomllib is None:
-        return {}
     try:
         with (vibe_home() / "config.toml").open("rb") as f:
             return tomllib.load(f)
@@ -562,6 +561,39 @@ def _candidates(root: Path, session_id: str | None, since: float | None) -> list
     return [(d, kind) for _m, d, kind in sorted(out, reverse=True)[:50]]
 
 
+RUN_MARKER = re.compile(rb"\(delegation run ([A-Za-z0-9._-]+)\)")
+
+
+def run_marker(run_id: str) -> str:
+    """Appended to a new session's prompt so the wrapper can find that session among parallel runs'."""
+    return f"(delegation run {run_id})"
+
+
+def _session_dirs(root: Path) -> set[Path]:
+    out = set()
+    for base in (root / "unified", root):
+        try:
+            out.update(d for d in base.iterdir() if d.is_dir())
+        except OSError:
+            continue
+    return out
+
+
+def _run_marker(session_dir: Path) -> str | None:
+    """The delegation run id in a session's stored prompt, if Vibe has written it yet."""
+    files = [session_dir / "meta.json", session_dir / "messages.jsonl",
+             *sorted((session_dir / "journal").glob("*.jsonl"))[:2]]
+    for path in files:
+        try:
+            with path.open("rb") as f:
+                match = RUN_MARKER.search(f.read(1_000_000))
+        except OSError:
+            continue
+        if match:
+            return match.group(1).decode()
+    return None
+
+
 def read_session_stats(session_id: str | None, cwd: str, since: float | None = None,
                        model_hint: str | None = None) -> dict | None:
     """A session's cumulative usage from Vibe's session storage (legacy or Unified Harness layout).
@@ -679,32 +711,68 @@ class SessionWatcher:
     itself and stops it at the plugin's caps.
     """
 
-    def __init__(self, cwd: str, since: float, session_id: str | None = None, model_hint: str | None = None):
+    def __init__(self, cwd: str, since: float, session_id: str | None = None, model_hint: str | None = None,
+                 marker: str | None = None):
         self.cwd, self.since, self.session_id, self.model_hint = cwd, since, session_id, model_hint
+        self.marker = marker
         self.config = vibe_config()
         self.root = session_root(self.config)
         self.dir: Path | None = None
         self.kind = ""
         self.meta: dict = {}
         self.reader: JournalReader | None = None
+        # A new session is told apart from other runs' sessions in the same directory: sessions that
+        # existed before this call are skipped, and so are sessions whose prompt names another run.
+        self.confirmed = bool(session_id)
+        self.exclude = set() if session_id else _session_dirs(self.root)
+
+    @property
+    def found_id(self) -> str | None:
+        """The session this call ran in, when it was identified for certain (or was the only candidate)."""
+        return (self.meta.get("session_id") or self.dir.name) if self.dir is not None else None
 
     def _locate(self) -> bool:
-        if self.dir is not None:
+        if self.dir is not None and self.confirmed:
             return True
         if not self.root.is_dir():
             return False
-        for d, kind in _candidates(self.root, self.session_id, None if self.session_id else self.since):
+        if self.session_id:
+            for d, kind in _candidates(self.root, self.session_id, None):
+                try:
+                    meta = json.loads((d / "meta.json").read_text())
+                except (OSError, ValueError):
+                    continue
+                self._use(d, kind, meta)
+                return True
+            return False
+        mine, unmarked = None, []
+        for d, kind in _candidates(self.root, None, self.since):
+            if d in self.exclude:
+                continue
             try:
                 meta = json.loads((d / "meta.json").read_text())
             except (OSError, ValueError):
                 continue
-            if not self.session_id and not _same_dir((meta.get("environment") or {}).get("working_directory"), self.cwd):
+            if not _same_dir((meta.get("environment") or {}).get("working_directory"), self.cwd):
                 continue
-            self.dir, self.kind, self.meta = d, kind, meta
-            self.session_id = meta.get("session_id") or d.name
-            self.reader = JournalReader(d) if kind == "unified" else None
-            return True
-        return False
+            owner = _run_marker(d) if self.marker else None
+            if owner == self.marker:
+                mine = (d, kind, meta)
+                break
+            if owner is None:
+                unmarked.append((d, kind, meta))
+        choice = mine or (unmarked[0] if len(unmarked) == 1 else None)
+        self.confirmed = mine is not None
+        if choice is None:
+            self.dir = None
+            return False
+        if choice[0] != self.dir:
+            self._use(*choice)
+        return True
+
+    def _use(self, d: Path, kind: str, meta: dict) -> None:
+        self.dir, self.kind, self.meta = d, kind, meta
+        self.reader = JournalReader(d) if kind == "unified" else None
 
     def poll(self) -> dict | None:
         """The session's cumulative usage so far, or None before it shows up."""

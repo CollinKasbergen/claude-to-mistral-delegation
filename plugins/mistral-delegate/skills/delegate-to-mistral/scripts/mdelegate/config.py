@@ -12,8 +12,8 @@ from pathlib import Path
 
 try:
     import tomllib
-except ModuleNotFoundError:  # Python < 3.11: config files are skipped.
-    tomllib = None
+except ModuleNotFoundError:  # Python < 3.11
+    from . import minitoml as tomllib
 
 POLICIES = ("conservative", "balanced", "aggressive")
 
@@ -57,6 +57,10 @@ KEYS = ("policy", "model", "verify", "allow_commands", "fix_attempts", "max_para
 
 DEPS_MODES = ("hardlink", "copy", "symlink", "none")
 
+# Per-mode caps under [read] / [write]: (type, smallest allowed value).
+CAP_KEYS = {"max_turns": (int, 1), "max_price": (float, 0.01), "max_tokens": (int, 1), "max_tool_calls": (int, 1),
+            "token_budget": (int, 1000)}
+
 
 def home() -> Path:
     custom = os.environ.get("MISTRAL_DELEGATE_HOME")
@@ -88,18 +92,61 @@ def check_label(check: dict) -> str:
     return check["cmd"] + (f" (when {', '.join(check['paths'])})" if check["paths"] else "")
 
 
-def _load_toml(path: Path, warnings: list[str]) -> dict:
+def _load_toml(path: Path, errors: list[str]) -> dict:
     if not path.is_file():
-        return {}
-    if tomllib is None:
-        warnings.append(f"ignored {path}: needs Python 3.11+ to read TOML")
         return {}
     try:
         with path.open("rb") as f:
             return tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError) as e:
-        warnings.append(f"ignored {path}: {e}")
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        errors.append(f"{path} can't be read: {e}")
         return {}
+
+
+def _cap(key: str, value, where: str, warnings: list[str]):
+    kind, low = CAP_KEYS[key]
+    try:
+        if isinstance(value, str):  # from an environment variable
+            value = kind(value.strip())
+        if isinstance(value, bool) or (kind is int and isinstance(value, float) and not value.is_integer()):
+            raise ValueError
+        number = kind(value) if isinstance(value, (int, float)) else None
+        if number is None or number < low:
+            raise ValueError
+        return number
+    except (TypeError, ValueError):
+        warnings.append(f"ignored {where}.{key} = {value!r}: use {'a whole number' if kind is int else 'a number'} "
+                        f"of at least {low}")
+        return None
+
+
+def _as_bool(settings: dict, key: str, default: bool) -> None:
+    value = settings[key]
+    if isinstance(value, bool):
+        return
+    if isinstance(value, str) and value.strip().lower() in ("true", "false", "yes", "no", "on", "off", "1", "0"):
+        settings[key] = value.strip().lower() in ("true", "yes", "on", "1")
+        return
+    settings["warnings"].append(f"ignored {key} = {value!r}: use true or false")
+    settings[key] = default
+
+
+def _as_number(settings: dict, key: str, cast, default, low=None, high=None) -> None:
+    value = settings[key]
+    if value is None or value == default:
+        return
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        number = cast(value)
+        if (low is not None and number < low) or (high is not None and number > high):
+            raise ValueError
+        settings[key] = number
+    except (TypeError, ValueError):
+        bounds = f" between {low} and {high}" if low is not None and high is not None else (
+            f" of at least {low}" if low is not None else "")
+        settings["warnings"].append(f"ignored {key} = {value!r}: use a number{bounds}")
+        settings[key] = default
 
 
 def load(repo_root: str | None) -> dict:
@@ -134,20 +181,39 @@ def load(repo_root: str | None) -> dict:
         "write": {},
         "sources": {},
         "warnings": [],
+        "errors": [],
     }
     files = [("user", home() / "config.toml")]
     if repo_root:
         files.append(("project", Path(repo_root) / ".mistral-delegate.toml"))
 
     for label, path in files:
-        data = _load_toml(path, settings["warnings"])
+        data = _load_toml(path, settings["errors"])
         for key in KEYS:
             if key in data:
                 settings[key] = data[key]
                 settings["sources"][key] = f"{label}: {path}"
+        for key in data:
+            if key in KEYS or key in ("read", "write"):
+                continue
+            if key in CAP_KEYS:
+                settings["warnings"].append(f"ignored {key} in {path}: caps go under [write] or [read]")
+            else:
+                settings["warnings"].append(f"ignored unknown setting {key!r} in {path}")
         for mode in ("read", "write"):
-            if isinstance(data.get(mode), dict):
-                settings[mode].update({k: v for k, v in data[mode].items() if k in ("max_turns", "max_price", "max_tokens", "max_tool_calls", "token_budget")})
+            section = data.get(mode)
+            if section is None:
+                continue
+            if not isinstance(section, dict):
+                settings["warnings"].append(f"ignored {mode} in {path}: use a [{mode}] table")
+                continue
+            for key, value in section.items():
+                if key not in CAP_KEYS:
+                    settings["warnings"].append(f"ignored unknown setting [{mode}] {key!r} in {path} "
+                                                f"(caps: {', '.join(CAP_KEYS)})")
+                elif (number := _cap(key, value, f"[{mode}]", settings["warnings"])) is not None:
+                    settings[mode][key] = number
+                    settings["sources"][f"{mode}.{key}"] = f"{label}: {path}"
 
     env = os.environ
     if env.get("MISTRAL_DELEGATE_POLICY"):
@@ -164,9 +230,11 @@ def load(repo_root: str | None) -> dict:
         settings["warnings"].append(f"unknown policy {settings['policy']!r}, using 'balanced'")
         settings["policy"] = "balanced"
     settings["verify"] = _as_checks(settings["verify"], settings["warnings"])
-    settings["allow_commands"] = _as_list(settings["allow_commands"])
-    settings["scope"] = _as_list(settings["scope"])
-    settings["vibe_args"] = _as_list(settings["vibe_args"])
+    for key in ("allow_commands", "scope", "vibe_args", "test_commands"):
+        if not isinstance(settings[key], (str, list, type(None))):
+            settings["warnings"].append(f"ignored {key} = {settings[key]!r}: use a list of strings")
+            settings[key] = []
+        settings[key] = _as_list(settings[key])
     prices = {}
     for alias, value in (settings["model_prices"] or {}).items() if isinstance(settings["model_prices"], dict) else []:
         try:
@@ -187,30 +255,23 @@ def load(repo_root: str | None) -> dict:
                 settings["warnings"].append(f"ignored token_weights.{key}: use a number")
     settings["token_weights"] = weights
     settings["autofix"] = _as_checks(settings["autofix"], settings["warnings"])
-    settings["fix_after_cap"] = bool(settings["fix_after_cap"])
-    settings["test_strength"] = bool(settings["test_strength"])
-    settings["test_commands"] = _as_list(settings["test_commands"])
-    try:
-        settings["monthly_credit"] = float(settings["monthly_credit"]) if settings["monthly_credit"] else None
-        settings["min_savings"] = float(settings["min_savings"]) if settings["min_savings"] else None
-        settings["credit_reset_day"] = min(28, max(1, int(settings["credit_reset_day"])))
-        settings["claude_relative_effort"] = max(0.0, float(settings["claude_relative_effort"]))
-    except (TypeError, ValueError):
-        settings["warnings"].append("monthly_credit, min_savings and credit_reset_day must be numbers; ignored")
-        settings["monthly_credit"], settings["min_savings"], settings["credit_reset_day"] = None, None, 1
+    for key, default in (("fix_after_cap", True), ("test_strength", True), ("baseline", True)):
+        _as_bool(settings, key, default)
+    _as_number(settings, "monthly_credit", float, None, low=0)
+    settings["monthly_credit"] = settings["monthly_credit"] or None
+    _as_number(settings, "min_savings", float, None, low=0)
+    settings["min_savings"] = settings["min_savings"] or None
+    _as_number(settings, "credit_reset_day", int, 1, low=1, high=31)
+    settings["credit_reset_day"] = min(28, settings["credit_reset_day"])
+    _as_number(settings, "claude_relative_effort", float, 0.5, low=0)
+    _as_number(settings, "fix_attempts", int, 1, low=0)
+    _as_number(settings, "continue_attempts", int, 1, low=0, high=1)
+    _as_number(settings, "max_parallel", int, 3, low=1)
     settings["currency"] = str(settings["currency"] or "$")
     settings["model"] = settings["model"] or None
     if settings["deps_mode"] not in DEPS_MODES:
         settings["warnings"].append(f"unknown deps_mode {settings['deps_mode']!r}, using 'hardlink'")
         settings["deps_mode"] = "hardlink"
-    settings["baseline"] = bool(settings["baseline"])
-    try:
-        settings["fix_attempts"] = max(0, int(settings["fix_attempts"]))
-        settings["continue_attempts"] = max(0, min(1, int(settings["continue_attempts"])))
-        settings["max_parallel"] = max(1, int(settings["max_parallel"]))
-    except (TypeError, ValueError):
-        settings["warnings"].append("fix_attempts and max_parallel must be integers; using defaults")
-        settings["fix_attempts"], settings["max_parallel"] = 1, 3
     return settings
 
 
@@ -221,16 +282,10 @@ def caps(settings: dict, mode: str) -> dict:
     result["max_price"] = None
     result.update(settings.get(mode, {}))
     env = os.environ
-    for key, var, cast in (("max_turns", "MISTRAL_DELEGATE_MAX_TURNS", int),
-                           ("max_price", "MISTRAL_DELEGATE_MAX_PRICE", float),
-                           ("max_tokens", "MISTRAL_DELEGATE_MAX_TOKENS", int),
-                           ("max_tool_calls", "MISTRAL_DELEGATE_MAX_TOOL_CALLS", int),
-                           ("token_budget", "MISTRAL_DELEGATE_TOKEN_BUDGET", int)):
-        try:
-            if env.get(var):
-                result[key] = cast(env[var])
-        except ValueError:
-            pass
+    for key in CAP_KEYS:
+        var = f"MISTRAL_DELEGATE_{key.upper()}"
+        if env.get(var) and (number := _cap(key, env[var], var, [])) is not None:
+            result[key] = number
     return result
 
 
@@ -262,6 +317,8 @@ def describe(settings: dict) -> str:
                      + (f" max_tokens={c['max_tokens']}" if c.get("max_tokens") else ""))
     for key, source in settings["sources"].items():
         lines.append(f"source of {key}: {source}")
+    for error in settings["errors"]:
+        lines.append(f"error: {error}")
     for warning in settings["warnings"]:
         lines.append(f"warning: {warning}")
     return "\n".join(lines)

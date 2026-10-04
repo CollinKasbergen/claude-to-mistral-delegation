@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from . import config
@@ -24,6 +25,13 @@ STATE_FILE = "mistral-delegate.json"
 
 GIT_IDENTITY = ["-c", "user.name=mistral-delegate", "-c", "user.email=mistral-delegate@localhost",
                 "-c", "commit.gpgsign=false"]
+# Settings that would change git's output format or run the user's programs are overridden for every call:
+# quoted non-ASCII paths, colour codes, diff drivers, and hooks (post-checkout, post-commit, ...).
+GIT_DEFAULTS = ["-c", "core.quotePath=false", "-c", "color.ui=never", "-c", "core.hooksPath=" + os.devnull]
+# Diffs that `git apply` can always read, and that list a rename as a deletion plus an addition,
+# so a file moved out of the scope is seen as changed there.
+DIFF_OPTS = ["--no-ext-diff", "--no-textconv", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--no-renames",
+             "--ignore-submodules"]
 
 
 class DelegateError(Exception):
@@ -33,7 +41,8 @@ class DelegateError(Exception):
 def git(cwd: str | Path, *argv: str) -> str:
     """Run git and return stdout, or "" on any failure."""
     try:
-        out = subprocess.run(["git", "-C", str(cwd), *argv], capture_output=True, text=True, timeout=60)
+        out = subprocess.run(["git", *GIT_DEFAULTS, "-C", str(cwd), *argv], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return out.stdout if out.returncode == 0 else ""
@@ -42,7 +51,8 @@ def git(cwd: str | Path, *argv: str) -> str:
 def git_checked(cwd: str | Path, *argv: str, input: bytes | None = None) -> bytes:
     """Run git and return stdout bytes, raising DelegateError on failure."""
     try:
-        out = subprocess.run(["git", "-C", str(cwd), *argv], capture_output=True, input=input, timeout=300)
+        out = subprocess.run(["git", *GIT_DEFAULTS, "-C", str(cwd), *argv], capture_output=True, input=input,
+                             timeout=300)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise DelegateError(f"git {' '.join(argv[:2])} failed: {e}") from e
     if out.returncode != 0:
@@ -112,13 +122,15 @@ def exclude_pathspecs(links: list[str]) -> list[str]:
 
 def snapshot_uncommitted(top: str, worktree: Path) -> dict | None:
     """Copy tracked changes and untracked files from the checkout and commit them in the worktree."""
-    diff = git_checked(top, "diff", "HEAD", "--binary")
+    diff = git_checked(top, "diff", *DIFF_OPTS, "HEAD", "--binary")
     untracked = [f for f in git_checked(top, "ls-files", "--others", "--exclude-standard", "-z")
                  .decode().split("\0") if f]
     if not diff.strip() and not untracked:
         return None
     if diff.strip():
         git_checked(worktree, "apply", "--binary", "--whitespace=nowarn", "-", input=diff)
+    # Untracked folders that git lists whole (a nested repository) and dependency folders aren't copied.
+    untracked = [f for f in untracked if not f.endswith("/") and not set(Path(f).parts) & DEPENDENCY_DIRS]
     for rel in untracked:
         src, dst = Path(top, rel), worktree / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -127,17 +139,17 @@ def snapshot_uncommitted(top: str, worktree: Path) -> dict | None:
         elif src.is_file():
             shutil.copy2(src, dst)
     git_checked(worktree, "add", "-A")
+    if not git(worktree, "status", "--porcelain", "--ignore-submodules").strip():
+        return None  # only submodule changes, which the worktree can't hold
     git_checked(worktree, *GIT_IDENTITY, "commit", "-q", "--no-verify",
                 "-m", "mistral-delegate: snapshot of uncommitted work")
-    changed = len([line for line in git(top, "diff", "HEAD", "--name-only").splitlines() if line])
+    changed = len([line for line in git(top, "diff", *DIFF_OPTS, "HEAD", "--name-only").splitlines() if line])
     return {"modified": changed, "untracked": len(untracked)}
 
 
-DEPS_MODES = ("hardlink", "copy", "symlink", "none")
-
-# Cache folders inside dependency trees are skipped when hard-linking: tools rewrite
-# them in place, which would also change the files in the user's checkout.
-CACHE_DIRS = (".vite", ".vitest", ".cache", ".turbo", ".parcel-cache")
+# Cache folders and build-info files inside dependency trees are skipped when hard-linking: tools
+# rewrite them in place, which would also change the files in the user's checkout.
+CACHE_DIRS = (".vite", ".vitest", ".cache", ".turbo", ".parcel-cache", ".tmp", "*.tsbuildinfo")
 
 
 def _hardlink_tree(src: Path, dst: Path) -> None:
@@ -149,6 +161,48 @@ def _hardlink_tree(src: Path, dst: Path) -> None:
 
     shutil.copytree(src, dst, symlinks=True, copy_function=link_or_copy,
                     ignore=shutil.ignore_patterns(*CACHE_DIRS))
+
+
+def _clone_command() -> list[str] | None:
+    """cp arguments for a copy-on-write clone (APFS on macOS, Btrfs/XFS on Linux), if this system has one."""
+    if sys.platform == "darwin":
+        return ["cp", "-c", "-R"]
+    if sys.platform.startswith("linux"):
+        return ["cp", "-a", "--reflink=always"]
+    return None
+
+
+def _first_file(src: Path) -> Path | None:
+    for root, _dirs, files in os.walk(src):
+        for name in files:
+            path = Path(root, name)
+            if not path.is_symlink():
+                return path
+    return None
+
+
+def _can_clone(src: Path, dst_dir: Path) -> bool:
+    """Whether files under src can be cloned copy-on-write into dst_dir."""
+    command, sample = _clone_command(), _first_file(src)
+    if not command or sample is None:
+        return False
+    probe = dst_dir / f".mistral-delegate-clone-probe-{os.getpid()}"
+    try:
+        ok = subprocess.run([*command, str(sample), str(probe)], capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        ok = False
+    try:
+        probe.unlink()
+    except OSError:
+        pass
+    return ok
+
+
+def _clone_tree(src: Path, dst: Path) -> None:
+    out = subprocess.run([*_clone_command(), str(src), str(dst)], capture_output=True, text=True,
+                         errors="replace", timeout=1800)
+    if out.returncode != 0:
+        raise OSError(out.stderr.strip() or "cp failed")
 
 
 def _can_hardlink(src: Path, dst_dir: Path) -> bool:
@@ -165,12 +219,14 @@ def _can_hardlink(src: Path, dst_dir: Path) -> bool:
     return True
 
 
-def prepare_dependencies(top: str, worktree: Path, extra: list[str], auto: bool,
-                         mode: str = "hardlink") -> tuple[list[str], list[str]]:
+def prepare_dependencies(top: str, worktree: Path, extra: list[str], auto: bool, mode: str = "hardlink",
+                         methods: dict | None = None) -> tuple[list[str], list[str]]:
     """Make dependency folders available in the worktree. Returns (paths prepared, notes).
 
-    hardlink: real directories whose files are hard links (fast, no extra disk, and tools
-              like Vite see them inside the project); falls back to symlink across filesystems.
+    hardlink: copy-on-write clones where the filesystem supports them (APFS, Btrfs, XFS: fast,
+              no extra disk, and writes stay in the worktree); otherwise real directories whose
+              files are hard links (fast, but a tool that rewrites a file in place changes the
+              checkout's copy too); falls back to symlink across filesystems.
     copy:     a full copy (slow for big trees, fully independent).
     symlink:  a symlink to the checkout's folder (instant, but some tools refuse paths
               that resolve outside the project).
@@ -192,14 +248,18 @@ def prepare_dependencies(top: str, worktree: Path, extra: list[str], auto: bool,
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
         how = mode
-        if how == "hardlink" and not _can_hardlink(src, dst.parent):
+        if how == "hardlink" and _can_clone(src, dst.parent):
+            how = "clone"
+        elif how == "hardlink" and not _can_hardlink(src, dst.parent):
             how = "symlink"
             notes.append(f"{rel}: hard links not possible (worktree on a different disk than the repo), "
                          "symlinked instead. Some tools (Vite, vitest mocks) misbehave with that: set "
                          "worktrees_dir to a folder on the repo's disk, or deps_mode = \"copy\"")
-        if how in ("hardlink", "copy"):
+        if how in ("clone", "hardlink", "copy"):
             try:
-                if how == "hardlink":
+                if how == "clone":
+                    _clone_tree(src, dst)
+                elif how == "hardlink":
                     _hardlink_tree(src, dst)
                 else:
                     shutil.copytree(src, dst, symlinks=True)
@@ -210,6 +270,8 @@ def prepare_dependencies(top: str, worktree: Path, extra: list[str], auto: bool,
         if how == "symlink":
             os.symlink(src, dst, target_is_directory=True)
         prepared.append(rel)
+        if methods is not None:
+            methods[rel] = how
 
     for rel in dict.fromkeys(e.strip("/") for e in extra):
         src, dst = Path(top, rel), worktree / rel
@@ -218,6 +280,8 @@ def prepare_dependencies(top: str, worktree: Path, extra: list[str], auto: bool,
         dst.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(src, dst, target_is_directory=src.is_dir())
         prepared.append(rel)
+        if methods is not None:
+            methods[rel] = "symlink"
     return prepared, notes
 
 
@@ -228,7 +292,11 @@ def prepare_worktree(top: str, name: str, *, snapshot: bool, link_deps: bool, ex
 
     existing = find_worktree(top, name)
     if existing:
+        # Only worktrees this tool made: never a worktree (or the checkout) the user works in.
         state = load_state(existing)
+        if not state.get("base") or os.path.realpath(existing) == os.path.realpath(top):
+            raise DelegateError(f"{name!r} is the branch of a worktree mistral-delegate didn't create ({existing}). "
+                                "Pick another --worktree-name.")
         return {
             "name": name,
             "path": existing,
@@ -237,6 +305,7 @@ def prepare_worktree(top: str, name: str, *, snapshot: bool, link_deps: bool, ex
             "snapshot": state.get("snapshot"),
             "links": state.get("links", []),
             "deps_mode": state.get("deps_mode"),
+            "deps_methods": state.get("deps_methods") or {},
             "notes": [],
             "reused": True,
         }
@@ -246,12 +315,16 @@ def prepare_worktree(top: str, name: str, *, snapshot: bool, link_deps: bool, ex
     path = worktree_root(top, worktrees_dir) / name
     path.parent.mkdir(parents=True, exist_ok=True)
     git_checked(top, "worktree", "add", "-q", "-b", name, str(path), "HEAD")
-
-    snap = snapshot_uncommitted(top, path) if snapshot else None
-    links, notes = prepare_dependencies(top, path, extra_links, auto=link_deps, mode=deps_mode)
-    state = {"base": git(path, "rev-parse", "HEAD").strip(), "snapshot": snap, "links": links,
-             "deps_mode": deps_mode if link_deps else "none"}
-    state_path(path).write_text(json.dumps(state))
+    try:
+        snap = snapshot_uncommitted(top, path) if snapshot else None
+        methods: dict = {}
+        links, notes = prepare_dependencies(top, path, extra_links, auto=link_deps, mode=deps_mode, methods=methods)
+        state = {"base": git(path, "rev-parse", "HEAD").strip(), "snapshot": snap, "links": links,
+                 "deps_mode": deps_mode if link_deps else "none", "deps_methods": methods}
+        state_path(path).write_text(json.dumps(state))
+    except (DelegateError, OSError, shutil.Error) as e:
+        remove_worktree({"toplevel": top, "path": str(path), "name": name})
+        raise DelegateError(str(e)) from e
     return {"name": name, "path": str(path), "toplevel": top, "reused": False, "notes": notes, **state}
 
 
@@ -262,17 +335,17 @@ def stage_changes(wt: dict) -> None:
 
 def changes_stat(wt: dict) -> str:
     stage_changes(wt)
-    return git(wt["path"], "diff", "--cached", "--stat", wt["base"]).rstrip()
+    return git(wt["path"], "diff", *DIFF_OPTS, "--cached", "--stat", wt["base"]).rstrip()
 
 
 def changed_files(wt: dict) -> list[str]:
     stage_changes(wt)
-    return [f for f in git(wt["path"], "diff", "--cached", "--name-only", wt["base"]).splitlines() if f]
+    return [f for f in git(wt["path"], "diff", *DIFF_OPTS, "--cached", "--name-only", wt["base"]).splitlines() if f]
 
 
 def changes_diff(wt: dict) -> str:
     stage_changes(wt)
-    return git(wt["path"], "diff", "--cached", wt["base"])
+    return git(wt["path"], "diff", *DIFF_OPTS, "--cached", wt["base"])
 
 
 def remove_worktree(wt: dict) -> None:
@@ -284,10 +357,11 @@ def apply_to_checkout(wt: dict, paths: list[str] | None = None) -> list[str]:
     """Apply Vibe's changes (optionally only some paths) to the user's checkout. Returns the files applied."""
     stage_changes(wt)
     spec = ["--", *paths] if paths else []
-    files = [f for f in git(wt["path"], "diff", "--cached", "--name-only", wt["base"], *spec).splitlines() if f]
+    files = [f for f in git(wt["path"], "diff", *DIFF_OPTS, "--cached", "--name-only", wt["base"], *spec).splitlines()
+             if f]
     if not files:
         return []
-    patch = git_checked(wt["path"], "diff", "--cached", "--binary", wt["base"], *spec)
+    patch = git_checked(wt["path"], "diff", *DIFF_OPTS, "--cached", "--binary", wt["base"], *spec)
     git_checked(wt["toplevel"], "apply", "--whitespace=nowarn", "-", input=patch)
     return files
 

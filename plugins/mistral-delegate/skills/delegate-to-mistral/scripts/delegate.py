@@ -29,14 +29,17 @@ or <repo>/.mistral-delegate.toml; see --show-config.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 from collections import Counter
 from pathlib import Path
@@ -50,7 +53,14 @@ KINDS = ("tests", "feature", "bugfix", "refactor", "migration", "boilerplate", "
 MAX_RESULT_CHARS = 12_000
 CHECK_OUTPUT_LINES = 60
 CHECK_OUTPUT_CHARS = 5_000
-WATCH_INTERVAL = float(os.environ.get("MISTRAL_DELEGATE_WATCH_INTERVAL", 3))
+def _env_number(name: str, default, cast=int):
+    try:
+        return cast(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
+
+WATCH_INTERVAL = _env_number("MISTRAL_DELEGATE_WATCH_INTERVAL", 3.0, float)
 SCRIPT = Path(__file__).resolve()
 
 
@@ -105,7 +115,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                      help="Load the project's .vibe/ config and AGENTS.md (always on in worktrees).")
     run.add_argument("--resume", metavar="SESSION_ID", help="Continue an earlier Vibe session.")
     run.add_argument("--agent", help="Use this Vibe agent profile instead of the generated one.")
-    run.add_argument("--timeout", type=int, default=int(os.environ.get("MISTRAL_DELEGATE_TIMEOUT", 900)),
+    run.add_argument("--timeout", type=int, default=_env_number("MISTRAL_DELEGATE_TIMEOUT", 900),
                      help="Seconds before a Vibe call is killed (default 900).")
     run.add_argument("--diff-lines", type=int, default=300,
                      help="Include the full diff in the report when it is at most this many lines (0: never).")
@@ -171,10 +181,18 @@ def runs_on_worktree(run: dict) -> list[dict]:
             if r["id"] == run["id"] or ((r.get("worktree") or {}).get("path") == path and not r.get("outcome"))]
 
 
+def refuse_while_running(run: dict) -> None:
+    """--adopt and --discard wait for every run on the worktree: a resume may still be working in it."""
+    busy = [r["id"] for r in runs_on_worktree(run) if ledger.state(r) == "running"]
+    if busy:
+        raise DelegateError(("That run is still going" if busy == [run["id"]] else
+                             f"{', '.join(busy)} is still working in this run's worktree")
+                            + ". Wait for it to finish (see --status).")
+
+
 def cmd_adopt(args: argparse.Namespace) -> int:
     run = find_run(args.adopt)
-    if ledger.state(run) == "running":
-        raise DelegateError("That run is still going. Wait for it to finish.")
+    refuse_while_running(run)
     wt = run.get("worktree")
     if not wt:
         if run.get("mode") != "write":
@@ -232,8 +250,7 @@ def cmd_adopt(args: argparse.Namespace) -> int:
 
 def cmd_discard(args: argparse.Namespace) -> int:
     run = find_run(args.discard)
-    if ledger.state(run) == "running":
-        raise DelegateError("That run is still going. Wait for it to finish.")
+    refuse_while_running(run)
     wt = run.get("worktree")
     if wt and os.path.isdir(wt["path"]):
         gitops.remove_worktree(wt)
@@ -261,11 +278,18 @@ class Run:
         self.cancelled = False
         self.unfinished = ""
         self.limit_note = ""
+        self.limit_flag = ""
         self.effective = 0
         self.live_tool_calls = 0
         self.guard_log: Path | None = None
         self.currency = "$"
         self.session_id: str | None = args.resume
+        self.run_id = ""
+        self.env: dict | None = None
+        self.spent = 0.0  # estimated cost of the Vibe calls so far, for a run that is interrupted
+        self.unmetered = False  # a Vibe call whose session (and so its token use) was never found
+        self.last_snap: dict | None = None
+        self.guard_policy: dict | None = None
 
     def call_vibe(self, cmd: list[str], cwd: str, *, token_budget: int, max_tool_calls: int,
                   max_price: float | None = None, model_hint: str | None = None) -> None:
@@ -273,12 +297,15 @@ class Run:
         tokens, `max_tool_calls` tool calls, and `max_price` if set. Vibe can't enforce these itself
         (no price for some models, and its turn limit counts prompts), so the wrapper watches the
         session's usage and the guard's log while Vibe runs."""
-        watcher = vibe.SessionWatcher(cwd, time.time(), session_id=self.session_id, model_hint=model_hint)
+        watcher = vibe.SessionWatcher(cwd, time.time(), session_id=self.session_id, model_hint=model_hint,
+                                      marker=self.run_id)
         base = watcher.poll() if self.session_id else None  # a resumed session already has usage
         guard_base = len(guard.read_log(self.guard_log)) if self.guard_log else 0
-        out_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
-        err_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
-        proc = subprocess.Popen(cmd, cwd=cwd, stdout=out_file, stderr=err_file, stdin=subprocess.DEVNULL, text=True)
+        out_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+        err_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+        # Vibe gets its own process group, so stopping it also stops the tests and servers it started.
+        proc = subprocess.Popen(cmd, cwd=cwd, stdout=out_file, stderr=err_file, stdin=subprocess.DEVNULL, text=True,
+                                encoding="utf-8", errors="replace", env=self.env, start_new_session=True)
         started, stopped, snap = time.monotonic(), "", None
 
         def measure():
@@ -289,38 +316,44 @@ class Run:
             cost, fallback = vibe.snapshot_cost(snap, base, fallback=True) if snap else (0.0, False)
             return use, effective, calls, cost, fallback
 
-        while proc.poll() is None:
-            time.sleep(WATCH_INTERVAL)
+        try:
+            while proc.poll() is None:
+                time.sleep(WATCH_INTERVAL)
+                snap = watcher.poll() or snap
+                _use, effective, calls, cost, fallback = measure()
+                if time.monotonic() - started > self.args.timeout:
+                    stopped = "timeout"
+                elif effective > token_budget:
+                    stopped = "budget_exceeded"
+                    self.limit_note = (f"stopped Mistral at {effective:,} effective tokens, over this call's "
+                                       f"token_budget of {token_budget:,}")
+                    self.limit_flag = "--token-budget"
+                elif max_price is not None and cost > max_price:
+                    stopped = "budget_exceeded"
+                    self.limit_note = (f"stopped Mistral at ~{self.currency}{cost:.2f}, over this call's max_price "
+                                       f"of {self.currency}{max_price:.2f}"
+                                       + (" (priced at mistral-medium-3.5 rates: the model's price is unknown)"
+                                          if fallback else ""))
+                    self.limit_flag = "--max-price"
+                elif calls > max_tool_calls:
+                    stopped = "tool_call_limit"
+                    self.limit_note = f"stopped Mistral after {calls} tool calls, over the cap of {max_tool_calls}"
+                    self.limit_flag = "--max-tool-calls"
+                if stopped:
+                    break
+        finally:
+            # Stopped at a cap, or the wrapper itself is being stopped: end Vibe and everything it started.
+            stop_process_group(proc)
             snap = watcher.poll() or snap
             _use, effective, calls, cost, fallback = measure()
-            if time.monotonic() - started > self.args.timeout:
-                stopped = "timeout"
-            elif effective > token_budget:
-                stopped = "budget_exceeded"
-                self.limit_note = (f"stopped Mistral at {effective:,} effective tokens, over this call's budget "
-                                   f"of {token_budget:,}")
-            elif max_price is not None and cost > max_price:
-                stopped = "budget_exceeded"
-                self.limit_note = (f"stopped Mistral at ~{self.currency}{cost:.2f}, over this call's max_price of "
-                                   f"{self.currency}{max_price:.2f}"
-                                   + (" (priced at mistral-medium-3.5 rates: the model's price is unknown)"
-                                      if fallback else ""))
-            elif calls > max_tool_calls:
-                stopped = "tool_call_limit"
-                self.limit_note = f"stopped Mistral after {calls} tool calls, over the cap of {max_tool_calls}"
-            if stopped:
-                proc.terminate()
-                try:
-                    proc.wait(10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-                break
-        snap = watcher.poll() or snap
-        _use, effective, calls, cost, fallback = measure()
-        self.effective += effective
-        self.live_tool_calls += calls
-        self.session_id = self.session_id or watcher.session_id
+            self.effective += effective
+            self.live_tool_calls += calls
+            self.spent += cost or 0.0
+            if snap is None:
+                self.unmetered = True
+            elif not self.session_id:
+                self.last_snap = snap
+        self.session_id = self.session_id or watcher.found_id
         out_file.seek(0)
         err_file.seek(0)
         proc = subprocess.CompletedProcess(cmd, proc.returncode, out_file.read(), err_file.read())
@@ -331,8 +364,10 @@ class Run:
             self.stderr = f"Vibe did not finish within {self.args.timeout}s and was stopped."
             return
         history = vibe.parse_output(proc.stdout)
-        # A refused approval in programmatic mode cancels the session.
-        self.cancelled = self.cancelled or bool(CANCELLED.search(proc.stdout) or CANCELLED.search(proc.stderr))
+        # A refused approval in programmatic mode cancels the session. Only this turn counts: a resumed
+        # session prints its whole history, earlier cancellations included.
+        turn_text = json.dumps(this_turn(history)) if history else proc.stdout
+        self.cancelled = self.cancelled or bool(CANCELLED.search(turn_text) or CANCELLED.search(proc.stderr))
         info = vibe.summarize_history(this_turn(history))
         self.stderr = proc.stderr.strip()
         self.session_id = info["session_id"] or vibe.summarize_history(history)["session_id"] or self.session_id
@@ -355,6 +390,26 @@ class Run:
             self.final_text = self.stderr
         else:
             self.status = "error"
+
+
+def stop_process_group(proc: subprocess.Popen, grace: float = 10) -> None:
+    """Stop a process started with start_new_session=True and every process in its group."""
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, None)):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.wait(wait)
+            if sig == signal.SIGTERM:
+                # The leader is gone; make sure nothing it started lingers.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
 CONTINUE_PROMPT = ("You stopped before finishing. Continue the task from where you left off, then end with "
@@ -395,7 +450,7 @@ def unfinished_reason(turn: list, final_text: str) -> str:
     if last and last.get("type") == "effect":
         return "Vibe's last step was a tool call, not a closing summary; the run may have stopped early."
     text = final_text.rstrip()
-    if text and (text.endswith(("…", "...", ":", ",", ";", "(")) or text.endswith(("and", "the", "to"))):
+    if text and (text.endswith(("…", "...", ":", ",", ";", "(")) or re.search(r"\b(and|the|to)$", text)):
         return "Mistral's final message stops mid-sentence; the run may have been cut short."
     return ""
 
@@ -469,7 +524,8 @@ def test_strength(wt: dict, run_dir: str, checks: list[dict], baseline: dict, se
             commands.append((command, command))
     gitops.stage_changes(wt)
     try:
-        patch = gitops.git_checked(wt["path"], "diff", "--cached", "--binary", wt["base"], "--", *tests)
+        patch = gitops.git_checked(wt["path"], "diff", *gitops.DIFF_OPTS, "--cached", "--binary", wt["base"],
+                                   "--", *tests)
         with gitops.clean_copy(wt, settings["deps_mode"]) as clean:
             if patch.strip():
                 gitops.git_checked(clean, "apply", "--whitespace=nowarn", "-", input=patch)
@@ -512,13 +568,22 @@ def run_checks(commands: list[str], cwd: str, timeout: int) -> dict[str, tuple[i
     """Run every check. Returns {command: (exit code, end of output)}."""
     results = {}
     for command in commands:
+        # Its own process group, so a timeout also stops what the check started (test workers, servers).
+        proc = subprocess.Popen(command, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+        timed_out = False
         try:
-            proc = subprocess.run(command, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  text=True, timeout=timeout, stdin=subprocess.DEVNULL)
-            code, output = proc.returncode, proc.stdout
-        except subprocess.TimeoutExpired as e:
-            code = 124
-            output = (e.output or "") if isinstance(e.output, str) else (e.output or b"").decode(errors="replace")
+            out, _ = proc.communicate(timeout=timeout)
+            code = proc.returncode
+        except subprocess.TimeoutExpired:
+            stop_process_group(proc, grace=2)
+            out, _ = proc.communicate()
+            code, timed_out = 124, True
+        except BaseException:
+            stop_process_group(proc, grace=2)
+            raise
+        output = (out or b"").decode("utf-8", errors="replace")
+        if timed_out:
             output += f"\n[timed out after {timeout}s]"
         results[command] = (code, tail(output))
     return results
@@ -559,8 +624,13 @@ def run_task(args: argparse.Namespace) -> int:
     if args.mode == "read" and (args.verify or args.in_place or args.allow_command or args.scope):
         raise DelegateError("--verify, --allow-command, --scope and --in-place only apply to --mode write.")
 
+    if not Path(workdir).is_dir():
+        raise DelegateError(f"--workdir {workdir} doesn't exist.")
     top = gitops.toplevel(workdir)
     settings = config.load(top or workdir)
+    if settings["errors"]:
+        # Running without the project's settings would also run without its checks and caps.
+        raise DelegateError("Fix the config first (nothing was run):\n" + "\n".join(f"  {e}" for e in settings["errors"]))
     vibe.EXTRA_PRICES.update(settings["model_prices"])
     vibe.WEIGHTS.update(settings["token_weights"])
     if args.policy:
@@ -638,24 +708,50 @@ def run_task(args: argparse.Namespace) -> int:
     guard_log = ledger.runs_dir() / f"{run_id}.guard.jsonl"
     guard_log.parent.mkdir(parents=True, exist_ok=True)
     guard_warning = guard.install(vibe.vibe_home(), config.home())
+    run = Run(args)
+    run.run_id = run_id
+    # Vibe passes its environment on to hooks: the guard finds this run's policy by this id.
+    run.env = dict(os.environ, **{guard.RUN_ENV: run_id})
     if not guard_warning:
         default_cmds = vibe.DEFAULT_BASH_ALLOWLIST if write else []
-        guard.write_policy(run_dir, {
+        run.guard_policy = {
             "run_id": run_id, "root": guard_root, "mode": args.mode, "scope": scope,
             "allow_commands": default_cmds + allow_commands, "default_commands": default_cmds,
             "allow_shell": args.allow_shell, "log": str(guard_log),
-            "expires": time.time() + args.timeout * (fix_attempts + 1) + args.verify_timeout * 3 + 600,
-        }, config.home())
+            # Dependency folders and --link paths come from the checkout (links, hard links): never written to.
+            "protected": list((wt or {}).get("links") or []),
+        }
+    # A stopped wrapper (a timeout in the calling tool, a closed terminal) still ends Vibe and records the run.
+    previous = {sig: signal.signal(sig, _exit_on_signal) for sig in (signal.SIGTERM, signal.SIGHUP)}
     try:
         return execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps, model, write, verify,
-                       allow_commands, scope, fix_attempts, baseline_on, kind, guard_log, guard_warning, guard_root)
+                       allow_commands, scope, fix_attempts, baseline_on, kind, guard_log, guard_warning, guard_root,
+                       run)
+    except BaseException as e:
+        interrupted = isinstance(e, (SystemExit, KeyboardInterrupt))
+        ledger.append({"event": "end", "id": run_id, "status": "interrupted" if interrupted else "error",
+                       "verification": "not_run", "cost": run.spent or None, "cost_estimated": True,
+                       "effective": run.effective, "session_id": run.session_id,
+                       "error": (f"{e.__class__.__name__}: {e}")[:300]})
+        if interrupted or isinstance(e, DelegateError):
+            raise
+        print(f"status: error\n\nrun_id: {run_id}\nUnexpected error: {e.__class__.__name__}: {e}\n"
+              + "".join(traceback.format_exception(type(e), e, e.__traceback__)[-3:]).rstrip())
+        return 2
     finally:
         guard.remove_policy(run_dir, run_id, config.home())
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _exit_on_signal(signum, _frame) -> None:
+    raise SystemExit(128 + signum)
 
 
 def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps, model, write, verify,
-            allow_commands, scope, fix_attempts, baseline_on, kind, guard_log, guard_warning, guard_root) -> int:
-    started_wall, started = time.time(), time.monotonic()
+            allow_commands, scope, fix_attempts, baseline_on, kind, guard_log, guard_warning, guard_root,
+            run: "Run") -> int:
+    started = time.monotonic()
     # Only the checks that concern this run: ones limited to paths outside the scope are skipped.
     planned = [c for c in verify if vibe.check_applies(c["paths"], scope, [])]
     commands = [c["cmd"] for c in planned]
@@ -697,7 +793,6 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     agent = args.agent or vibe.write_agent_profile(args.mode, model, vibe_allow)
     trust = args.trust or wt is not None
 
-    run = Run(args)
     stats_before = vibe.read_session_stats(args.resume, run_dir, model_hint=model) if args.resume else None
 
     run.guard_log = None if guard_warning else guard_log
@@ -706,6 +801,10 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     def vibe_call(text: str, share: float) -> None:
         """One Vibe call with `share` of the caps, enforced by the wrapper. If a money cap is set, Vibe gets
         it too; its --max-price counts the whole session, so a resumed session gets what it already spent on top."""
+        if run.guard_policy:
+            # Active for this call only: a Vibe that outlives the wrapper finds no live policy and is refused.
+            guard.write_policy(run_dir, dict(run.guard_policy, expires=time.time() + args.timeout + 300),
+                               config.home())
         vibe_caps = dict(caps)
         if caps.get("max_price") is not None:
             session_cost = vibe.stats_cost(vibe.read_session_stats(run.session_id, run_dir, model_hint=model)) \
@@ -719,7 +818,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                       max_price=caps["max_price"] * share if caps.get("max_price") is not None else None,
                       model_hint=model)
 
-    vibe_call(prompt, 1.0)
+    vibe_call(prompt if args.resume else prompt + "\n\n" + vibe.run_marker(run_id), 1.0)
     continued, summary_note = 0, ""
 
     verification, results, failures, attempts = "not_run", {}, [], 0
@@ -794,8 +893,10 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                                       settings, args.verify_timeout)
     elapsed = time.monotonic() - started
 
-    stats_after = vibe.read_session_stats(run.session_id, run_dir, since=None if run.session_id else started_wall,
-                                          model_hint=model)
+    # Without a session id (Vibe was stopped before printing one), only the snapshot the watcher
+    # identified counts; the newest session in the directory may be a parallel run's.
+    stats_after = (vibe.read_session_stats(run.session_id, run_dir, model_hint=model) if run.session_id
+                   else run.last_snap)
     run.session_id = run.session_id or (stats_after or {}).get("session_id")
     use = vibe.usage(stats_after, stats_before)
 
@@ -810,14 +911,22 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     guard_events = guard.read_log(guard_log)
 
     lines = [f"run_id: {run_id}", f"status: {run.status}"]
+    for warning in settings["warnings"]:
+        lines.append(f"config_warning: {warning}")
+    if run.unmetered and (run.tool_calls or run.live_tool_calls or run.final_text):  # Vibe did work unwatched
+        lines.append("budget_warning: the wrapper couldn't find this run's Vibe session, so its token and price caps "
+                     "weren't enforced for at least one call (tool calls were still capped by the guard, and turns "
+                     "by Vibe). Check session_logging in Vibe's config.toml.")
     if run.status == "no_changes":
         lines.append("note: Mistral finished without changing any file. Read its result below to see why.")
     if run.status == "incomplete":
         lines.append("missing_files (named in --scope but never created; passing checks don't cover them): "
                      + ", ".join(missing))
     if run.status in ("budget_exceeded", "tool_call_limit"):
-        lines.append(f"note: the wrapper {run.limit_note}. The work so far is in the worktree: review it, "
-                     "--resume with a higher --max-price/--max-tool-calls, or discard it.")
+        lines.append(f"note: the wrapper {run.limit_note}. "
+                     + ("The work so far is in the worktree: review it, --resume with a higher " if wt else
+                        "Review what it found, or --resume with a higher ")
+                     + (run.limit_flag or "--token-budget") + (", or discard it." if wt else "."))
     if settings.get("continues"):
         lines.append(f"continues: {settings['continues']} (same worktree). This run's id and the earlier one "
                      "both refer to everything in the worktree; --adopt or --discard either settles both.")
@@ -1020,8 +1129,15 @@ def worktree_section(wt: dict, run_id: str, files: list[str], out_of_scope: list
     else:
         lines.append(f"worktree_base: your HEAD at {wt['base'][:12]}")
     if wt.get("links"):
-        how = {"hardlink": "hard-linked copies", "copy": "copies", "symlink": "symlinks"}.get(wt.get("deps_mode"), "linked")
-        lines.append(f"dependencies ({how} from your checkout): " + ", ".join(wt["links"]))
+        labels = {"clone": "copy-on-write clones", "hardlink": "hard-linked copies", "copy": "copies",
+                  "symlink": "symlinks"}
+        methods = wt.get("deps_methods") or {}
+        groups: dict[str, list[str]] = {}
+        for link in wt["links"]:
+            how = methods.get(link) or wt.get("deps_mode")
+            groups.setdefault(labels.get(how, "linked"), []).append(link)
+        for label, links in groups.items():
+            lines.append(f"dependencies ({label} from your checkout): " + ", ".join(links))
     for note in wt.get("notes") or []:
         lines.append(f"dependency_note: {note}")
     stat = gitops.changes_stat(wt)

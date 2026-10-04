@@ -38,8 +38,10 @@ fix_attempts = 1
 max_parallel = 3
 
 # How dependency folders (node_modules, .venv, ...) get into Mistral's worktree:
-#   hardlink - real folders whose files are shared with your checkout (default;
-#              fast, and tools like Vite accept them)
+#   hardlink - real folders (default; tools like Vite accept them): copy-on-write
+#              clones where the disk supports it (APFS, Btrfs, XFS), so nothing
+#              written in the worktree reaches your checkout; elsewhere hard links
+#              whose files are shared with your checkout
 #   copy     - full independent copy (slow for big folders)
 #   symlink  - a link to your checkout's folder (instant, but Vite rejects files
 #              that resolve outside the project)
@@ -56,8 +58,8 @@ deps_mode = "hardlink"
 # failures that were already there aren't blamed on Mistral.
 baseline = true
 
-# Extra flags for every Vibe call. If reports keep saying "cost unknown",
-# this one makes Vibe record exact costs:
+# Extra flags for every Vibe call. If reports keep saying "usage: unknown",
+# this one makes Vibe store token counts in its older session format:
 # vibe_args = ["--legacy-harness"]
 
 # Model for Mistral's runs: an alias from your Vibe config. If unset, Vibe uses
