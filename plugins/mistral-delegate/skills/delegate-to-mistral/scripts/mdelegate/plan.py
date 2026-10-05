@@ -135,6 +135,7 @@ def _test_cases(lines: list[str], where: str) -> tuple[list[str], list[str]]:
         return [], lines
     end = next((n for n in range(start + 1, len(lines)) if SUBHEADING.match(lines[n])), len(lines))
     cases: list[str] = []
+    intro: list[str] = []  # text before the first case (conventions for these tests) stays with the step
     for line in lines[start + 1:end]:
         item = LIST_ITEM.match(line)
         if item:
@@ -142,10 +143,12 @@ def _test_cases(lines: list[str], where: str) -> tuple[list[str], list[str]]:
         elif line.strip() and cases:
             cases[-1] += " " + line.strip()  # an item continued on the next line
         elif line.strip():
-            raise PlanError(f"{where}: write each test case as a list item (- ...) under ### Test cases")
+            intro.append(line)
     if not cases:
-        raise PlanError(f"{where}: ### Test cases has no cases; list them as - items, or remove the heading")
-    return cases, lines[:start] + lines[end:]
+        shown = f" (it has only: {intro[0].strip()[:80]!r})" if intro else ""
+        raise PlanError(f"{where}: ### Test cases lists no cases{shown}; write each case as a list item "
+                        "(- setup -> call -> expected result), or remove the heading")
+    return cases, lines[:start] + intro + lines[end:]
 
 
 def parse(text: str) -> Plan:
@@ -241,6 +244,9 @@ TEST_CASE_RULES = (
     "- Put setup shared by several tests in a fixture or helper; don't copy it into each test. Inside "
     "`pytest.raises` (or the framework's equivalent), only the call that should fail.\n"
     "- Add a test beyond these only for a branch of your code that no case covers.\n"
+    "- Put a comment `# case N` (`// case N` in JavaScript or TypeScript) on the line above each test, N being "
+    "the case's number in the list (the first is 1). A test that covers several cases names them all: "
+    "`# case 3, 4`.\n"
     "Before you finish, go through the list and check that each case has its test and that the test asserts "
     "the stated result.")
 

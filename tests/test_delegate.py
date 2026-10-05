@@ -524,6 +524,8 @@ class WriteModeTest(DelegateTestBase):
             self.assertIn(spelling, profile)
         self.assertNotIn('"npx rm"', profile)
         self.assertIn("vibe_may_run: npm test (also accepted:", out.stdout)
+        out = self.run_delegate("--mode", "write", "--no-verify", "--verify", "cd . && true", "Task")
+        self.assertIn("vibe_may_run: cd . && true\n", out.stdout)  # the check whole, not `cd .` on its own
 
     def test_missing_folders_for_literal_scope_paths_are_created(self):
         out = self.run_delegate("--mode", "write", "--scope", "frontend/src/new/thing.test.ts", "Task")
@@ -944,6 +946,14 @@ class WriteModeTest(DelegateTestBase):
         out = self.run_delegate("--mode", "write", "Task")
         self.assertIn("project_rules: none", out.stdout)
 
+    def test_the_formatters_run_last_even_when_the_checks_pass(self):
+        (self.repo / ".mistral-delegate.toml").write_text('autofix = ["echo {files:*.py} > formatted.txt"]\n')
+        out = self.run_delegate("--mode", "write", "--verify", "true", "Task")
+        wt = Path(self.value(out, "worktree_path"))
+        self.assertEqual((wt / "formatted.txt").read_text().strip(), "test_app.py")
+        self.assertIn("autofix: ran echo test_app.py > formatted.txt", out.stdout)
+        self.assertIn("verification: passed", out.stdout)
+
     def test_autofix_formats_only_the_changed_files(self):
         (self.repo / ".mistral-delegate.toml").write_text(
             'autofix = ["echo {files:*.py} > formatted.txt; touch fixed.txt", "echo {files:*.ts} > ts.txt"]\n')
@@ -996,14 +1006,35 @@ class WriteModeTest(DelegateTestBase):
         self.assertIn("don't test what they claim", self.calls()[1]["prompt"])
         self.assertIn("tests/test_loose.py: `assert 1 in [1, 2]`: assert the exact value instead.",
                       self.calls()[1]["prompt"])
-        self.assertIn("test_quality_fix: Mistral was asked once to fix 1 weak spot(s) in its new tests; 0 remain",
+        self.assertIn("test_quality_fix: 1 weak spot(s) in Mistral's new tests sent back over 1 round(s); 0 remain",
                       out.stdout)
+        self.assertIn("rounds: first pass ~$0.00, test quality ~$0.00", out.stdout)
         self.assertNotIn("assertion_hint", out.stdout)
         (self.repo / ".mistral-delegate.toml").write_text("test_quality_fix = false\n")
         out = self.run_delegate("--mode", "write", "--verify", "true",
                                 "Task\nFAKE_FILE tests/test_loose.py assert 1 in [1, 2]")
         self.assertEqual(len(self.calls()), 3)  # no quality round this time
         self.assertIn("assertion_hint", out.stdout)
+
+    def test_a_run_is_revised_in_its_session_and_worktree(self):
+        first = self.run_delegate("--mode", "write", "--verify", "test -f test_app.py", "Task")
+        run_id = self.value(first, "run_id")
+        out = self.run_delegate("--revise", run_id, "FAKE_FILE review.txt R")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        call = self.last()
+        self.assertIn("The reviewer read your result and wants these changes", call["prompt"])
+        self.assertEqual(Path(call["cwd"]).name, run_id)  # the same worktree
+        self.assertIn("--resume", call["argv"])
+        self.assertIn("pass: test -f test_app.py", out.stdout)  # the run's own checks again
+        self.assertIn("kind: revise", out.stdout)
+        shown = out.stdout.split("changes_in_this_revision:")[1].split("diff_file")[0]
+        self.assertIn("review.txt", shown)
+        self.assertNotIn("test_app.py", shown)  # from the first run, already reviewed
+        adopted = self.run_delegate("--adopt", run_id)
+        self.assertEqual(adopted.returncode, 0, adopted.stdout)
+        self.assertEqual((self.repo / "review.txt").read_text(), "R\n")  # the revision
+        self.assertTrue((self.repo / "test_app.py").exists())  # and the run's own work
+        self.assertIn("needs the list of changes", self.run_delegate("--revise", run_id).stdout)
 
     def test_loose_assertions_are_flagged(self):
         out = self.run_delegate("--mode", "write", "Task\nFAKE_FILE tests/test_loose.py assert 1 in [1, 2]")
@@ -1358,6 +1389,7 @@ class PlanParserTest(unittest.TestCase):
             Add borrow().
 
             ### Test cases
+            Use the store fixture.
             - member with 3 open loans borrows b4 -> raises LoanLimitError("Member m1 already has 3 open loans")
             - queue [expired r1, active r2]: next_in_queue("b1")
               returns r2
@@ -1370,6 +1402,7 @@ class PlanParserTest(unittest.TestCase):
             'member with 3 open loans borrows b4 -> raises LoanLimitError("Member m1 already has 3 open loans")',
             'queue [expired r1, active r2]: next_in_queue("b1") returns r2'])
         self.assertNotIn("Test cases", step.text)
+        self.assertIn("Use the store fixture.", step.text)  # text before the first case stays with the step
         self.assertIn("### Notes\nKeep it small.", step.text)
         spec = plans.step_spec(p, step)
         self.assertIn('\n\n1. member with 3 open loans borrows b4', spec)
@@ -1383,8 +1416,8 @@ class PlanParserTest(unittest.TestCase):
 
     def test_test_cases_must_be_list_items(self):
         from mdelegate import plan as plans
-        for body, message in (("### Test cases\n\n", "has no cases"),
-                              ("### Test cases\nborrowing works\n", "as a list item")):
+        for body, message in (("### Test cases\n\n", "lists no cases"),
+                              ("### Test cases\nborrowing works\n", "it has only: 'borrowing works'")):
             with self.assertRaises(plans.PlanError) as caught:
                 plans.parse(f"# P\n## step: a\nDo it.\n{body}")
             self.assertIn(message, str(caught.exception))
@@ -1775,6 +1808,36 @@ class PlanRunTest(DelegateTestBase):
         self.assertIn("a: test_cases_warning: the spec lists 2 test case(s), but Mistral added 1 new test(s)",
                       out.stdout)
 
+    def test_a_revision_lands_in_the_merged_result(self):
+        plan = self.plan("""\
+            # Revised
+            ## step: a
+            scope: *.txt, test_app.py
+            verify: test -f a.txt
+            FAKE_FILE a.txt A
+            ## step: b
+            scope: *.txt, test_app.py
+            FAKE_FILE b.txt B
+            """)
+        plan_id = self.value(self.run_delegate("--plan", str(plan)), "plan_id")
+        out = self.run_delegate("--revise", plan_id, "- a.txt should say AA\nFAKE_FILE review.txt R")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        prompt = self.last()["prompt"]
+        self.assertIn("The reviewer read the merged result and wants these changes", prompt)
+        self.assertIn("- a.txt should say AA", prompt)
+        self.assertIn("pass: test -f a.txt", out.stdout)  # the steps' checks run on the revision
+        self.assertIn(f"plan_id: {plan_id} (revision 1)", out.stdout)
+        shown = out.stdout.split("changes_in_this_revision:")[1]
+        self.assertIn("review.txt", shown)  # the revision's own diff, not the whole plan's again
+        self.assertNotIn("b.txt", shown)
+        self.assertIn(f'more changes: --revise {plan_id} "<list>"', out.stdout)
+        revise_run = next(r for r in self.runs().values() if r.get("kind") == "revise")
+        self.assertEqual(revise_run["plan"], plan_id)
+        adopted = self.run_delegate("--adopt", plan_id)
+        self.assertEqual(adopted.returncode, 0, adopted.stdout)
+        self.assertEqual((self.repo / "review.txt").read_text(), "R\n")
+        self.assertIn("already", self.run_delegate("--revise", plan_id, "more").stdout)
+
     def test_steps_wait_for_free_slots(self):
         (self.home).mkdir(parents=True, exist_ok=True)
         (self.home / "config.toml").write_text("max_parallel = 2\n")
@@ -2027,6 +2090,15 @@ class GuardPolicyTest(unittest.TestCase):
         action, _r, new = guard.check_tool("bash", {"command": f"cat {spaced}/src/a.ts | grep x"}, policy, spaced)
         self.assertEqual(action, "rewrite")
         self.assertIn(shlex.quote(os.path.join(spaced, "src/a.ts")), new["command"])
+
+    def test_a_wrong_path_with_spaces_is_named_whole(self):
+        spaced = os.path.join(self.root, "2TB SSD")
+        Path(spaced, "src").mkdir(parents=True)
+        policy = dict(self.policy, root=spaced)
+        wrong = os.path.join(self.root, "2TB SSD-other/src/a.ts")
+        action, reason, _new = guard.check_tool("bash", {"command": f"cat {wrong}"}, policy, spaced)
+        self.assertEqual(action, "deny")
+        self.assertIn(f"`{wrong}` (unquoted, so it arrived in pieces) isn't a file or folder in the project", reason)
 
     def test_package_script_spellings_match(self):
         policy = dict(self.policy, allow_commands=["cd", "npm --prefix frontend test"])
@@ -2300,6 +2372,9 @@ class GuardLineTest(unittest.TestCase):
         import delegate
         events = [{"action": "rewrite", "target": "cat /Volumes/2TB SSD/p/a.py", "new": "cat '/Volumes/2TB SSD/p/a.py'"},
                   {"action": "rewrite", "target": "/a.py", "new": "/work/a.py"}, {"action": "allow"}]
+        noop = {"action": "deny", "reason": "This edit changes nothing: the old and new text are identical."}
+        self.assertIn("refused 0 (returned to Mistral as errors), stopped 1 edit(s) that changed nothing",
+                      delegate.guard_line([noop], 1, None))
         line = delegate.guard_line(events, 3, None)
         self.assertEqual(line, "guard: checked 3 tool calls, refused 0 (returned to Mistral as errors), quoted 1 "
                                "path(s) containing spaces, pointed 1 path(s) at the file in the project "
@@ -2348,9 +2423,55 @@ class TestProblemsTest(unittest.TestCase):
         self.assertIn(("from_result", "tests/test_service.py: test_list"), kinds)
         self.assertIn(("copied", "tests/test_service.py: test_reserve_fields, test_reserve_whole"), kinds)
         prompt = self.delegate.test_quality_prompt(problems)
-        self.assertIn("- tests/test_service.py: test_reserve_fields (checks r field by field): compare the whole "
-                      "object instead", prompt)
+        self.assertIn("- tests/test_service.py: test_reserve_fields (checks r field by field): replace those field "
+                      "checks with one comparison of the whole object", prompt)
+        self.assertIn("- tests/test_service.py: test_reserve_whole: `assert r.id == 1`: delete these lines", prompt)
         self.assertIn("move the repeated setup into one helper function or fixture", prompt)
+
+
+class CleanupChecksTest(unittest.TestCase):
+    DIFF = """\
++++ b/tests/test_store.py
+@@ -1,2 +1,22 @@
+ import pytest
++LIMIT = 3
++USED = 4
++
++def _old_setup(store):
++    return make_book(store, "Dune")
++
++def _lend(store):
++    return make_book(store, "Emma")
++
++# case 1
++def test_add(store):
++    book = _lend(store)
++    r = store.add_reservation(book.id, 1, TODAY, END)
++    assert r is not None
++    assert isinstance(r, Reservation)
++    assert r == Reservation(r.id, book.id, 1, TODAY, END)
++
++# case 3
++def test_limit(store):
++    assert store.count(USED) == 0
+"""
+
+    def setUp(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import delegate
+        self.delegate = delegate
+
+    def test_filler_unused_helpers_and_missing_cases(self):
+        problems = self.delegate.test_problems(self.DIFF, ["add one", "get missing", "the limit", "day 8"])
+        self.assertIn(("filler", "tests/test_store.py: test_add: `assert r is not None`; "
+                                 "`assert isinstance(r, Reservation)`"), problems)
+        self.assertNotIn("loose", [k for k, _w in problems])  # the isinstance line is reported once, as filler
+        unused = [w for k, w in problems if k == "unused"]
+        self.assertEqual(unused, ["tests/test_store.py: `LIMIT`", "tests/test_store.py: `_old_setup`"])
+        self.assertEqual([w for k, w in problems if k == "missing_case"], ["case 2: get missing", "case 4: day 8"])
+        # Without any case tags there's nothing to match: the count line covers that.
+        untagged = self.delegate.test_problems(self.DIFF.replace("# case", "# note"), ["a", "b"])
+        self.assertNotIn("missing_case", [k for k, _w in untagged])
 
 
 class GitOpsTest(unittest.TestCase):

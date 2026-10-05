@@ -65,7 +65,7 @@ Read the report. If the diff wasn't included, read the file named on its `diff:`
 - `denied_commands` / `refused_by_guard` don't include a command Mistral needed (if it does, say which, so it can be added to `allow_commands`);
 - the code follows the patterns of the surrounding code.
 
-If something small is wrong, you may follow up once with `--resume <session_id> --worktree-name <name>` and a precise instruction.
+If anything needs changing, don't fix it yourself: send the whole list once with `python3 <wrapper> --revise <run_id> "<list>"` (one line per change: file, what's wrong, what it should be). Mistral makes the changes in the same session and worktree, the checks run again, and the report shows only the revision's diff. Review that, and revise once more at most.
 
 ## 5. Report back
 

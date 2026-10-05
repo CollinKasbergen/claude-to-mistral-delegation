@@ -16,7 +16,7 @@ The session context names the active **policy** (`conservative`, `balanced` or `
 
 If both are yes, delegate it, even if you know exactly how you'd write it. Writing the code yourself is the expensive path. Keep design decisions, data-model choices, anything visual, and anything you can't check. Also keep small changes with subtle logic, such as URL or state synchronisation and edge-case handling, where reviewing Mistral's version properly takes about as long as writing it.
 
-**Habit:** after planning a change, label each step "mine" or "Mistral's". Put Mistral's steps in **one plan file** and start it with `--plan` in the background (see Plans below), then do your steps, then review the plan's one report and adopt. A single isolated step can be a plain run instead.
+**Habit:** after planning a change, label each step "mine" or "Mistral's". Put Mistral's steps in **one plan file** and start it with `--plan` in the background (see Plans below), then do your steps, then review the plan's one report, send everything that needs changing back in one `--revise` list, and adopt. A single isolated step can be a plain run instead.
 
 The session context may also show:
 
@@ -108,6 +108,7 @@ What to build in this step.
 - **The report:** `status: ok` (every step merged and the merged result passes its checks), `checks_failed` (every step merged, but together they fail a check), `partial` (some steps didn't merge) or `failed` (none did). One line per step (`-> merged`, `not merged: conflicts with ... in <files>`, `skipped: needs <step>`, or how to resume it), `review_first` (steps that ended without a closing summary and were merged on passing checks alone: read their diffs), one `baseline_warning` for checks that already failed on the starting code, `step_notes` (warnings from the steps' own reports), `verification` of the merged result (the plan's `verify:`, every merged step's checks and the configured checks), usage and credit, the combined diff, and `adopt_with`. `--result <step run id>` prints a step's own report when you need detail.
 - **A step line reads `checks failed`** when Mistral finished but the step's checks still failed; such a step isn't merged and holds back the steps that depend on it.
 - **Finishing a partial plan:** resume a failed step with the `--mode write --resume <session> --worktree-name <name>` command its line gives, then run `--integrate <plan id>`. It runs the steps that were skipped because of it (and any step whose worktree is gone), merges everything again and rechecks, with one report like the first. Don't run held-back steps as plain runs or with `--plan --steps`: they wouldn't be part of the plan.
+- **Revise instead of fixing it yourself:** after reading the plan's report and diff, put every change you want into one list and run `--revise <plan id> "<list>"` (or `-` to read it from stdin). See "Revise, don't fix" below. Revise after the last `--integrate`: merging the steps again drops a revision.
 - **Adopt or discard the plan, never a step:** `--adopt <plan id>` applies the merged result; `--adopt <plan id> --steps api` only those steps (with what they depend on); `--discard <plan id>` drops it all. `--include-out-of-scope` / `--skip-out-of-scope` work as for a run.
 
 ### Single steps and subagents
@@ -181,6 +182,22 @@ The wrapper adds the rules itself: which commands may run, which checks must pas
 
 The report starts with `run_id`, `status` and `verification`, then `usage` (cost, steps, tokens), the change list, and the full diff when it is short.
 
+### Revise, don't fix
+
+Your tokens are the scarce ones; Mistral's are cheap. When the review turns up anything to change (a weak or missing test, a leftover helper, a wording fix, a dead branch, a missed case), don't edit the files yourself. Write one list and send it back:
+
+```bash
+python3 <wrapper> --revise <plan id or run id> "- tests/test_service.py: the three limit tests copy the same setup; move it into one helper
+- tests/test_service.py: add the case where the 4th reservation on 2026-03-08 still raises
+- tests/test_api.py: delete the unused helper _reserve_raw
+- README.md, reservations section: the reserve action returns the reservation, not the book"
+```
+
+- One line per change: the file, what's wrong, what it should be. Precise beats short: Mistral does what the line says and nothing more.
+- For a plan, Mistral works in the plan's merged worktree, with the plan's shared context and every merged step's checks (plus the configured ones). For a run, it continues the run's own session and worktree with its checks and scope.
+- The report shows only what the revision changed (`changes_in_this_revision`), so your review stays short. Then adopt as usual (the whole plan: `--steps` would leave the revision out).
+- Revise again if something is still off; fix it yourself only if two revisions didn't manage it.
+
 - **final_message_warning.** Mistral's last step was a tool call, it left no final message, or its summary stops mid-sentence: the run was likely cut short. Treat the result as unfinished even if checks pass, and resume or redo it.
 - **checks_skipped / flaky_checks.** Configured checks limited to paths this run doesn't touch are skipped. A check that failed and then passed on an immediate rerun before Mistral started is flaky, not broken.
 - **status: incomplete.** Files named literally in `--scope` were never created (`missing_files`), even after one request. Passing checks don't cover files that don't exist. Resume with a precise instruction, or write them yourself.
@@ -190,12 +207,14 @@ The report starts with `run_id`, `status` and `verification`, then `usage` (cost
 - **test_strength / test_strength_warning.** When a run changes both code and tests, the wrapper also runs Mistral's tests against the original code, with only the test changes applied, on a clean copy. They should fail there.
   - Only test-runner checks count (pytest, vitest, jest, `go test`, `npm test`, ... or a `test_commands` entry), whose baseline passed, and whose `paths` cover the changed tests. Lint and `test -f` checks are ignored; pytest, vitest and jest run just the changed test files. Docs, configs and lockfiles don't count as code changes.
   - The warning appears only when every selected suite passes there. A timeout or a missing directory gives `test_strength: not checked (...)`.
-  - A `test_strength_warning` means they still pass without the change, so they don't test it: a guarded assertion (`if (button) expect(...)`), a missing assertion, or the wrong thing under test. Fix that before adopting, or resume Mistral with the exact problem.
+  - A `test_strength_warning` means they still pass without the change, so they don't test it: a guarded assertion (`if (button) expect(...)`), a missing assertion, or the wrong thing under test. Put the exact problem in a `--revise` list before adopting.
   - A `test_strength` line means they fail as they should. When they can't even load without the new code (an import error, normal for a new feature), there's no line: that shows nothing either way.
-- **assertion_hint.** Weak spots in the new tests: assertions on presence, size, type or truthiness (`assert x in y`, `len(...)`, `isinstance`, `toContain`); an object checked field by field instead of whole; an expected value looked up in the result under test (`next(... if ...)`); the same setup lines copied into several tests; tests that assert nothing; skipping or filtering tests that only check for None; setup inside `pytest.raises`. Mistral writes these whatever the spec and AGENTS.md say, so by default (`test_quality_fix = true`) the wrapper sends them back once, after the checks pass, as a fix round naming each test and what to change, then reruns the checks. The report's `test_quality_fix` line says how many were sent and how many remain; `assertion_hint` lists what remains. Fix those before adopting.
+- **assertion_hint.** Weak spots in the new tests: assertions on presence, size, type or truthiness (`assert x in y`, `len(...)`, `isinstance`, `toContain`); an object checked field by field instead of whole; an expected value looked up in the result under test (`next(... if ...)`); the same setup lines copied into several tests; tests that assert nothing; skipping or filtering tests that only check for None; setup inside `pytest.raises`. Also asserts that a whole-object comparison in the same test already covers, helpers and constants nothing uses, and test cases no test is tagged with (`# case N`, which Mistral is asked to add). Mistral writes these whatever the spec and AGENTS.md say, so by default (`test_quality_fix = true`) the wrapper sends them back after the checks pass, as a round naming each test and what to change, then reruns the checks; a second round follows if the first helped but left some. The report's `test_quality_fix` line says how many were sent per round and how many remain; `assertion_hint` lists what remains. Put those in a `--revise` list.
+- **rounds.** What each Mistral call of the run cost: first pass, continue, fix, test quality, revision. A plan's step lines show the same per step.
+- **autofix.** The formatters run at the end of every write run, on the files it changed (and also before deciding on a fix round when a check fails), so Mistral's later rounds are formatted too.
 - **Formatting failures cost Mistral rounds.** A long line or import order shouldn't take a fix round: suggest an `autofix` with `{files}` (only the files the run changed; the wrapper then keeps the formatter's edits only on the lines Mistral wrote, so the user's own lines keep their layout), e.g. `autofix = ["uv run ruff format {files:*.py}", "uv run ruff check --fix {files:*.py}"]`.
 - **verification: passed.** Passing checks don't prove the tests check the right thing. For tests Mistral wrote, read each assertion and ask whether it would fail if the feature were broken; watch for setups that test the wrong object, or duplicated fixtures. Then review the rest of the diff for scope and fit with the surrounding code, and run `adopt_with`. That applies only Mistral's changes to the checkout, leaves the user's uncommitted work alone, and removes the worktree. Use `--paths` to take part of it; the worktree then stays with the rest (`--discard` it when done).
-- **verification: failed.** Read `failing_check_output`. Either follow up with `--resume … --worktree-name …` and a precise instruction, fix it yourself after adopting, or discard.
+- **verification: failed.** Read `failing_check_output`. Send it back with `--revise <run id>` and a precise instruction, or discard.
 - **status: budget_exceeded / tool_call_limit.** The wrapper stopped Mistral at a cap (`note:` says which, and the `budget:` line shows what was used). The work so far is in the worktree and has been checked, with one fix round. Review it, resume with a higher cap, or discard it.
 - **usage / credit.** Effective tokens (fresh, cached and output), the cost at list prices, and the month's credit used so far. Mention the credit when it's getting low.
 - **continued.** Mistral stopped without a closing summary while its work looked unfinished (checks failing, nothing changed, or no checks to tell), and was asked once to finish. When its changes are in and pass the checks, the report only notes the missing summary instead of paying for a round. A remaining `final_message_warning` means it still didn't finish.

@@ -435,8 +435,10 @@ class PlanRun:
             or ([record] if record else [])
         costs = [c for c in (ledger.run_cost(r, vibe.model_prices()) for r in step_runs) if c is not None]
         if costs:
+            rounds = [r for run in step_runs for r in run.get("rounds") or []]
             parts.append(f"~{self.settings['currency']}{sum(costs):.4f}"
-                         + (f" over {len(step_runs)} runs" if len(step_runs) > 1 else ""))
+                         + (f" over {len(step_runs)} runs" if len(step_runs) > 1 else "")
+                         + (f" ({_rounds_text(rounds, self.settings['currency'])})" if len(rounds) > 1 else ""))
         if result.get("run_id"):
             parts.append(f"run {result['run_id']}")
         line = ", ".join(parts)
@@ -683,6 +685,9 @@ def integrate_again(args, script: Path, script_cmd) -> int:
             run.results[step.id] = result
         run.run_steps()
         latest_runs = {k: r.get("run_id") for k, r in run.results.items() if r.get("run_id")}
+        if any(r.get("kind") == "revise" for r in _plan_runs(record)):
+            run.notes.append("note: this plan had been revised (--revise); merging the steps again dropped the "
+                             "revision. Run --revise again with the same list if it still applies.")
         if latest_runs == (record.get("step_runs") or {}):
             run.notes.append("note: nothing changed since the last integration: no step was resumed or run. Resume "
                              "the step that failed (with --mode write and the --resume command its line gives), "
@@ -699,6 +704,57 @@ def integrate_again(args, script: Path, script_cmd) -> int:
         raise
     print(report)
     return 0 if end["status"] == "ok" and end["verification"] != "failed" else 1
+
+
+def revise(args, record: dict, script: Path, script_cmd) -> int:
+    """Claude's review findings for a plan, made by one Mistral run in the plan's merged worktree."""
+    _refuse_while_running(record)
+    merged = record.get("merged") or []
+    int_wt = record.get("worktree") or {}
+    if not merged or not os.path.isdir(int_wt.get("path", "")):
+        raise DelegateError(f"Plan {record['id']} has no merged result to revise.")
+    plan = _load_plan(record)
+    args.workdir = record.get("workdir") or args.workdir
+    workdir, top, settings = _setup(args)
+    steps = [plan.step(s) for s in record.get("steps") or [] if s in {x.id for x in plan.steps}]
+    run = PlanRun(args, script, settings, top, workdir, plan, steps, record["id"], script_cmd)
+    changes = args.task or ""
+    if args.spec:
+        try:
+            changes = gitops.find_document(args.spec, top, "spec").read_text(encoding="utf-8") + "\n" + changes
+        except OSError as e:
+            raise DelegateError(f"Can't read --spec file: {e}") from e
+    parts = [f"# Plan: {plan.title}",
+             "The steps of this plan were done separately and are merged in your working directory:",
+             "\n".join(f"- {s}: {plan.step(s).summary()}" for s in merged)]
+    if plan.shared:
+        parts.append("## Shared context\n\n" + plan.shared)
+    parts.append("## What to change\n\nThe reviewer read the merged result and wants these changes, and only "
+                 "these. Make each one, keep the checks passing, and when you replace something, delete what it "
+                 "replaced. End with the list of changes, one line each, saying how you made it or why you "
+                 "couldn't.\n\n" + changes.strip())
+    count = sum(1 for r in _plan_runs(record) if r.get("kind") == "revise") + 1
+    spec = ledger.run_file(record["id"], f"revise-{count}.spec.md")
+    spec.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+    # Every check a merged step had, and the plan's own; the configured checks apply by themselves.
+    checks = list(dict.fromkeys([*plan.verify, *[c for s in merged for c in plan.step(s).verify]]))
+    scope = [] if not all(plan.step(s).scope for s in merged) else list(dict.fromkeys(
+        [*[e for s in merged for e in plan.step(s).scope], *(args.scope or [])]))
+    cmd = run.child_command(worktree=record["id"], kind="revise", spec=spec, step_tag=f"{record['id']}:revise",
+                            task=f"Make the reviewer's changes to plan '{plan.title}'", scope=scope, verify=[],
+                            add_verify=checks, allow=[], context=[],
+                            extra=["--diff-lines", str(args.diff_lines),  # the revision's diff is for review
+                                   "--revise-of", record["id"]])
+    proc = subprocess.run(cmd, cwd=workdir)
+    print(f"\nplan_id: {record['id']} (revision {count})\n"
+          f"adopt_with: {script_cmd('--adopt', record['id'])}   (the whole plan: --steps would leave the "
+          "revision out)")
+    return proc.returncode
+
+
+def _rounds_text(rounds: list[dict], currency: str) -> str:
+    return ", ".join(r["label"] + (f" ~{currency}{r['cost']:.2f}" if r.get("cost") is not None else "")
+                     for r in rounds)
 
 
 def _step_worktrees(record: dict) -> dict[str, dict]:
