@@ -326,6 +326,11 @@ def top_denied(runs: dict[str, dict], days: int = 90, limit: int = 5) -> list[tu
     return [(cmd, n, *last[cmd]) for cmd, n in counts.most_common(limit)]
 
 
+def _command_of(denied: str) -> str:
+    tool, sep, rest = denied.partition(": ")
+    return rest if sep and " " not in tool else denied
+
+
 def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = None, currency: str = "$",
                  min_savings: float | None = None, allowed: list[str] | None = None) -> str:
     """allowed: the commands Mistral may run now (allow_commands and the configured checks); denials of
@@ -334,10 +339,12 @@ def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = No
     if not stats:
         return f"No finished delegations in the last {days} days."
     lines = [f"Delegations in the last {days} days:",
-             "kind          runs  ok   verify-pass  adopted/decided       avg-eff-tokens  avg-cost   savings"]
+             "kind          runs  ok   checks-pass  adopted/decided       avg-eff-tokens  avg-cost   savings"]
     total_runs, total_cost = 0, 0.0
     for kind, s in sorted(stats.items(), key=lambda kv: -kv[1]["runs"]):
-        verify = f"{s['passed']}/{s['verified']}" if s["verified"] else "-"
+        # Runs without checks (most docs runs) aren't in it: "1/1 of 4" says 3 runs had nothing to check.
+        verify = (f"{s['passed']}/{s['verified']}" + (f" of {s['runs']}" if s["verified"] < s["runs"] else "")
+                  if s["verified"] else "-")
         ratio = savings(s)
         flag = "  (below min_savings)" if min_savings and ratio is not None and ratio < min_savings else ""
         avg_cost = f"{currency}{s['cost'] / s['costed']:.3f}" if s["costed"] else "?"
@@ -358,11 +365,14 @@ def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = No
     if overhead:
         lines.append(overhead)
     denied = top_denied(runs, days, limit=20)
-    allowed_now = [d for d in denied if allowed and guard.command_allowed(d[0].split(), allowed)]
+    # Denials are recorded as "<tool>: <command>"; allow_commands and the checks name the command alone.
+    allowed_now = [d for d in denied if allowed and guard.command_allowed(_command_of(d[0]).split(), allowed)]
+    recent = {r_id for r_id, _r in sorted(runs.items(), key=lambda kv: -(kv[1].get("started") or 0))[:10]}
     still = [d for d in denied if d not in allowed_now][:5]
 
     def entry(cmd: str, n: int, when: float, run_id: str) -> str:
-        return f"  {n}x  {cmd}  (last {time.strftime('%b %d', time.localtime(when))}, run {run_id})"
+        return (f"  {n}x  {cmd}  (last {time.strftime('%b %d', time.localtime(when))}, run {run_id}"
+                + ("" if run_id in recent else "; not in the last 10 runs") + ")")
 
     if still:
         lines.append("most denied commands (add to allow_commands if Mistral needs them):")

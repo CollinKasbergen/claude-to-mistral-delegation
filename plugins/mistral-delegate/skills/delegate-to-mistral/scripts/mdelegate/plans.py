@@ -360,7 +360,7 @@ class PlanRun:
                 elif line.startswith(STEP_NOTE_PREFIXES):
                     # Notes whose example matters stay whole; others keep their first sentence and list items.
                     whole = line.startswith(("out_of_scope", "missing_files", "assertion_hint", "test_strength"))
-                    first = line[:500] if whole else line.split(". ")[0][:300]
+                    first = line[:2000] if whole else line.split(". ")[0][:300]
                     items = [ln.strip() for ln in report_lines[n + 1:n + 6] if ln.startswith("  - ")]
                     notes.setdefault(first + (" " + "; ".join(items) if items else ""), []).append(step.id)
         if failed_before:

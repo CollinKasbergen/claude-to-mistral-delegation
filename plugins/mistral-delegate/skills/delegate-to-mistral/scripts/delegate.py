@@ -421,9 +421,18 @@ class Run:
         self.denied_reasons += info.get("denied_reasons") or [""] * len(info["denied"])
         self.problems += info["problems"]
         self.notices += info["notices"]
-        if info["final_text"]:
-            self.final_text = info["final_text"]
-        self.unfinished = unfinished_reason(this_turn(history), info["final_text"])
+        answer = info["final_text"]
+        read = self.args.mode == "read"
+        if read:
+            # Mistral often answers, then says it will double-check something and reads a file or two:
+            # its answer is the long message, not the last line.
+            longest = max((vibe.text_of(e) for e in this_turn(history) if isinstance(e, dict)
+                           and e.get("type") == "message" and e.get("role") == "assistant"), key=len, default="")
+            if len(longest) >= 200 and len(answer.strip()) < 200:
+                answer = longest
+        if answer:
+            self.final_text = answer
+        self.unfinished = unfinished_reason(this_turn(history), answer, read)
         if stopped:
             self.status = stopped
         elif proc.returncode == 0:
@@ -472,6 +481,32 @@ ASSERTS = re.compile(r"\bassert|\bexpect\(|\.should\b|\braises\(|\bthrows\(|\.re
 # Assertions a function that returns nothing also passes.
 NONE_ONLY = re.compile(r"assert\s+(\S.*\s+is\s+(not\s+)?None|not\s+[\w.\[\]'\"()]+)\s*(,.*)?$|assertIs(Not)?None\(|assertFalse\(|"
                        r"\.(toBeNull|toBeUndefined|toBeFalsy)\(\)|\.not\.toBeDefined\(\)")
+# Test names about passing over items: those need more than "returns None" to show anything.
+SKIPPING_TEST = re.compile(r"skip|ignor|exclud|filter|bypass|pass(es)?_over", re.I)
+RAISES_BLOCK = re.compile(r"^(\s*)with\s+(pytest\.raises|self\.assertRaises\w*)\(.*:\s*(#.*)?$")
+
+
+def statements_in_raises(body: list[str]) -> int:
+    """The most statements inside one `with pytest.raises(...)` block of a test."""
+    most = 0
+    for i, line in enumerate(body):
+        block = RAISES_BLOCK.match(line)
+        if not block:
+            continue
+        inner, depth = [], None
+        for nxt in body[i + 1:]:
+            if not nxt.strip() or nxt.strip().startswith("#"):
+                continue
+            indent = len(nxt) - len(nxt.lstrip())
+            if indent <= len(block.group(1)):
+                break
+            depth = depth if depth is not None else indent
+            if indent == depth and not nxt.strip().startswith((")", "]", "}")):
+                inner.append(nxt)
+        most = max(most, len(inner))
+    return most
+
+
 PY_TEST = re.compile(r"^(\s*)(async\s+)?def\s+(test\w*)\s*\(")
 JS_TEST = re.compile(r"^(\s*)(it|test)(\.\w+)?\(\s*(['\"`])(.*?)\4")
 
@@ -521,13 +556,16 @@ def assertion_hint(wt: dict) -> str:
             current = line[6:]
         elif current and TEST_FILE.search(current) and LOOSE_ASSERTION.search(line):
             loose.append(f"{current}: {line[1:].strip()[:100]}")
-    empty, none_only = [], []
+    empty, none_only, crowded = [], [], []
     for path, name, body in new_tests(diff):
         checks = [ln.strip() for ln in body if ASSERTS.search(ln) and not ln.strip().startswith(("#", "//"))]
         if not checks:
             empty.append(f"{path}: {name}")
-        elif all(NONE_ONLY.search(c) for c in checks):
+        elif SKIPPING_TEST.search(name) and all(NONE_ONLY.search(c) for c in checks):
+            # "Not found" is a fair None; a test about passing over items should show the item it reaches.
             none_only.append(f"{path}: {name}")
+        if statements_in_raises(body) > 1:
+            crowded.append(f"{path}: {name}")
     parts = []
     if loose:
         parts.append(f"{len(loose)} assertion(s) in the new tests check presence, size or truthiness, or compute "
@@ -536,8 +574,12 @@ def assertion_hint(wt: dict) -> str:
     if empty:
         parts.append(f"{len(empty)} new test(s) assert nothing: " + "; ".join(empty[:3]))
     if none_only:
-        parts.append(f"{len(none_only)} new test(s) only check for None or a false value, which code that does "
-                     "nothing also passes: " + "; ".join(none_only[:3]))
+        parts.append(f"{len(none_only)} new test(s) about skipping or filtering only check that nothing is "
+                     "returned, which code that skips everything also passes; they should show the valid item "
+                     "after the skipped one is reached: " + "; ".join(none_only[:3]))
+    if crowded:
+        parts.append(f"{len(crowded)} new test(s) put setup inside pytest.raises / assertRaises, so an error in "
+                     "the setup also passes; keep only the call that should raise inside: " + "; ".join(crowded[:3]))
     if not parts:
         return ""
     return "assertion_hint: " + ". ".join(parts) + ". Check them against the project's rules before adopting."
@@ -560,11 +602,16 @@ def this_turn(history: list) -> list:
     return history
 
 
-def unfinished_reason(turn: list, final_text: str) -> str:
-    """Why the turn looks cut off (no closing summary, or a summary that stops mid-sentence), or ""."""
+def unfinished_reason(turn: list, final_text: str, read: bool = False) -> str:
+    """Why the turn looks cut off (no closing summary, or a summary that stops mid-sentence), or "".
+
+    read: a read-only run, where every tool call reads, so calls after a full answer never matter."""
     if not turn:
         return ""
     entries = [e for e in turn if isinstance(e, dict) and e.get("type") in ("message", "effect")]
+    if read and len(final_text.strip()) >= 200:
+        while entries and entries[-1].get("type") == "effect":
+            entries.pop()
     # Trailing read-only calls (re-reading a file, updating a todo list) after the summary don't matter.
     # Trailing read-only or refused calls after a real answer don't make the answer unfinished.
     while entries and entries[-1].get("type") == "effect" and (
@@ -684,6 +731,7 @@ def test_strength(wt: dict, run_dir: str, checks: list[dict], baseline: dict, se
             if patch.strip():
                 gitops.git_checked(clean, "apply", "--whitespace=nowarn", "-", input=patch)
             cwd = clean / rel_dir
+            all_new = all(not (clean / f).exists() for f in code)
             if not cwd.is_dir():
                 return f"test_strength: not checked ({rel_dir} doesn't exist in the original code)"
             results = run_checks([run for _orig, run in commands], str(cwd), timeout)
@@ -708,10 +756,18 @@ def test_strength(wt: dict, run_dir: str, checks: list[dict], baseline: dict, se
         shown.append(f"{run}: {last[0][:160]}")
     if all(LOAD_ERROR.search(out) and not REAL_FAILURE.search(out) for _run, out in failing):
         # The tests can't even load without the new code: that says nothing about their assertions.
+        if all_new:
+            return ""  # expected for brand-new code, and nothing to act on; assertion_hint covers the tests
         return ("test_strength: not conclusive: Mistral's tests fail on the original code only because they can't "
                 "load there (" + "; ".join(shown) + "), so this doesn't show they would catch a broken change. "
                 "Read the assertions.")
     return ("test_strength: Mistral's tests fail on the original code, as they should (" + "; ".join(shown) + ").")
+
+
+def runnable_checks(verify: list[dict]) -> list[str]:
+    """The parts of the checks Mistral may run itself (a `{files}` command needs the wrapper's file list)."""
+    return [seg.strip() for c in verify for seg in re.split(r"&&|\|\||;", c["cmd"])
+            if seg.strip() and "{files" not in seg]
 
 
 def resolve_mode(args: argparse.Namespace) -> str:
@@ -773,8 +829,7 @@ def run_task(args: argparse.Namespace) -> int:
             if command not in {v["cmd"] for v in verify}:
                 verify.append({"cmd": command, "paths": []})
     # Mistral may run the run's own checks, so it can see a lint or type error before it says it's done.
-    check_commands = [seg.strip() for c in verify for seg in re.split(r"&&|\|\||;", c["cmd"])
-                      if seg.strip() and "{files" not in seg]
+    check_commands = runnable_checks(verify)
     allow_commands = list(dict.fromkeys(settings["allow_commands"] + args.allow_command + check_commands)) \
         if write else []
     # `npm test` also covers `npm run test`, `npx vitest` (when that's the test script), etc.
@@ -1302,8 +1357,11 @@ def guard_line(events: list[dict], tool_calls: int, warning: str | None) -> str:
                                                      if tool_calls else ""))
     denied = sum(e.get("action") == "deny" for e in events)
     rewritten = sum(e.get("action") == "rewrite" for e in events)
+    example = next((e for e in events if e.get("action") == "rewrite" and e.get("new")), None)
     return (f"guard: checked {len(events)} tool calls, refused {denied} (returned to Mistral as errors), "
-            f"corrected {rewritten} path(s)")
+            f"corrected {rewritten} path(s)"
+            + (f" Mistral guessed wrong or wrote from outside the project (e.g. {example['target']} -> "
+               f"{example['new']}); the calls went ahead with the corrected path" if example else ""))
 
 
 def usage_line(use: dict | None, currency: str) -> str:
@@ -1420,11 +1478,13 @@ def main(argv: list[str]) -> int:
                 print(f"{len(runs) - len(here)} run(s) in other projects not shown (--all-repos shows them).")
             return 0
         if args.stats:
-            settings = config.load(gitops.toplevel(str(Path(args.workdir).resolve())) or args.workdir)
+            top = gitops.toplevel(str(Path(args.workdir).resolve()))
+            settings = config.load(top or args.workdir)
             vibe.EXTRA_PRICES.update(settings["model_prices"])
             print(ledger.format_stats(ledger.load_runs(), prices=vibe.model_prices(), currency=settings["currency"],
                                       min_savings=settings["min_savings"],
-                                      allowed=settings["allow_commands"] + [c["cmd"] for c in settings["verify"]]))
+                                      allowed=cmdforms.expand(settings["allow_commands"]
+                                                              + runnable_checks(settings["verify"]), top or args.workdir)))
             line = credit_line(settings, None)
             if line:
                 print(line)
