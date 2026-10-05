@@ -132,6 +132,7 @@ def run_file(run_id: str, name: str) -> Path:
     """A file in a run's (or plan's) own folder: ~/.mistral-delegate/runs/<id>/<name>.
 
     report.md   the report the wrapper printed       spec.md     the task and spec Mistral got
+    prompt.md   the whole first prompt Mistral got (task, spec, project rules, instructions)
     changes.diff  everything the run changed         guard.jsonl  the guard's decisions
     plan.md     a plan as it was run                  <step>.spec.md, <step>.log  a plan step's spec and output
     """
@@ -339,17 +340,18 @@ def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = No
     if not stats:
         return f"No finished delegations in the last {days} days."
     lines = [f"Delegations in the last {days} days:",
-             "kind          runs  ok   checks-pass  adopted/decided       avg-eff-tokens  avg-cost   savings"]
+             "kind          runs  ok   checks                adopted/decided       avg-eff-tokens  avg-cost   savings"]
     total_runs, total_cost = 0, 0.0
     for kind, s in sorted(stats.items(), key=lambda kv: -kv[1]["runs"]):
-        # Runs without checks (most docs runs) aren't in it: "1/1 of 4" says 3 runs had nothing to check.
-        verify = (f"{s['passed']}/{s['verified']}" + (f" of {s['runs']}" if s["verified"] < s["runs"] else "")
-                  if s["verified"] else "-")
+        # What the runs' checks said, counting runs that had none (most docs runs): "2 pass, 3 none".
+        failed, unchecked = s["verified"] - s["passed"], s["runs"] - s["verified"]
+        verify = ", ".join([f"{s['passed']} pass"] * bool(s["passed"]) + [f"{failed} fail"] * bool(failed)
+                           + [f"{unchecked} none"] * bool(unchecked))
         ratio = savings(s)
         flag = "  (below min_savings)" if min_savings and ratio is not None and ratio < min_savings else ""
         avg_cost = f"{currency}{s['cost'] / s['costed']:.3f}" if s["costed"] else "?"
         avg_effective = f"{s['effective'] // s['measured']:,}" if s["measured"] else "n/a"
-        lines.append(f"{kind:<13} {s['runs']:<5} {s['ok']:<4} {verify:<12} {_adopted(s):<21} "
+        lines.append(f"{kind:<13} {s['runs']:<5} {s['ok']:<4} {verify:<21} {_adopted(s):<21} "
                      f"{avg_effective:<15} {avg_cost:<10} "
                      + (f"x{ratio:.1f}" if ratio is not None else "-") + flag)
         total_runs += s["runs"]
