@@ -12,6 +12,7 @@ import calendar
 import contextlib
 import json
 import os
+import re
 import subprocess
 import time
 from collections import Counter, defaultdict
@@ -327,6 +328,15 @@ def top_denied(runs: dict[str, dict], days: int = 90, limit: int = 5) -> list[tu
     return [(cmd, n, *last[cmd]) for cmd, n in counts.most_common(limit)]
 
 
+def _allowed_now(command: str, allowed: list[str]) -> bool:
+    """Whether every part of a chained command is allowed now, as the guard decides. Moving into a
+    folder (`cd web`) is never what was denied, so it neither counts nor allows the rest."""
+    prefixes = [a for a in allowed if not re.match(r"^cd(\s|$)", a)]
+    parts = [p.strip() for p in re.split(r"&&|\|\||;|\|", command) if p.strip()]
+    parts = [p for p in parts if not re.match(r"^cd(\s|$)", p)]
+    return bool(parts) and all(guard.command_allowed(p.split(), prefixes) for p in parts)
+
+
 def _command_of(denied: str) -> str:
     tool, sep, rest = denied.partition(": ")
     return rest if sep and " " not in tool else denied
@@ -340,18 +350,17 @@ def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = No
     if not stats:
         return f"No finished delegations in the last {days} days."
     lines = [f"Delegations in the last {days} days:",
-             "kind          runs  ok   checks                adopted/decided       avg-eff-tokens  avg-cost   savings"]
+             "kind          runs  ok   checks-passed  no-checks  adopted/decided       avg-eff-tokens  avg-cost   savings"]
     total_runs, total_cost = 0, 0.0
     for kind, s in sorted(stats.items(), key=lambda kv: -kv[1]["runs"]):
-        # What the runs' checks said, counting runs that had none (most docs runs): "2 pass, 3 none".
-        failed, unchecked = s["verified"] - s["passed"], s["runs"] - s["verified"]
-        verify = ", ".join([f"{s['passed']} pass"] * bool(s["passed"]) + [f"{failed} fail"] * bool(failed)
-                           + [f"{unchecked} none"] * bool(unchecked))
+        # Of the runs that had checks, how many passed; and how many had none (most docs runs).
+        verify = f"{s['passed']}/{s['verified']}" if s["verified"] else "-"
+        unchecked = s["runs"] - s["verified"]
         ratio = savings(s)
         flag = "  (below min_savings)" if min_savings and ratio is not None and ratio < min_savings else ""
         avg_cost = f"{currency}{s['cost'] / s['costed']:.3f}" if s["costed"] else "?"
         avg_effective = f"{s['effective'] // s['measured']:,}" if s["measured"] else "n/a"
-        lines.append(f"{kind:<13} {s['runs']:<5} {s['ok']:<4} {verify:<21} {_adopted(s):<21} "
+        lines.append(f"{kind:<13} {s['runs']:<5} {s['ok']:<4} {verify:<14} {unchecked:<10} {_adopted(s):<21} "
                      f"{avg_effective:<15} {avg_cost:<10} "
                      + (f"x{ratio:.1f}" if ratio is not None else "-") + flag)
         total_runs += s["runs"]
@@ -368,7 +377,7 @@ def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = No
         lines.append(overhead)
     denied = top_denied(runs, days, limit=20)
     # Denials are recorded as "<tool>: <command>"; allow_commands and the checks name the command alone.
-    allowed_now = [d for d in denied if allowed and guard.command_allowed(_command_of(d[0]).split(), allowed)]
+    allowed_now = [d for d in denied if allowed and _allowed_now(_command_of(d[0]), allowed)]
     recent = {r_id for r_id, _r in sorted(runs.items(), key=lambda kv: -(kv[1].get("started") or 0))[:10]}
     still = [d for d in denied if d not in allowed_now][:5]
 

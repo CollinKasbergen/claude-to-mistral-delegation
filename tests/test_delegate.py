@@ -138,6 +138,10 @@ FAKE_VIBE = textwrap.dedent('''\
     if agent != "plan":
         if "failed (exit code" in prompt:
             open("fixed.txt", "w").write("fixed\\n")
+        elif "don't test what they claim" in prompt:  # the test-quality round
+            path, _, content = os.environ.get("FAKE_VIBE_GOOD_TEST", "").partition("=")
+            if path:
+                open(path, "w").write(content)
         else:
             open("test_app.py", "w").write("def test_app():\\n    assert True\\n")
             for path, content in re.findall(r"^FAKE_FILE (\\S+) (.*)$", prompt, re.M):  # files a plan step asks for
@@ -453,7 +457,7 @@ class WriteModeTest(DelegateTestBase):
         self.assertTrue(results[1]["hook_specific_output"]["tool_input"]["path"].endswith("/app.py"))
         self.assertIsNone(results[2])
         self.assertIn("guard: checked 3 tool calls, refused 1", out.stdout)
-        self.assertIn("corrected 1 path(s) Mistral guessed wrong or wrote from outside the project (e.g. /app.py -> ", out.stdout)
+        self.assertIn("pointed 1 path(s) at the file in the project (e.g. /app.py -> ", out.stdout)
         self.assertIn("refused_by_guard", out.stdout)
         self.assertIn("bash: npx vitest run", out.stdout.split("denied_commands")[1])  # Vibe-side denial still shown
         # Outside a run the hook does nothing.
@@ -972,11 +976,11 @@ class WriteModeTest(DelegateTestBase):
         out = self.run_delegate("--mode", "write", "--no-verify", "--verify", "true", "Task")
         self.assertNotIn("test -f app.py", out.stdout.split("verification:")[1].split("\n\n")[0])
 
-    def test_tests_that_only_fail_to_load_are_not_conclusive(self):
+    def test_tests_that_only_fail_to_load_get_no_strength_line(self):
         (self.repo / ".mistral-delegate.toml").write_text('test_commands = ["test ! -f"]\n')
         out = self.run_delegate("--mode", "write", "--verify", 'test ! -f test_app.py || python3 -c "import newmod"',
                                 "Task\nFAKE_FILE newmod.py X = 1", FAKE_VIBE_TOUCH_APP="1")
-        self.assertIn("test_strength: not conclusive", out.stdout)
+        self.assertNotIn("test_strength", out.stdout)  # can't load on the old code: shows nothing either way
 
     def test_tests_of_brand_new_code_get_no_strength_line(self):
         (self.repo / ".mistral-delegate.toml").write_text('test_commands = ["test ! -f"]\n')
@@ -984,13 +988,30 @@ class WriteModeTest(DelegateTestBase):
                                 "Task\nFAKE_FILE newmod.py X = 1")
         self.assertNotIn("test_strength", out.stdout)  # it can't load without newmod.py: expected, nothing to do
 
+    def test_weak_tests_get_one_quality_round(self):
+        out = self.run_delegate("--mode", "write", "--verify", "true",
+                                "Task\nFAKE_FILE tests/test_loose.py assert 1 in [1, 2]",
+                                FAKE_VIBE_GOOD_TEST="tests/test_loose.py=assert [1, 2] == [1, 2]\n")
+        self.assertEqual(len(self.calls()), 2)
+        self.assertIn("don't test what they claim", self.calls()[1]["prompt"])
+        self.assertIn("tests/test_loose.py: `assert 1 in [1, 2]`: assert the exact value instead.",
+                      self.calls()[1]["prompt"])
+        self.assertIn("test_quality_fix: Mistral was asked once to fix 1 weak spot(s) in its new tests; 0 remain",
+                      out.stdout)
+        self.assertNotIn("assertion_hint", out.stdout)
+        (self.repo / ".mistral-delegate.toml").write_text("test_quality_fix = false\n")
+        out = self.run_delegate("--mode", "write", "--verify", "true",
+                                "Task\nFAKE_FILE tests/test_loose.py assert 1 in [1, 2]")
+        self.assertEqual(len(self.calls()), 3)  # no quality round this time
+        self.assertIn("assertion_hint", out.stdout)
+
     def test_loose_assertions_are_flagged(self):
         out = self.run_delegate("--mode", "write", "Task\nFAKE_FILE tests/test_loose.py assert 1 in [1, 2]")
-        self.assertIn("assertion_hint: 1 assertion(s) in the new tests check presence", out.stdout)
-        self.assertIn("tests/test_loose.py: assert 1 in [1, 2]", out.stdout)
+        self.assertIn("assertion_hint: in the new tests, 1 check presence, size, type or truthiness", out.stdout)
+        self.assertIn("tests/test_loose.py: `assert 1 in [1, 2]`", out.stdout)
         self.assertIn("worktree_base: your HEAD when the worktree was made", out.stdout)
         out = self.run_delegate("--mode", "write", "Task\nFAKE_FILE tests/test_q.py assert first == (a if a < b else b)")
-        self.assertIn("tests/test_q.py: assert first == (a if a < b else b)", out.stdout)
+        self.assertIn("tests/test_q.py: `assert first == (a if a < b else b)`", out.stdout)
 
     def test_checks_mistral_may_run_and_checks_that_cant_run_yet(self):
         check = "cd . && python3 -c \"open('new_test_file.py')\""  # fails like pytest on a file that isn't there yet
@@ -1704,7 +1725,7 @@ class PlanRunTest(DelegateTestBase):
         self.assertEqual(out.stdout.count("baseline_warning"), 1)
         self.assertIn("before any step changed it: false (in every step)", out.stdout)
         self.assertIn("a: assertion_hint", notes)
-        self.assertIn("tests/test_loose.py: assert 1 in [1, 2]", notes)  # the example, not cut off at "e.g"
+        self.assertIn("tests/test_loose.py: `assert 1 in [1, 2]`", notes)  # the example, not cut off at "e.g"
         self.assertIn("checks passed_except_preexisting first try", out.stdout)
 
     def test_plan_checks_add_to_the_configured_and_step_checks(self):
@@ -2265,13 +2286,71 @@ diff --git a/src/app.py b/src/app.py
         from unittest import mock
         with mock.patch.object(self.delegate.gitops, "changes_diff", return_value=self.DIFF):
             hint = self.delegate.assertion_hint({})
-        self.assertIn("2 new test(s) assert nothing: tests/test_s.py: test_empty; web/a.test.ts: renders", hint)
-        self.assertIn("2 new test(s) about skipping or filtering only check that nothing is returned", hint)
-        self.assertIn("tests/test_s.py: test_skips_expired; web/a.test.ts: skips hidden books", hint)
-        self.assertIn("1 new test(s) put setup inside pytest.raises / assertRaises", hint)
-        self.assertIn("tests/test_s.py: test_crowded", hint)
+        self.assertIn("2 assert nothing: tests/test_s.py: test_empty; web/a.test.ts: renders", hint)
+        self.assertIn("2 are about skipping or filtering but only check that nothing is returned: "
+                      "tests/test_s.py: test_skips_expired; web/a.test.ts: skips hidden books", hint)
+        self.assertIn("1 put setup inside pytest.raises / assertRaises: tests/test_s.py: test_crowded", hint)
         for fine in ("test_good", "test_raises", "test_missing"):  # a "not found" None is a fair check
             self.assertNotIn(fine, hint)
+
+
+class GuardLineTest(unittest.TestCase):
+    def test_quoting_a_path_with_spaces_isnt_a_wrong_path(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import delegate
+        events = [{"action": "rewrite", "target": "cat /Volumes/2TB SSD/p/a.py", "new": "cat '/Volumes/2TB SSD/p/a.py'"},
+                  {"action": "rewrite", "target": "/a.py", "new": "/work/a.py"}, {"action": "allow"}]
+        line = delegate.guard_line(events, 3, None)
+        self.assertEqual(line, "guard: checked 3 tool calls, refused 0 (returned to Mistral as errors), quoted 1 "
+                               "path(s) containing spaces, pointed 1 path(s) at the file in the project "
+                               "(e.g. /a.py -> /work/a.py)")
+
+
+class TestProblemsTest(unittest.TestCase):
+    DIFF = """\
++++ b/tests/test_service.py
+@@ -1,1 +1,30 @@
+ import pytest
++def test_reserve_fields(store):
++    ada = make_member(store, "Ada")
++    dune = make_book(store, "Dune")
++    lend(store, dune, ada)
++    r = reserve_book(store, dune.id, bob.id, TODAY)
++    assert isinstance(r, Reservation)
++    assert r.book_id == dune.id
++    assert r.member_id == bob.id
++
++def test_reserve_whole(store):
++    ada = make_member(store, "Ada")
++    dune = make_book(store, "Dune")
++    lend(store, dune, ada)
++    r = reserve_book(store, dune.id, bob.id, TODAY)
++    assert r == Reservation(r.id, dune.id, bob.id, TODAY, END)
++    assert r.id == 1
++
++def test_list(client):
++    body = handle({"action": "reservations"})
++    mine = next(x for x in body["reservations"] if x["member_id"] == 2)
++    assert body == {"ok": True, "reservations": [mine]}
+"""
+
+    def setUp(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import delegate
+        self.delegate = delegate
+
+    def test_finds_piecemeal_checks_lookups_in_the_result_and_copied_setup(self):
+        problems = self.delegate.test_problems(self.DIFF)
+        kinds = {(kind, where.split(" (")[0].split(" repeat")[0]) for kind, where in problems}
+        self.assertIn(("loose", "tests/test_service.py: `assert isinstance(r, Reservation)`"), kinds)
+        self.assertIn(("fields", "tests/test_service.py: test_reserve_fields"), kinds)
+        self.assertNotIn(("fields", "tests/test_service.py: test_reserve_whole"), kinds)  # compared whole too
+        self.assertIn(("from_result", "tests/test_service.py: test_list"), kinds)
+        self.assertIn(("copied", "tests/test_service.py: test_reserve_fields, test_reserve_whole"), kinds)
+        prompt = self.delegate.test_quality_prompt(problems)
+        self.assertIn("- tests/test_service.py: test_reserve_fields (checks r field by field): compare the whole "
+                      "object instead", prompt)
+        self.assertIn("move the repeated setup into one helper function or fixture", prompt)
 
 
 class GitOpsTest(unittest.TestCase):
@@ -2384,7 +2463,7 @@ class LedgerTest(unittest.TestCase):
         runs = ledger.load_runs()
         self.assertEqual(runs["r3"]["status"], "ok")  # not swallowed by the torn line
         self.assertIn("r1", ledger.format_status(runs, currency="€"))
-        self.assertIn("1 pass", ledger.format_stats(runs))  # passed_except_preexisting counts as passed
+        self.assertIn("1/1", ledger.format_stats(runs))  # passed_except_preexisting counts as passed
         ledger.month_spend(runs)
 
     def test_token_averages_skip_runs_without_token_data(self):
@@ -2403,6 +2482,11 @@ class LedgerTest(unittest.TestCase):
         stats = ledger.format_stats(runs)
         self.assertIn("1x  bash: uv run mypy shelf  (last ", stats)
         self.assertNotIn("x  tool", stats)
+        chained = {"b": {"id": "b", "kind": "tests", "status": "ok", "started": time.time(),
+                         "denied": ["bash: cd web && npm run typecheck"]}}
+        stats = ledger.format_stats(chained, allowed=["cd web", "npx tsc --noEmit"])  # from `cd web && npx tsc`
+        self.assertIn("1x  bash: cd web && npm run typecheck", stats)  # still denied: npm run typecheck isn't allowed
+        self.assertNotIn("allowed now", stats)
         stats = ledger.format_stats(runs, allowed=["uv run mypy"])  # a configured check now
         self.assertNotIn("most denied commands", stats)
         self.assertIn("denied before, allowed now (allow_commands or a configured check, which Mistral may run): "
@@ -2413,7 +2497,7 @@ class LedgerTest(unittest.TestCase):
         runs = {i: {"id": i, "kind": "docs", "status": "ok", "started": time.time(),
                     "verification": "passed" if i == "a" else "not_run"} for i in "abcd"}
         row = next(line for line in ledger.format_stats(runs).splitlines() if line.startswith("docs"))
-        self.assertIn("1 pass, 3 none", row)
+        self.assertRegex(row, r"^docs\s+4\s+4\s+1/1\s+3\s")  # 1 of 1 checked run passed; 3 had no checks
 
     def test_status_uses_the_currency(self):
         from mdelegate import ledger
