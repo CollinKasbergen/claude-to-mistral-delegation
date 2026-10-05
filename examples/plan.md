@@ -15,8 +15,15 @@ verify: npx vitest run tests/api
 allow: npx vitest run
 
 Add GET /api/teams returning { id, name, memberCount } for the current user's
-teams, and GET /api/teams/:id with the members. Cover: no teams, a team the
-user isn't in (404), and member counts.
+teams, and GET /api/teams/:id with the members.
+
+### Test cases
+- user u1 in no teams: GET /api/teams -> 200, []
+- u1 in team 3 "Core" with members u1, u2: GET /api/teams -> 200,
+  [{ id: 3, name: "Core", memberCount: 2 }]
+- team 7 without u1: GET /api/teams/7 -> 404, { error: "Team 7 not found" }
+- u1 in team 3: GET /api/teams/3 -> 200,
+  { id: 3, name: "Core", members: [{ id: "u1" }, { id: "u2" }] }
 
 ## step: store - Teams store
 depends: api

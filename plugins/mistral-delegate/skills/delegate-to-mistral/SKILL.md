@@ -89,7 +89,11 @@ context: src/api/users.ts
 verify: npx vitest run src/api
 allow: npx vitest run
 
-What to build in this step: endpoints, cases to cover, insertion points.
+What to build in this step: endpoints, insertion points.
+
+### Test cases
+- no teams: GET /api/teams -> 200, []
+- a team the user isn't in: GET /api/teams/7 -> 404, {"error": "Team 7 not found"}
 
 ## step: ui - Teams page
 depends: api
@@ -98,7 +102,7 @@ scope: src/pages/Teams.vue, src/pages/Teams.test.ts
 What to build in this step.
 ```
 
-- **Format:** `# Title`, then optional plan settings (`verify:` checks for the merged result, added to the configured checks and every merged step's checks, which always run there too; `kind:` default kind), then the shared context. Each `## step: <id> - <title>` starts with its settings: `scope`, `context`, `depends` (comma-separated), `verify`, `allow` (one command per line, may repeat), `kind`. A step's `verify:` adds to the configured checks (lint, type check), it doesn't replace them. The rest is that step's instructions. A step gets the shared context, its own instructions, and one line about every other step; write each step as you'd write a spec.
+- **Format:** `# Title`, then optional plan settings (`verify:` checks for the merged result, added to the configured checks and every merged step's checks, which always run there too; `kind:` default kind), then the shared context. Each `## step: <id> - <title>` starts with its settings: `scope`, `context`, `depends` (comma-separated), `verify`, `allow` (one command per line, may repeat), `kind`. A step's `verify:` adds to the configured checks (lint, type check), it doesn't replace them. A `### Test cases` section lists the tests to write (see Writing the spec). The rest is that step's instructions. A step gets the shared context, its own instructions, and one line about every other step; write each step as you'd write a spec.
 - **Split by file:** steps that change the same file conflict when merged (the report says so, and the later step isn't merged). Give each step its own files, and make a step that builds on another `depends` on it.
 - **Run it in the background:** write it to `.mistral-delegate/plans/teams-page.md`, then `python3 <wrapper> --plan teams-page` (Bash `run_in_background`; it takes as long as its slowest chain of steps). `--steps api,ui` runs only some. Caps and flags (`--fix-attempts`, `--max-price`, ...) apply to each step. `--status` shows the plan and its steps while they run.
 - **The report:** `status: ok` (every step merged and the merged result passes its checks), `checks_failed` (every step merged, but together they fail a check), `partial` (some steps didn't merge) or `failed` (none did). One line per step (`-> merged`, `not merged: conflicts with ... in <files>`, `skipped: needs <step>`, or how to resume it), `review_first` (steps that ended without a closing summary and were merged on passing checks alone: read their diffs), one `baseline_warning` for checks that already failed on the starting code, `step_notes` (warnings from the steps' own reports), `verification` of the merged result (the plan's `verify:`, every merged step's checks and the configured checks), usage and credit, the combined diff, and `adopt_with`. `--result <step run id>` prints a step's own report when you need detail.
@@ -152,7 +156,12 @@ Files: <paths to read>, <paths to create or change>.
 Follow: <existing file whose patterns and style to match>.
 Requirements / cases: <bulleted, exhaustive list>.
 Out of scope: <what not to touch>.
+
+## Test cases
+- <setup> -> <call> -> <exact expected result>
 ```
+
+**Write the test cases yourself, for every step that adds tests.** Mistral ignores rules like "assert exact values" or "don't copy setup", however often they're repeated, but it turns concrete cases into tests reliably. Give one list item per case: the setup, the call, and the exact expected result (the whole object, list, response body or error message, with real ids and values). Example: `member m1 with 3 open loans borrows b4 -> raises LoanLimitError("Member m1 already has 3 open loans")`; `queue for b1 is [r1 expired, r2 active] -> next_in_queue("b1") returns r2`. Cover the edge cases you care about (empty, limit reached, expired, another member's item); Mistral seldom adds them itself. The wrapper adds the instructions for turning cases into tests (one test per case, whole-value assertions, ids from the setup, shared setup in fixtures), and the report has `test_cases_warning` when there are fewer new tests than cases.
 
 **Lessons from real runs:**
 
@@ -160,7 +169,7 @@ Out of scope: <what not to touch>.
 
 - **Parallel runs on one file:** when two runs edit the same file, give each an exact insertion point (after which function or heading, or before which line) and keep their edits apart. Better still, split the work by file.
 - **New files:** name every new file literally in `--scope` (the wrapper creates its folders). When parallel runs both need a new shared file, such as an index or barrel, create an empty placeholder in the checkout before starting them, so each run adds to it instead of creating it.
-- **Ask for exact assertions.** Mistral's tests tend to check that a value is somewhere ("the row contains a 1 and a 0") instead of the exact value in the exact place, and to copy whole setups (a router, a store) instead of the existing helpers. Say which exact values each test must assert and which helper to use.
+- **Ask for exact assertions through the test cases.** Without them, Mistral's tests check that a value is somewhere ("the row contains a 1 and a 0") instead of the exact value in the exact place, copy whole setups (a router, a store) instead of the existing helpers, and sometimes test the wrong object. Name the helper or fixture to use in the shared context or the spec.
 - **Mistral copies the spec word for word,** mistakes included. Proofread names, paths and any prose it could paste into code or docs, and label examples as examples.
 
 **For tests, spell out the harness setup.** Name the existing test file to copy, how to mount or render the unit, which modules to stub and how (e.g. a parent layout, the clipboard, timers), and how to read the result (DOM queries, toasts, emitted events). Specs with this setup succeed first time; specs without it send Mistral guessing and often end empty.
@@ -199,6 +208,7 @@ The report starts with `run_id`, `status` and `verification`, then `usage` (cost
 - **out_of_scope_changes.** Mistral edited files outside the scope of the worktree's runs. `--adopt` won't apply anything until you decide: look at them, then use `--include-out-of-scope` to take them too or `--skip-out-of-scope` to leave them out. Never take them just to make a check pass.
 - **baseline_warning.** Checks that failed before Mistral changed anything can come from the worktree environment (`deps_mode`) or from your own uncommitted changes, which the worktree starts from, such as a half-done regeneration.
 - **baseline_note.** A check that couldn't run before Mistral's change because the files it tests didn't exist yet (pytest "file or directory not found"). It has no baseline: if it fails afterwards, that's Mistral's failure and gets a fix round.
+- **project_rules.** Which AGENTS.md files (the project root's and any in the folders down to the working folder) were repeated in Mistral's prompt, and where the full prompt is saved. `none` means Mistral got no project rules from the prompt: add an AGENTS.md before blaming it for ignoring them.
 - **denied_commands.** Commands Mistral tried to run but wasn't allowed to. If one is a check it needs (e.g. `npx vitest run`), suggest adding it to `allow_commands`. `--stats` lists the most denied commands with the run each was last denied in, and lists apart the ones that are allowed now (denials from before they were).
 - **refused_tool_calls.** Tool calls other than shell commands that Vibe's own permissions refused (an edit or a write). They aren't missing `allow_commands`; check whether Mistral tried to touch something outside its worktree.
 - **A check that already failed before Mistral:** its error lines are compared with the baseline's. `FAIL ... with N new error line(s) now` means Mistral added errors to it: that counts as a new failure, gets a fix round, and the fix prompt lists the new lines. Only an unchanged failure is `already failing`. Judge a check by its exit code, never by grepping its output.

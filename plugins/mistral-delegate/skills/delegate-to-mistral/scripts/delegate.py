@@ -55,6 +55,7 @@ from mdelegate import commands as cmdforms, config, gitops, guard, ledger, vibe 
 from mdelegate.checks import (EDITABLE_SOURCES, CheckResult, check_lines, measure_baseline, new_failures,  # noqa: E402
                               python_path_env, run_checks, stop_process_group)
 from mdelegate.gitops import DelegateError  # noqa: E402
+from mdelegate.plan import TEST_CASE_RULES  # noqa: E402
 
 KINDS = ("tests", "feature", "bugfix", "refactor", "migration", "boilerplate", "docs", "search", "other",
          "integration")
@@ -426,10 +427,11 @@ class Run:
         if read:
             # Mistral often answers, then says it will double-check something and reads a file or two:
             # its answer is the long message, not the last line.
-            longest = max((vibe.text_of(e) for e in this_turn(history) if isinstance(e, dict)
-                           and e.get("type") == "message" and e.get("role") == "assistant"), key=len, default="")
-            if len(longest) >= 200 and len(answer.strip()) < 200:
-                answer = longest
+            said = [vibe.text_of(e) for e in this_turn(history) if isinstance(e, dict)
+                    and e.get("type") == "message" and e.get("role") == "assistant"]
+            answers = [t for t in said if looks_answered(t)]
+            if answers and not looks_answered(answer):
+                answer = max(answers, key=len)
         if answer:
             self.final_text = answer
         self.unfinished = unfinished_reason(this_turn(history), answer, read)
@@ -446,13 +448,29 @@ class Run:
             self.status = "error"
 
 
-def project_rules(root: str) -> str:
-    """The project's AGENTS.md, which Mistral's prompt repeats: Vibe loads it, but gives it little weight."""
-    try:
-        text = Path(root, "AGENTS.md").read_text(encoding="utf-8", errors="replace").strip()
-    except OSError:
-        return ""
-    return text[:6000] + ("\n[... AGENTS.md truncated ...]" if len(text) > 6000 else "")
+def project_rules(root: str, run_dir: str | None = None) -> tuple[str, list[str]]:
+    """The project's AGENTS.md files, which Mistral's prompt repeats (Vibe loads them, but gives them
+    little weight): the one at the root and any in the folders down to where the run works, nearest
+    last. Returns (text, the files used, relative to the root)."""
+    folders = [Path(root)]
+    if run_dir:
+        rel = Path(os.path.relpath(run_dir, root))
+        if not rel.parts or rel.parts[0] != "..":
+            for part in rel.parts:
+                if part != ".":
+                    folders.append(folders[-1] / part)
+    texts, used = [], []
+    for folder in folders:
+        try:
+            text = (folder / "AGENTS.md").read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if text:
+            name = os.path.relpath(folder / "AGENTS.md", root)
+            used.append(name)
+            texts.append(text if len(folders) == 1 or not texts else f"(from {name})\n\n{text}")
+    text = "\n\n".join(texts)
+    return text[:8000] + ("\n[... AGENTS.md truncated ...]" if len(text) > 8000 else ""), used
 
 
 CONTINUE_PROMPT = ("You stopped before finishing. Continue the task from where you left off, then end with "
@@ -546,6 +564,25 @@ def new_tests(diff: str) -> list[tuple[str, str, list[str]]]:
     return found
 
 
+TEST_CASES_TITLE = re.compile(r"^(#{2,4})\s*test\s*cases\s*:?\s*$", re.I | re.M)
+
+
+def spec_test_cases(spec: str) -> int:
+    """How many test cases a spec's `Test cases` section lists (0 without one)."""
+    heading = TEST_CASES_TITLE.search(spec)
+    if not heading:
+        return 0
+    level = len(heading.group(1))
+    numbered = bullets = 0
+    for line in spec[heading.end():].splitlines():
+        if re.match(rf"^#{{1,{level}}}\s", line):
+            break
+        numbered += bool(re.match(r"^\d+[.)]\s+\S", line))
+        bullets += bool(re.match(r"^[-*+]\s+\S", line))
+    # A plan step's section numbers the cases and uses bullets for how to write them.
+    return numbered or bullets
+
+
 def assertion_hint(wt: dict) -> str:
     """New tests that assert loosely (membership, length, truthiness), check only None, or check nothing:
     patterns Mistral falls back to."""
@@ -602,6 +639,16 @@ def this_turn(history: list) -> list:
     return history
 
 
+# A reference into the code (`store.py:135`, `line 21`, `count_open_loans()`): a short answer is still one.
+CODE_REFERENCE = re.compile(r"[\w/.-]+\.\w{1,5}:\d+|\blines?\s+\d+|`[\w.]+\(?\)?`")
+
+
+def looks_answered(text: str) -> bool:
+    """Whether a read run's message answers the question, rather than announcing the next look."""
+    text = text.strip()
+    return len(text) >= 200 or len(CODE_REFERENCE.findall(text)) >= 2
+
+
 def unfinished_reason(turn: list, final_text: str, read: bool = False) -> str:
     """Why the turn looks cut off (no closing summary, or a summary that stops mid-sentence), or "".
 
@@ -609,7 +656,7 @@ def unfinished_reason(turn: list, final_text: str, read: bool = False) -> str:
     if not turn:
         return ""
     entries = [e for e in turn if isinstance(e, dict) and e.get("type") in ("message", "effect")]
-    if read and len(final_text.strip()) >= 200:
+    if read and looks_answered(final_text):
         while entries and entries[-1].get("type") == "effect":
             entries.pop()
     # Trailing read-only calls (re-reading a file, updating a todo list) after the summary don't matter.
@@ -796,6 +843,10 @@ def run_task(args: argparse.Namespace) -> int:
             spec = gitops.find_document(args.spec, gitops.toplevel(workdir), "spec").read_text(encoding="utf-8")
         except OSError as e:
             raise DelegateError(f"Can't read --spec file: {e}") from e
+    if spec and spec_test_cases(spec) and TEST_CASE_RULES not in spec:
+        # A hand-written spec's test cases get the same instructions as a plan step's.
+        spec = spec.rstrip() + "\n\n## How to write the test cases\n\n" + TEST_CASE_RULES.replace(
+            "each case below", "each case in the Test cases section") + "\n"
     task = (args.task or "").strip() or ("Implement the spec below." if spec else "")
     if not task:
         raise DelegateError("No task given. Pass it as an argument, '-' for stdin, or use --spec.")
@@ -1003,10 +1054,15 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
             gitops.save_state(wt["path"], {"baseline": {c: v.stored() for c, v in {**stored, **baseline}.items()}})
     preexisting = [cmd for cmd, (code, _out) in baseline.items() if code != 0]
 
+    rules, rules_from = project_rules(guard_root, os.path.realpath(run_dir)) if write else ("", [])
     prompt = vibe.build_prompt(task, mode=args.mode, spec=spec, context=args.context, verify=commands,
                                allow_commands=settings.get("allow_commands_as_given") or allow_commands, allow_shell=args.allow_shell, scope=scope,
                                preexisting_failures=preexisting, root=guard_root,
-                               cwd=os.path.realpath(run_dir), project_rules=project_rules(guard_root) if write else "")
+                               cwd=os.path.realpath(run_dir), project_rules=rules)
+    try:
+        ledger.run_file(run_id, "prompt.md").write_text(prompt, encoding="utf-8")
+    except OSError:
+        pass
     # `sed` is safe once the guard vets each call (print-only scripts, no -i); Vibe matches allowlist
     # entries as prefixes, so `sed -nE` or `sed -E -n` need the bare `sed`. Without the guard, keep Vibe's default.
     # Likewise the runners of allowed commands (`uv run`, `npm`, ...): Vibe only matches prefixes, so
@@ -1054,7 +1110,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     # A follow-up (--resume) fixes or extends earlier work: it gets half the caps, like a fix round.
     first_share = 0.5 if args.resume else 1.0
     vibe_call(prompt if args.resume else prompt + "\n\n" + vibe.run_marker(run_id), first_share)
-    continued, summary_note = 0, ""
+    continued, summary_note, continue_reason, continue_said = 0, "", "", ""
 
     verification, results, failures, attempts = "not_run", {}, [], 0
     # Checks limited to paths that Mistral ended up changing outside the scope join in now.
@@ -1107,7 +1163,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         if missing:
             follow_up = (f"These files from your task don't exist yet: {', '.join(missing)}. Create them as the "
                          "task describes, then end with the summary of every file you changed.")
-        elif not write and len(run.final_text.strip()) >= 200:
+        elif not write and looks_answered(run.final_text):
             summary_note = ("Mistral's last step wasn't its answer, but it did answer; it wasn't asked to "
                             "continue (that would cost a round).")
         elif commands and not failures and changed_now:
@@ -1117,6 +1173,9 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
             follow_up = CONTINUE_PROMPT
         if follow_up and run.session_id and settings["continue_attempts"] > 0:
             continued = 1
+            continue_reason = (f"{', '.join(missing)} didn't exist yet" if missing else run.unfinished
+                               or "no closing summary")
+            continue_said = " ".join(run.final_text.split())[:160]
             vibe_call(follow_up, 0.5)
             if commands:
                 check_round()
@@ -1179,8 +1238,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append(f"continues: {settings['continues']} (same worktree). This run's id and the earlier one "
                      "both refer to everything in the worktree; --adopt or --discard either settles both.")
     if continued:
-        lines.append("continued: Mistral's work looked unfinished (missing files, failing checks, or no closing "
-                     "summary), so it was asked once to finish.")
+        lines.append(f"continued: Mistral's work looked unfinished ({continue_reason}), so it was asked once to "
+                     "finish." + (f" Its last message before that: \"{continue_said}\"" if continue_said else ""))
     if run.status == "stopped_by_refusal":
         lines.append("note: Vibe ended the session after a refused tool call (it treats a refused approval as "
                      "the user cancelling). " + ("The guard hook was not active: " + guard_warning if guard_warning
@@ -1200,10 +1259,24 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append(strength_line)
     if wt and files_now and (hint := assertion_hint(wt)):
         lines.append(hint)
+    cases = spec_test_cases(spec or "")
+    if wt and files_now and cases:
+        written = len(new_tests(gitops.changes_diff(wt)))
+        if written < cases:
+            lines.append(f"test_cases_warning: the spec lists {cases} test case(s), but Mistral added {written} new "
+                         "test(s). Check that each case has its test (a parametrized test counts once).")
+        else:
+            lines.append(f"test_cases: {cases} in the spec, {written} new test(s)")
     if summary_note:
         lines.append("note: " + summary_note)
     elif run.unfinished:
         lines.append("final_message_warning: " + run.unfinished)
+    if write:
+        # Whether Mistral was given the project's rules: when its tests ignore them, this rules out the prompt.
+        lines.append("project_rules: " + (", ".join(rules_from) + " repeated in Mistral's prompt (" + str(len(rules))
+                                          + f" characters; the full prompt: {ledger.run_file(run_id, 'prompt.md')})"
+                                          if rules_from else "none: no AGENTS.md at the project root or in the "
+                                          "folders down to the working folder"))
     if baseline_source:
         lines.append("baseline: " + baseline_source)
     if not_runnable:
