@@ -1470,6 +1470,15 @@ class PlanRunTest(DelegateTestBase):
         path.write_text(textwrap.dedent(text))
         return path
 
+    def runs_with_end(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        from mdelegate import ledger
+        os.environ["MISTRAL_DELEGATE_HOME"] = str(self.home)
+        try:
+            return ledger.load_runs()
+        finally:
+            del os.environ["MISTRAL_DELEGATE_HOME"]
+
     def runs(self):
         return {e["id"]: e for e in map(json.loads, filter(str.strip, (self.home / "ledger.jsonl").read_text().splitlines()))
                 if e.get("event") == "start"}
@@ -1820,6 +1829,7 @@ class PlanRunTest(DelegateTestBase):
             FAKE_FILE b.txt B
             """)
         plan_id = self.value(self.run_delegate("--plan", str(plan)), "plan_id")
+        before = self.runs_with_end()[plan_id]["cost"]
         out = self.run_delegate("--revise", plan_id, "- a.txt should say AA\nFAKE_FILE review.txt R")
         self.assertEqual(out.returncode, 0, out.stdout)
         prompt = self.last()["prompt"]
@@ -1827,6 +1837,8 @@ class PlanRunTest(DelegateTestBase):
         self.assertIn("- a.txt should say AA", prompt)
         self.assertIn("pass: test -f a.txt", out.stdout)  # the steps' checks run on the revision
         self.assertIn(f"plan_id: {plan_id} (revision 1)", out.stdout)
+        self.assertNotIn("test_strength", out.stdout)  # the revision doesn't judge the steps' tests again
+        self.assertGreater(self.runs_with_end()[plan_id]["cost"], before)  # the plan's cost includes it
         shown = out.stdout.split("changes_in_this_revision:")[1]
         self.assertIn("review.txt", shown)  # the revision's own diff, not the whole plan's again
         self.assertNotIn("b.txt", shown)
@@ -1837,6 +1849,37 @@ class PlanRunTest(DelegateTestBase):
         self.assertEqual(adopted.returncode, 0, adopted.stdout)
         self.assertEqual((self.repo / "review.txt").read_text(), "R\n")
         self.assertIn("already", self.run_delegate("--revise", plan_id, "more").stdout)
+
+    def test_a_revision_without_its_list_is_asked_once_then_flagged(self):
+        plan = self.plan("""\
+            # Quiet revision
+            ## step: a
+            scope: *.txt, test_app.py
+            FAKE_FILE a.txt A
+            ## step: b
+            scope: *.txt, test_app.py
+            FAKE_FILE b.txt B
+            """)
+        plan_id = self.value(self.run_delegate("--plan", str(plan)), "plan_id")
+        calls = len(self.calls())
+        out = self.run_delegate("--revise", plan_id, "- a.txt: say AA\n- b.txt: say BB", FAKE_VIBE_UNFINISHED="1")
+        self.assertEqual(len(self.calls()), calls + 2)
+        self.assertIn("You stopped without the list of the reviewer's changes", self.last()["prompt"])
+        self.assertIn("revision_warning: Mistral ended without saying which of the 2 changes it made", out.stdout)
+
+    def test_step_lines_count_every_round(self):
+        plan = self.plan("""\
+            # Rounds
+            ## step: a
+            verify: true
+            FAKE_FILE tests/test_loose.py assert 1 in [1, 2]
+            ## step: b
+            FAKE_FILE b.txt B
+            """)
+        out = self.run_delegate("--plan", str(plan))
+        line = next(ln for ln in out.stdout.splitlines() if ln.strip().startswith("a: "))
+        self.assertIn("1 test quality round(s)", line)
+        self.assertIn("(first pass ~$0.00, test quality ~$0.00)", line)
 
     def test_steps_wait_for_free_slots(self):
         (self.home).mkdir(parents=True, exist_ok=True)
@@ -2473,6 +2516,33 @@ class CleanupChecksTest(unittest.TestCase):
         untagged = self.delegate.test_problems(self.DIFF.replace("# case", "# note"), ["a", "b"])
         self.assertNotIn("missing_case", [k for k, _w in untagged])
 
+    def test_a_shared_helper_call_isnt_copied_setup(self):
+        diff = """\
++++ b/tests/test_q.py
+@@ -1,1 +1,14 @@
+ import pytest
++def three_reservations(store):
++    return [store.add(i) for i in range(3)]
++
++def test_one(store):
++    r1, r2, r3 = three_reservations(store)
++    store.cancel(r1.id)
++    store.cancel(r2.id)
++    assert store.active() == [r3]
++
++def test_two(store):
++    r1, r2, r3 = three_reservations(store)
++    store.cancel(r1.id)
++    store.cancel(r2.id)
++    assert store.count() == 1
+"""
+        self.assertNotIn("copied", [k for k, _w in self.delegate.test_problems(diff)])
+
+    def test_a_collection_error_is_a_load_error(self):
+        out = "==== ERRORS ====\nERROR collecting tests/test_q.py\n1 error in 0.1s"
+        self.assertTrue(self.delegate.LOAD_ERROR.search(out))
+        self.assertFalse(self.delegate.REAL_FAILURE.search(out))
+
 
 class GitOpsTest(unittest.TestCase):
     def test_a_rename_out_of_scope_lists_both_paths(self):
@@ -2610,8 +2680,8 @@ class LedgerTest(unittest.TestCase):
         self.assertNotIn("allowed now", stats)
         stats = ledger.format_stats(runs, allowed=["uv run mypy"])  # a configured check now
         self.assertNotIn("most denied commands", stats)
-        self.assertIn("denied before, allowed now (allow_commands or a configured check, which Mistral may run): "
-                      "bash: uv run mypy shelf (1x)", stats)
+        self.assertIn("denied before, allowed now (in allow_commands, a configured check, or another spelling of "
+                      "one, e.g. `npm run typecheck` for a check that runs tsc): bash: uv run mypy shelf (1x)", stats)
 
     def test_checks_column_counts_runs_without_checks(self):
         from mdelegate import ledger

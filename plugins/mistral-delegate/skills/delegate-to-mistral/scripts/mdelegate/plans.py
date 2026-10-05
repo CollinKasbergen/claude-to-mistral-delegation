@@ -417,14 +417,21 @@ class PlanRun:
         shown = "checks failed" if result.get("status") == "ok" and result.get("verification") == "failed" \
             else result.get("status")
         parts = [f"{step.id}: {shown}"]
+        rounds = [r["label"] for r in record.get("rounds") or []]
         if result.get("verification") == "not_run" and result.get("status") == "ok":
             parts.append("no checks")
         elif result.get("verification"):
             used = record.get("fix_attempts_used")
             parts.append(f"checks {result['verification']}"
                          + (f" after {used} fix round(s)" if used else " first try" if result.get("run_id") else ""))
-        if record.get("test_quality_fix"):
-            parts.append(f"a test-quality round for {record['test_quality_fix']} weak spot(s)")
+        extra = [f"{rounds.count(label)} {label} round(s)" for label in ("continue", "test quality")
+                 if rounds.count(label)]
+        if not rounds and record.get("continued"):
+            extra.append("1 continue round(s)")
+        if not rounds and record.get("test_quality_fix"):
+            extra.append(f"{record.get('test_quality_rounds') or 1} test quality round(s)")
+        if extra:
+            parts.append(" and ".join(extra))
         if record.get("unfinished"):
             parts.append("no closing summary (read its diff)")
         if record.get("files_changed") is not None:
@@ -746,6 +753,10 @@ def revise(args, record: dict, script: Path, script_cmd) -> int:
                             extra=["--diff-lines", str(args.diff_lines),  # the revision's diff is for review
                                    "--revise-of", record["id"]])
     proc = subprocess.run(cmd, cwd=workdir)
+    # The plan's cost includes its revisions (--status, --stats).
+    costs = [ledger.run_cost(r, vibe.model_prices()) for r in _plan_runs(record) if r["id"] != record["id"]]
+    if any(c is not None for c in costs):
+        ledger.append({"event": "update", "id": record["id"], "cost": sum(c for c in costs if c is not None)})
     print(f"\nplan_id: {record['id']} (revision {count})\n"
           f"adopt_with: {script_cmd('--adopt', record['id'])}   (the whole plan: --steps would leave the "
           "revision out)")

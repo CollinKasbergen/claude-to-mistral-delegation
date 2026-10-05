@@ -389,7 +389,8 @@ def format_stats(runs: dict[str, dict], days: int = 90, prices: dict | None = No
         lines.append("most denied commands (add to allow_commands if Mistral needs them):")
         lines += [entry(*d) for d in still]
     if allowed_now:
-        lines.append("denied before, allowed now (allow_commands or a configured check, which Mistral may run): "
+        lines.append("denied before, allowed now (in allow_commands, a configured check, or another spelling of "
+                     "one, e.g. `npm run typecheck` for a check that runs tsc): "
                      + ", ".join(f"{cmd} ({n}x)" for cmd, n, _w, _r in allowed_now[:5]))
     return "\n".join(lines)
 
