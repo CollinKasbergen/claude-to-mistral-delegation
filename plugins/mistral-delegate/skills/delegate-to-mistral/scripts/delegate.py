@@ -58,7 +58,7 @@ from mdelegate.gitops import DelegateError  # noqa: E402
 from mdelegate.plan import TEST_CASE_RULES  # noqa: E402
 
 KINDS = ("tests", "feature", "bugfix", "refactor", "migration", "boilerplate", "docs", "search", "other",
-         "integration")
+         "integration", "revise")
 MAX_RESULT_CHARS = 12_000
 def _env_number(name: str, default, cast=int):
     try:
@@ -133,6 +133,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--via-worker", action="store_true",
                      help="Set by the mistral-worker subagent, so --stats can tell its runs apart.")
     run.add_argument("--plan-step", metavar="PLAN:STEP", help=argparse.SUPPRESS)  # set by the plan runner
+    run.add_argument("--revise-of", metavar="ID", help=argparse.SUPPRESS)  # the plan or run a revision is for
 
     plans = p.add_argument_group("plans (several steps in one call)")
     plans.add_argument("--plan", metavar="FILE",
@@ -142,6 +143,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                        help="With --plan: run only these steps. With --adopt PLAN: apply only these steps.")
     plans.add_argument("--integrate", metavar="PLAN_ID",
                        help="Merge a plan's steps again (after you resumed one) and rerun the combined checks.")
+    plans.add_argument("--revise", metavar="ID",
+                       help="After reviewing a plan or write run: have Mistral make the changes you list (the "
+                            "task argument, or '-' for stdin) in its worktree, then rerun the checks. Use this "
+                            "instead of fixing things yourself.")
 
     manage = p.add_argument_group("managing runs")
     manage.add_argument("--status", action="store_true", help="List running and recent delegations.")
@@ -178,6 +183,46 @@ def find_run(run_id: str) -> dict:
     if not run:
         raise DelegateError(f"No run with id {run_id!r}. See --status.")
     return run
+
+
+def cmd_revise(args: argparse.Namespace) -> int:
+    """Claude's review findings, made by Mistral: in a plan's merged worktree, or by resuming a write run."""
+    record = find_run(args.revise)
+    if args.task == "-":
+        args.task = sys.stdin.read()
+    if not (args.task or "").strip() and not args.spec:
+        raise DelegateError("--revise needs the list of changes: pass it as the task argument, '-' for stdin, "
+                            "or --spec FILE.")
+    if record.get("outcome"):
+        raise DelegateError(f"{record['id']} was already {record['outcome']}; there's nothing left to revise.")
+    if record.get("mode") == "plan":
+        from mdelegate import plans
+        return plans.revise(args, record, SCRIPT, script_cmd)
+    if record.get("plan"):
+        raise DelegateError(f"{record['id']} is a step of plan {record['plan']}: revise the plan "
+                            f"(--revise {record['plan']}), whose merged result you adopt.")
+    wt = record.get("worktree") or {}
+    if record.get("mode") != "write" or not wt.get("name") or not os.path.isdir(wt.get("path", "")):
+        raise DelegateError(f"{record['id']} has no worktree to revise (only write runs in a worktree can be).")
+    # The latest run on that worktree holds the session to continue (an earlier revise or resume, say).
+    latest = max(runs_on_worktree(record), key=lambda r: r.get("started") or 0, default=record)
+    session = latest.get("session_id") or record.get("session_id")
+    if not session:
+        raise DelegateError(f"{record['id']} has no Vibe session to continue.")
+    # A resume of that run's session in its worktree, with its checks and scope.
+    args.mode, args.kind = "write", "revise"
+    args.resume, args.worktree_name = session, wt["name"]
+    args.verify = list(dict.fromkeys((record.get("checks") or []) + args.verify))
+    args.scope = args.scope or record.get("scope") or []
+    args.task = revise_task(args.task or "")
+    args.revise, args.revise_of = None, record["id"]
+    return run_task(args)
+
+
+def revise_task(changes: str) -> str:
+    return ("The reviewer read your result and wants these changes, and only these. Make each one, keep the "
+            "checks passing, and when you replace something, delete what it replaced:\n\n" + changes.strip()
+            + "\n\nEnd with the list of changes, one line each, saying how you made it or why you couldn't.")
 
 
 def worktree_scope(run: dict) -> list[str]:
@@ -568,20 +613,43 @@ def new_tests(diff: str) -> list[tuple[str, str, list[str]]]:
 TEST_CASES_TITLE = re.compile(r"^(#{2,4})\s*test\s*cases\s*:?\s*$", re.I | re.M)
 
 
-def spec_test_cases(spec: str) -> int:
-    """How many test cases a spec's `Test cases` section lists (0 without one)."""
+def spec_cases(spec: str) -> list[str]:
+    """The test cases a spec's `Test cases` section lists, in order (none without one)."""
     heading = TEST_CASES_TITLE.search(spec)
     if not heading:
-        return 0
+        return []
     level = len(heading.group(1))
-    numbered = bullets = 0
+    numbered: list[str] = []
+    bullets: list[str] = []
     for line in spec[heading.end():].splitlines():
         if re.match(rf"^#{{1,{level}}}\s", line):
             break
-        numbered += bool(re.match(r"^\d+[.)]\s+\S", line))
-        bullets += bool(re.match(r"^[-*+]\s+\S", line))
+        if (m := re.match(r"^\d+[.)]\s+(\S.*)$", line)):
+            numbered.append(m.group(1).strip())
+        elif (m := re.match(r"^[-*+]\s+(\S.*)$", line)):
+            bullets.append(m.group(1).strip())
     # A plan step's section numbers the cases and uses bullets for how to write them.
     return numbered or bullets
+
+
+def spec_test_cases(spec: str) -> int:
+    return len(spec_cases(spec))
+
+
+CASE_TAG = re.compile(r"(?:#|//)\s*cases?\s+(\d+(?:\s*(?:,|and|&)\s*\d+)*)", re.I)
+
+
+def tagged_cases(diff: str) -> set[int]:
+    """The case numbers the new test lines are tagged with (`# case 3`, `// case 4, 5`)."""
+    found: set[int] = set()
+    current = ""
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            current = line[6:] if line.startswith("+++ b/") else ""
+        elif line.startswith("+") and current and TEST_FILE.search(current):
+            for m in CASE_TAG.finditer(line):
+                found.update(int(n) for n in re.findall(r"\d+", m.group(1)))
+    return found
 
 
 FIELD_ASSERT = re.compile(r"^\s*assert\s+([A-Za-z_]\w*)(?:\.\w+|\[[^\]]+\])\s*==")
@@ -590,22 +658,34 @@ WHOLE_ASSERT = re.compile(r"^\s*assert\s+([A-Za-z_]\w*)\s*==|==\s*([A-Za-z_]\w*)
 FROM_RESULT = re.compile(r"\bnext\(.*\bfor\b.*\bin\b.*\bif\b")
 SETUP_BLOCK = 3  # lines repeated in several tests that count as copied setup
 
+# A top-level helper or constant added to a test file: `def make_loan(`, `LIMIT = 3`, `const base = `.
+TOP_DEFINITION = re.compile(r"^(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(|^([A-Z][A-Z0-9_]*)\s*(?::[^=]+)?=[^=]|"
+                            r"^(?:export\s+)?(?:const|let|function)\s+([A-Za-z_$][\w$]*)")
+# Assertions on a variable that a whole-object comparison of it already covers.
+WEAKER_ON = r"^\s*assert\s+(?:{v}\s*$|{v}\s+is\s+not\s+None|isinstance\(\s*{v}\s*,|len\(\s*{v}\s*\)|{v}(?:\.\w+|\[[^\]]+\])+\s*(?:==|is\b))"
+
 # What each kind of problem asks Mistral to do, for the test-quality fix round.
 TEST_FIXES = {
     "loose": "assert the exact value instead",
     "empty": "add the assertion the test's case needs",
     "none_only": "set up a valid item after the skipped one and assert that exactly it is returned",
     "crowded": "move the setup above the pytest.raises block; keep only the call that should fail inside",
-    "fields": "compare the whole object instead: `assert x == Model(...)` with every field",
+    "fields": "replace those field checks with one comparison of the whole object: `assert x == Model(...)` "
+              "with every field",
+    "filler": "delete these lines: the whole-object comparison in the same test already covers them",
+    "unused": "delete it, or call it where the tests repeat its setup",
+    "missing_case": "write the test for this case and tag it with its `# case N` comment",
     "from_result": "take the expected id or object from the setup (the value your setup call returned), "
                    "not by searching the result",
     "copied": "move the repeated setup into one helper function or fixture and call it from each test",
 }
 
 
-def test_problems(diff: str) -> list[tuple[str, str]]:
-    """Weak spots in the new tests: (kind, where and what), kind being a key of TEST_FIXES."""
+def test_problems(diff: str, cases: list[str] | None = None) -> list[tuple[str, str]]:
+    """Weak spots in the new tests: (kind, where and what), kind being a key of TEST_FIXES.
+    cases: the spec's test cases, to find the ones no test is tagged with."""
     problems: list[tuple[str, str]] = []
+    filler_lines: set[str] = set()
     current = ""
     for line in diff.splitlines():
         if line.startswith("+++ "):
@@ -635,6 +715,11 @@ def test_problems(diff: str) -> list[tuple[str, str]]:
         piecemeal = [v for v, n in fields.items() if n >= 2 and v not in whole]
         if piecemeal:
             problems.append(("fields", f"{where} (checks {', '.join(piecemeal)} field by field)"))
+        filler = [ln.strip() for v in whole for ln in code
+                  if re.match(WEAKER_ON.format(v=re.escape(v)), ln) and not WHOLE_ASSERT.search(ln.strip())]
+        if filler:
+            filler_lines.update(filler)
+            problems.append(("filler", f"{where}: " + "; ".join(f"`{ln[:80]}`" for ln in filler[:4])))
         if any(FROM_RESULT.search(ln) for ln in code):
             problems.append(("from_result", where))
     # Copied setup: the same run of non-assert lines in two or more new tests of a file.
@@ -651,7 +736,39 @@ def test_problems(diff: str) -> list[tuple[str, str]]:
         if len(names) >= 2 and (path, *names) not in reported:
             reported.add((path, *names))
             problems.append(("copied", f"{path}: {', '.join(names)} repeat `{window[0][:80]}` and the lines after it"))
-    return problems
+    problems += unused_definitions(diff)
+    if cases:
+        tagged = tagged_cases(diff)
+        # Untagged tests can't be matched to cases; the test_cases count line covers those.
+        for n, case in enumerate(cases, 1):
+            if tagged and n not in tagged:
+                problems.append(("missing_case", f"case {n}: {case[:200]}"))
+    # A weaker assert that a whole comparison makes redundant is reported once, as filler.
+    return [(k, w) for k, w in problems if not (k == "loose" and w.split(": `", 1)[-1].rstrip("`") in filler_lines)]
+
+
+def unused_definitions(diff: str) -> list[tuple[str, str]]:
+    """Helpers and constants added at the top level of a test file that nothing in the file's change uses."""
+    out: list[tuple[str, str]] = []
+    files: dict[str, list[str]] = {}
+    current = ""
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            current = line[6:] if line.startswith("+++ b/") else ""
+        elif current and line[:1] in ("+", " "):
+            files.setdefault(current, []).append(line)
+    for path, lines in files.items():
+        if not TEST_FILE.search(path) or path.endswith("conftest.py"):
+            continue  # conftest fixtures are used from other files
+        text = "\n".join(ln[1:] for ln in lines)
+        for line in lines:
+            m = TOP_DEFINITION.match(line[1:]) if line.startswith("+") else None
+            name = m and next(g for g in m.groups() if g)
+            if not name or name.startswith("test") or name.startswith("__"):
+                continue
+            if len(re.findall(rf"(?<![\w$]){re.escape(name)}(?![\w$])", text)) == 1:
+                out.append(("unused", f"{path}: `{name}`"))
+    return out
 
 
 def assertion_hint(wt: dict, problems: list[tuple[str, str]] | None = None) -> str:
@@ -667,7 +784,10 @@ def assertion_hint(wt: dict, problems: list[tuple[str, str]] | None = None) -> s
               "crowded": "put setup inside pytest.raises / assertRaises",
               "fields": "check an object field by field instead of comparing it whole",
               "from_result": "take the expected value from the result they check (next(... if ...))",
-              "copied": "copy the same setup instead of a helper"}
+              "copied": "copy the same setup instead of a helper",
+              "filler": "keep weaker asserts next to a whole-object comparison that covers them",
+              "unused": "are helpers or constants nothing uses",
+              "missing_case": "test cases have no test tagged with their number"}
     parts = []
     for kind, label in labels.items():
         found = [w for k, w in problems if k == kind]
@@ -678,10 +798,13 @@ def assertion_hint(wt: dict, problems: list[tuple[str, str]] | None = None) -> s
 
 def test_quality_prompt(problems: list[tuple[str, str]]) -> str:
     return ("Your checks pass, but some of your new tests don't test what they claim. Fix each one below, "
-            "change only the test files, and keep every test passing:\n\n"
-            + "\n".join(f"- {where}: {TEST_FIXES[kind]}." for kind, where in problems[:15])
+            "change only the test files, and keep every test passing. When you replace or move code, delete what "
+            "it replaced: no helper, constant or assert may be left over.\n\n"
+            + "\n".join(f"- {where}: {TEST_FIXES[kind]}." for kind, where in problems[:25])
             + "\n\nThen end with a short list of the tests you changed.")
 
+
+TEST_QUALITY_ROUNDS = 2
 
 CANCELLED = re.compile(r"<user_cancellation>|User cancelled the operation")
 
@@ -941,6 +1064,10 @@ def run_task(args: argparse.Namespace) -> int:
         if write else []
     # `npm test` also covers `npm run test`, `npx vitest` (when that's the test script), etc.
     settings["allow_commands_as_given"] = allow_commands
+    # For the report, a chained check stays whole (`cd web && npx tsc`); the guard checks its parts.
+    settings["allow_commands_shown"] = list(dict.fromkeys(
+        settings["allow_commands"] + args.allow_command
+        + [c["cmd"] for c in verify if "{files" not in c["cmd"]])) if write else []
     allow_commands = cmdforms.expand(allow_commands, top or workdir) if allow_commands else []
     scope = list(dict.fromkeys(args.scope or settings["scope"])) if write else []
     fix_attempts = settings["fix_attempts"] if args.fix_attempts is None else max(0, args.fix_attempts)
@@ -967,6 +1094,7 @@ def run_task(args: argparse.Namespace) -> int:
              "pid_started": ledger.process_started(os.getpid()), "mode": args.mode, "kind": kind,
              "repo": Path(top or workdir).name, "workdir": workdir, "task": task[:500], "policy": settings["policy"],
              "model": model, "scope": scope, "continues": None, "worktree": None,
+             "checks": list(dict.fromkeys(args.verify + args.add_verify)),
              **({"plan": plan_id, "step": plan_step} if args.plan_step else {}),
              **({"via": "worker"} if args.via_worker else {})}
     # Counting the running delegations and recording this one happen under one lock, so two runs
@@ -1135,7 +1263,10 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     run.guard_log = None if guard_warning else guard_log
     run.currency = settings["currency"]
 
-    def vibe_call(text: str, share: float) -> None:
+    rounds: list[dict] = []  # what each Vibe call cost: {"label", "cost", "effective"}
+    round_mark = stats_before
+
+    def vibe_call(text: str, share: float, label: str) -> None:
         """One Vibe call with `share` of the caps, enforced by the wrapper. If a money cap is set, Vibe gets
         it too; its --max-price counts the whole session, so a resumed session gets what it already spent on top."""
         if run.guard_policy:
@@ -1155,6 +1286,12 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                       max_tool_calls=max(1, int(caps["max_tool_calls"] * share)),
                       max_price=caps["max_price"] * share if caps.get("max_price") is not None else None,
                       model_hint=model)
+        nonlocal round_mark
+        snap = vibe.read_session_stats(run.session_id, run_dir, model_hint=model) if run.session_id else None
+        used = vibe.usage(snap, round_mark) if snap else None
+        rounds.append({"label": label, "cost": used["cost"] if used else None,
+                       "effective": used["effective"] if used else None})
+        round_mark = snap or round_mark
 
     # In place, only what changes from now on is Mistral's: the checkout may hold the user's own uncommitted work.
     inplace_root = (top or workdir) if write and not wt else None
@@ -1163,11 +1300,16 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     def inplace_changes() -> list[str]:
         return gitops.changed_since(inplace_root, inplace_before) if inplace_root else []
 
+    # A revision's report shows what the revision changed, not the whole run again: mark where it starts.
+    revision_base = gitops.commit_all(wt, f"mistral-delegate: before revision {run_id}") \
+        if wt and kind == "revise" else None
     # A follow-up (--resume) fixes or extends earlier work: it gets half the caps, like a fix round.
     first_share = 0.5 if args.resume else 1.0
-    vibe_call(prompt if args.resume else prompt + "\n\n" + vibe.run_marker(run_id), first_share)
+    vibe_call(prompt if args.resume else prompt + "\n\n" + vibe.run_marker(run_id), first_share,
+              "revision" if kind == "revise" else "follow-up" if args.resume else "first pass")
     continued, summary_note, continue_reason, continue_said = 0, "", "", ""
-    quality_asked: list[tuple[str, str]] = []
+    rounds_at_note = 0  # a missing summary noted after this many rounds; a later round may have given one
+    quality_asked: list[list[tuple[str, str]]] = []  # the weak spots sent back, per test-quality round
 
     verification, results, failures, attempts = "not_run", {}, [], 0
     # Checks limited to paths that Mistral ended up changing outside the scope join in now.
@@ -1176,29 +1318,37 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     skipped_checks = [c["cmd"] for c in verify if c["cmd"] not in commands]
     autofixes = [c["cmd"] for c in settings["autofix"] if vibe.check_applies(c["paths"], scope, changed_so_far)]
     autofixed: list[str] = []
+    formatted_since = False  # whether the formatters ran after Mistral's latest round
+
+    def run_autofix(templates: list[str]) -> bool:
+        """Run the formatters on the changed files. Returns whether they changed anything."""
+        changed = gitops.changed_files(wt) if wt else inplace_changes()
+        fix_root = wt["path"] if wt else (top or workdir)
+        before = gitops.read_texts(fix_root, changed)
+        for template in templates:
+            command = cmdforms.with_files(template, changed, os.path.relpath(run_dir, wt["path"] if wt else
+                                                                               (top or workdir)))
+            if command is None:
+                continue  # it formats changed files of a kind this run didn't change
+            code, out = run_checks([command], run_dir, args.verify_timeout)[command]
+            tail_lines = [ln.strip() for ln in out.splitlines() if ln.strip()][-2:]
+            autofixed.append(command + ("" if code == 0 else
+                                        f" (exit {code}: {' / '.join(tail_lines)[:240] or 'no output'})"))
+        # Formatters rewrite whole files; the user's own lines in them keep their layout.
+        restored = gitops.keep_changed_lines_only(fix_root, wt["base"] if wt else "HEAD", before)
+        if restored:
+            autofixed.append(f"(kept formatting changes to Mistral's lines only, in {', '.join(restored[:5])})")
+        return gitops.read_texts(fix_root, changed) != before
 
     def check_round() -> None:
-        nonlocal results, failures
+        nonlocal results, failures, formatted_since
         results = run_checks(commands, run_dir, args.verify_timeout)
         failures = new_failures(results, baseline)
+        formatted_since = False
         if failures and autofixes:
             # Formatting-type failures are fixed by a command, not by another Mistral round.
-            changed = gitops.changed_files(wt) if wt else inplace_changes()
-            fix_root = wt["path"] if wt else (top or workdir)
-            before = gitops.read_texts(fix_root, changed)
-            for template in autofixes:
-                command = cmdforms.with_files(template, changed, os.path.relpath(run_dir, wt["path"] if wt else
-                                                                                   (top or workdir)))
-                if command is None:
-                    continue  # it formats changed files of a kind this run didn't change
-                code, out = run_checks([command], run_dir, args.verify_timeout)[command]
-                tail_lines = [ln.strip() for ln in out.splitlines() if ln.strip()][-2:]
-                autofixed.append(command + ("" if code == 0 else
-                                            f" (exit {code}: {' / '.join(tail_lines)[:240] or 'no output'})"))
-            # Formatters rewrite whole files; the user's own lines in them keep their layout.
-            restored = gitops.keep_changed_lines_only(fix_root, wt["base"] if wt else "HEAD", before)
-            if restored:
-                autofixed.append(f"(kept formatting changes to Mistral's lines only, in {', '.join(restored[:5])})")
+            run_autofix(autofixes)
+            formatted_since = True
             results = run_checks(commands, run_dir, args.verify_timeout)
             failures = new_failures(results, baseline)
 
@@ -1224,6 +1374,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
             summary_note = ("Mistral's last step wasn't its answer, but it did answer; it wasn't asked to "
                             "continue (that would cost a round).")
         elif commands and not failures and changed_now:
+            rounds_at_note = len(rounds)
             summary_note = ("Mistral ended without a closing summary, but its changes pass the checks, so it "
                             "wasn't asked to finish (that would cost a round). Read the diff instead.")
         else:
@@ -1233,7 +1384,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
             continue_reason = (f"{', '.join(missing)} didn't exist yet" if missing else run.unfinished
                                or "no closing summary")
             continue_said = " ".join(run.final_text.split())[:160]
-            vibe_call(follow_up, 0.5)
+            vibe_call(follow_up, 0.5, "continue")
             if commands:
                 check_round()
             missing = missing_new_files()
@@ -1246,18 +1397,32 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                     run.status == "ok" or (settings["fix_after_cap"]
                                            and run.status in ("budget_exceeded", "tool_call_limit"))):
                 attempts += 1
-                vibe_call(vibe.fix_prompt(failures, scope), 0.5)
+                vibe_call(vibe.fix_prompt(failures, scope), 0.5, "fix")
                 check_round()
 
         fix_failures()
         # Not for an integration fix: it repairs the merged steps, whose tests were reviewed in their own runs.
-        if (write and wt and settings["test_quality_fix"] and kind != "integration" and not failures and run.status == "ok"
-                and run.session_id and (weak := test_problems(gitops.changes_diff(wt)))):
-            # Mistral ignores test-style rules up front, but fixes a weak test it is pointed at.
-            quality_asked = weak
-            vibe_call(test_quality_prompt(weak), 0.5)
+        # Mistral ignores test-style rules up front, but fixes a weak test it is pointed at: up to two rounds,
+        # the second only while the first made progress.
+        spec_case_list = spec_cases(spec or "")
+        for _round in range(TEST_QUALITY_ROUNDS):
+            if not (write and wt and settings["test_quality_fix"] and kind not in ("integration", "revise")
+                    and not failures and run.status == "ok" and run.session_id):
+                break
+            weak = test_problems(gitops.changes_diff(wt), spec_case_list)
+            if not weak or (quality_asked and len(weak) >= len(quality_asked[-1])):
+                break
+            quality_asked.append(weak)
+            vibe_call(test_quality_prompt(weak), 0.5, "test quality")
             check_round()
             fix_failures()
+    if write and checkable and not formatted_since and settings["autofix"]:
+        # A last format pass: Mistral's later rounds (fixes, test quality) come after the formatters ran.
+        final_fixes = [c["cmd"] for c in settings["autofix"]
+                       if vibe.check_applies(c["paths"], scope, gitops.changed_files(wt) if wt else inplace_changes())]
+        if final_fixes and run_autofix(final_fixes) and commands:
+            check_round()
+    if commands and checkable:
         if failures:
             verification = "failed"
         elif any(code != 0 for code, _out in results.values()):
@@ -1327,10 +1492,11 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append("flaky_checks (failed, then passed on a rerun before Mistral started): " + ", ".join(flaky))
     if strength_line:
         lines.append(strength_line)
-    weak_left = test_problems(gitops.changes_diff(wt)) if wt and files_now else []
+    weak_left = test_problems(gitops.changes_diff(wt), spec_cases(spec or "")) if wt and files_now else []
     if quality_asked:
-        lines.append(f"test_quality_fix: Mistral was asked once to fix {len(quality_asked)} weak spot(s) in its "
-                     f"new tests; {len(weak_left)} remain" + (" (listed in assertion_hint)" if weak_left else ""))
+        lines.append("test_quality_fix: " + " then ".join(f"{len(w)}" for w in quality_asked)
+                     + f" weak spot(s) in Mistral's new tests sent back over {len(quality_asked)} round(s); "
+                     f"{len(weak_left)} remain" + (" (listed in assertion_hint)" if weak_left else ""))
     if weak_left:
         lines.append(assertion_hint(wt, weak_left))
     cases = spec_test_cases(spec or "")
@@ -1341,6 +1507,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                          "test(s). Check that each case has its test (a parametrized test counts once).")
         else:
             lines.append(f"test_cases: {cases} in the spec, {written} new test(s)")
+    if rounds_at_note and len(rounds) > rounds_at_note and not run.unfinished:
+        summary_note = ""  # a later round (fix, test quality) ended with a summary
     if summary_note:
         lines.append("note: " + summary_note)
     elif run.unfinished:
@@ -1370,6 +1538,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append(f"model_note: Vibe's server-side default routed this run to {ran_model!r}, not a Mistral model. "
                      "To use Mistral, set model = \"mistral-medium-3.5\" in .mistral-delegate.toml.")
     lines.append(usage_line(use, settings["currency"]))
+    if len(rounds) > 1:
+        lines.append("rounds: " + rounds_text(rounds, settings["currency"]))
     first = 0.5 if args.resume else 1.0
     lines.append(f"budget: {run.effective:,} effective tokens used across this run's Vibe calls; the wrapper caps "
                  + ("this follow-up's first call" if args.resume else "the first pass")
@@ -1385,19 +1555,22 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     lines.append(f"elapsed: {elapsed:.0f}s, tool calls: {tool_calls}"
                  + (f", model steps: {steps} (max_turns {caps['max_turns']})" if steps is not None else ""))
     if autofixed:
-        lines.append("autofix: ran " + ", ".join(autofixed) + " before deciding on a fix round")
+        lines.append("autofix: ran " + ", ".join(autofixed))
     lines.append(guard_line(guard_events, tool_calls, guard_warning))
     model_warning = vibe.unknown_model_warning(model) if not args.agent else None
     if model_warning:
         lines.append(f"model_warning: {model_warning}")
     if allow_commands:
-        given = settings["allow_commands_as_given"]
-        extra = [c for c in allow_commands if c not in given]
+        given = settings["allow_commands_shown"]
+        parts = set(settings["allow_commands_as_given"])
+        extra = [c for c in allow_commands if c not in parts and c not in given]
         lines.append("vibe_may_run: " + ", ".join(given)
                      + (f" (also accepted: {', '.join(extra[:8])}{', …' if len(extra) > 8 else ''})" if extra else ""))
     if scope:
         lines.append("scope: " + ", ".join(scope))
-    if run.session_id:
+    if run.session_id and args.revise_of:
+        lines.append(f"session_id: {run.session_id}  (more changes: --revise {args.revise_of} \"<list>\")")
+    elif run.session_id:
         lines.append(f"session_id: {run.session_id}  (follow up with: --mode {args.mode} --resume {run.session_id}"
                      + (f" --worktree-name {wt['name']})" if wt else ")"))
 
@@ -1417,7 +1590,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
             worktree_removed = True
             lines.append(f"worktree: removed {wt['name']} (Vibe failed before changing anything)")
         else:
-            lines += worktree_section(wt, run_id, files, out_of_scope, args.diff_lines, plan=settings.get("plan") or "")
+            lines += worktree_section(wt, run_id, files, out_of_scope, args.diff_lines, plan=settings.get("plan") or "",
+                                      revision_base=revision_base)
     elif write:
         files = files_now
         out_of_scope = [f for f in files if scope and not vibe.matches_scope(f, scope)]
@@ -1479,7 +1653,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         int((use["effective"] if use else run.effective) * settings["claude_relative_effort"])
     ledger.save_report(run_id, report)
     ledger.append({"event": "end", "id": run_id, "status": run.status, "verification": verification,
-                   "fix_attempts_used": attempts, "test_quality_fix": len(quality_asked), "cost": use["cost"] if use else None,
+                   "rounds": rounds, "fix_attempts_used": attempts, "test_quality_fix": sum(len(w) for w in quality_asked),
+                   "test_quality_rounds": len(quality_asked), "cost": use["cost"] if use else None,
                    "unfinished": bool(run.unfinished),
                    "model": ran_model, "tokens_in": use["tokens_in"] if use else None,
                    "tokens_out": use["tokens_out"] if use else None, "cached": use["cached"] if use else None,
@@ -1489,7 +1664,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
                    "steps": steps, "tool_calls": tool_calls, "tokens": use["tokens"] if use else None,
                    "files_changed": len(files), "out_of_scope": out_of_scope,
                    "denied": sorted(set(vibe_denied) | {f"{e.get('tool')}: {e.get('target')}" for e in guard_events
-                                                       if e.get("action") == "deny"}),
+                                                       if e.get("action") == "deny" and not is_noop_refusal(e)}),
                    "baseline_failures": preexisting,
                    "session_id": run.session_id, "worktree_removed": worktree_removed})
     print(report)
@@ -1502,13 +1677,16 @@ def guard_line(events: list[dict], tool_calls: int, warning: str | None) -> str:
     if not events:
         return ("guard: no tool calls reached it" + (" (is your Vibe version older than hooks support?)"
                                                      if tool_calls else ""))
-    denied = sum(e.get("action") == "deny" for e in events)
+    noop = sum(e.get("action") == "deny" and is_noop_refusal(e) for e in events)
+    denied = sum(e.get("action") == "deny" for e in events) - noop
     rewrites = [e for e in events if e.get("action") == "rewrite"]
     # A path with a space that arrived unquoted only needed quotes; any other rewrite pointed a path
     # at the file inside the project.
     quoted = [e for e in rewrites if _unquoted(e.get("new") or "") == _unquoted(e.get("target") or "")]
     moved = [e for e in rewrites if e not in quoted]
     parts = [f"guard: checked {len(events)} tool calls, refused {denied} (returned to Mistral as errors)"]
+    if noop:
+        parts.append(f"stopped {noop} edit(s) that changed nothing")
     if quoted:
         parts.append(f"quoted {len(quoted)} path(s) containing spaces")
     if moved:
@@ -1518,8 +1696,20 @@ def guard_line(events: list[dict], tool_calls: int, warning: str | None) -> str:
     return ", ".join(parts)
 
 
+def is_noop_refusal(event: dict) -> bool:
+    """An edit whose old and new text are the same: stopped, but not a permission problem."""
+    return str(event.get("reason") or "").startswith("This edit changes nothing")
+
+
 def _unquoted(text: str) -> str:
     return text.replace("'", "").replace('"', "").strip()
+
+
+def rounds_text(rounds: list[dict], currency: str) -> str:
+    """What each Vibe call of a run cost: "first pass ~$0.21, test quality ~$0.09"."""
+    return ", ".join(r["label"] + (f" ~{currency}{r['cost']:.2f}" if r.get("cost") is not None
+                                   else f" {r['effective']:,} tokens" if r.get("effective") else "")
+                     for r in rounds)
 
 
 def usage_line(use: dict | None, currency: str) -> str:
@@ -1556,7 +1746,7 @@ def credit_line(settings: dict, use: dict | None) -> str | None:
 
 
 def worktree_section(wt: dict, run_id: str, files: list[str], out_of_scope: list[str], diff_lines: int,
-                     plan: str = "") -> list[str]:
+                     plan: str = "", revision_base: str | None = None) -> list[str]:
     lines = [f"worktree_name: {wt['name']}" + ("  (reused)" if wt["reused"] else ""),
              f"worktree_path: {wt['path']}"]
     snap = wt.get("snapshot")
@@ -1589,10 +1779,11 @@ def worktree_section(wt: dict, run_id: str, files: list[str], out_of_scope: list
         lines.append("python_path: your virtualenv installs " + ", ".join(EDITABLE_SOURCES) + " in editable mode "
                      "from your checkout; checks and Mistral's commands put the worktree's copy first on PYTHONPATH, "
                      "so they test Mistral's code")
-    stat = gitops.changes_stat(wt)
-    lines.append("changes_by_vibe:\n" + (stat or "  (none)"))
+    shown = dict(wt, base=revision_base) if revision_base else wt
+    stat = gitops.changes_stat(shown)
+    lines.append(("changes_in_this_revision" if revision_base else "changes_by_vibe") + ":\n" + (stat or "  (none)"))
     if files:
-        diff = gitops.changes_diff(wt)
+        diff = gitops.changes_diff(shown)
         n = diff.count("\n")
         # The full diff is kept with the run's report, so it can still be read after --adopt removes the worktree.
         diff_file = ledger.run_file(run_id, "changes.diff")
@@ -1609,6 +1800,10 @@ def worktree_section(wt: dict, run_id: str, files: list[str], out_of_scope: list
                             f"git -C {shlex.quote(wt['path'])} diff --cached {wt['base'][:12]}"))
         if diff_file and 0 < n <= diff_lines:
             lines.append(f"diff_file: {diff_file}")
+        if plan and revision_base:
+            lines.append(f"part_of_plan: {plan} (a revision of its merged result: adopt the whole plan, or "
+                         f"--revise {plan} again; --integrate would rebuild the merged result without it)")
+            return lines
         if plan:
             lines.append(f"part_of_plan: {plan} (adopt or discard the plan, not this step; after a follow-up, "
                          f"run --integrate {plan} first)")
@@ -1659,6 +1854,8 @@ def main(argv: list[str]) -> int:
             top = gitops.toplevel(str(Path(args.workdir).resolve()))
             print(config.describe(config.load(top or args.workdir)))
             return 0
+        if args.revise:
+            return cmd_revise(args)
         if args.plan or args.integrate:
             from mdelegate import plans
             return plans.main(args, SCRIPT, KINDS, script_cmd)

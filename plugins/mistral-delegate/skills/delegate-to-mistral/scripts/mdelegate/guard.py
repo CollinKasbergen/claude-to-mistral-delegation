@@ -617,8 +617,15 @@ def analyze_shell(command: str, policy: dict, cwd: str) -> tuple[str | None, dic
                     i += joined[2]
                     continue
             if word.startswith(("/", "~")) or ".." in word.split("/"):
+                root = policy["root"]
+                if root.startswith(word + " ") and i < len(args):
+                    # The start of the project's own path, cut at a space: the full path isn't in the project.
+                    guess = " ".join(args[i - 1:i + 1])
+                    return (f"`{guess}` (unquoted, so it arrived in pieces) isn't a file or folder in the project. "
+                            f"Check the path; better, use paths relative to your working directory, the project "
+                            f"root ({root})."), corrections
                 return (f"`{word}` is outside the project. Use paths relative to your working directory, the "
-                        f"project root ({policy['root']}); if a path contains spaces, quote it."), corrections
+                        f"project root ({root}); if a path contains spaces, quote it."), corrections
     return None, corrections
 
 

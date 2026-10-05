@@ -148,8 +148,10 @@ For a change with several steps, Claude writes one Markdown plan to `.mistral-de
 
 1. **Steps run in parallel worktrees**, up to `max_parallel` at a time. A step that `depends` on others waits for them and starts from their result. Each step is an ordinary run: it gets the shared context, its own instructions and one line about every other step, plus the guard, caps, checks and fix rounds. A step whose dependency failed is skipped. A step's `verify:` adds to the configured checks; it doesn't replace them.
 2. **Merging:** steps that succeeded are merged into the plan's own worktree. A step that conflicts with the steps merged before it isn't merged, and the report names the files.
-3. **Checks on the combined result:** the plan's `verify` (or every merged step's checks plus the configured ones) run on the merged result, with a baseline from the starting code. If only the combination fails, one Mistral run fixes it there.
+3. **Checks on the combined result:** the plan's `verify`, every merged step's checks and the configured ones run on the merged result, with a baseline from the starting code. If only the combination fails, one Mistral run fixes it there.
 4. **One report:** `status: ok` only when every step merged and the merged result passes; `checks_failed` when they merged but fail together. A line per step, warnings from the steps' reports, the combined verification, usage and credit, and the combined diff. `--adopt <plan id>` applies it all (or `--steps a,b` for some), `--discard <plan id>` drops it. A failed step can be resumed; `--integrate <plan id>` then runs the steps it held back, merges everything again and rechecks.
+
+5. **Revise instead of fixing:** after reviewing, Claude sends everything that needs changing back in one list, `--revise <plan id> "<list>"`. Mistral makes the changes in the merged worktree, the checks run again, and the report shows only the revision's diff. `--revise <run id>` does the same for a single run, in its own session. Claude reviews; Mistral types.
 
 This replaces a `mistral-worker` subagent per step: Claude writes one plan and reads one report, and the wrapper does the coordination without spending Claude's tokens. `--stats` shows Claude's tokens per delegated step for plans and single runs, so you can compare.
 
