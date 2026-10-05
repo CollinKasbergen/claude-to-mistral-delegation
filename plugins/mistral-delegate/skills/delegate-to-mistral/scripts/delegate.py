@@ -219,6 +219,13 @@ def cmd_revise(args: argparse.Namespace) -> int:
     return run_task(args)
 
 
+def revision_items(text: str) -> int:
+    """How many changes a revision list asks for: its list items, after the revision heading if any."""
+    marker = re.search(r"wants these changes[^\n]*\n", text)
+    body = text[marker.end():] if marker else text
+    return len(re.findall(r"^\s*(?:[-*+]|\d+[.)])\s+\S", body, re.M))
+
+
 def revise_task(changes: str) -> str:
     return ("The reviewer read your result and wants these changes, and only these. Make each one, keep the "
             "checks passing, and when you replace something, delete what it replaced:\n\n" + changes.strip()
@@ -518,6 +525,9 @@ def project_rules(root: str, run_dir: str | None = None) -> tuple[str, list[str]
     return text[:8000] + ("\n[... AGENTS.md truncated ...]" if len(text) > 8000 else ""), used
 
 
+REVISE_CONTINUE = ("You stopped without the list of the reviewer's changes. Go through them one by one: make any "
+                   "you haven't made yet, then end with every change on its own line, saying how you made it or "
+                   "why you couldn't.")
 CONTINUE_PROMPT = ("You stopped before finishing. Continue the task from where you left off, then end with "
                    "the summary: every file you changed and why, and anything you couldn't do.")
 
@@ -722,14 +732,21 @@ def test_problems(diff: str, cases: list[str] | None = None) -> list[tuple[str, 
             problems.append(("filler", f"{where}: " + "; ".join(f"`{ln[:80]}`" for ln in filler[:4])))
         if any(FROM_RESULT.search(ln) for ln in code):
             problems.append(("from_result", where))
-    # Copied setup: the same run of non-assert lines in two or more new tests of a file.
+    # Copied setup: the same run of non-assert lines in two or more new tests of a file. A block that calls
+    # one of the file's own helpers is setup already shared, not copied.
+    helpers = defined_helpers(diff)
     seen: dict[tuple[str, tuple[str, ...]], list[str]] = {}
     for path, name, body in tests:
         lines = [ln.strip() for ln in body if ln.strip() and not ln.strip().startswith(("#", "//"))]
         windows = {tuple(lines[i:i + SETUP_BLOCK]) for i in range(len(lines) - SETUP_BLOCK + 1)}
+        calls_helper = re.compile(r"(?<![\w.])(" + "|".join(map(re.escape, helpers.get(path, []))) + r")\s*\(") \
+            if helpers.get(path) else None
         for window in windows:
-            if not any(ASSERTS.search(ln) for ln in window):
-                seen.setdefault((path, window), []).append(name)
+            if any(ASSERTS.search(ln) for ln in window):
+                continue
+            if calls_helper and any(calls_helper.search(ln) for ln in window):
+                continue
+            seen.setdefault((path, window), []).append(name)
     reported: set[tuple[str, ...]] = set()
     for (path, window), names in seen.items():
         names = sorted(set(names))
@@ -745,6 +762,21 @@ def test_problems(diff: str, cases: list[str] | None = None) -> list[tuple[str, 
                 problems.append(("missing_case", f"case {n}: {case[:200]}"))
     # A weaker assert that a whole comparison makes redundant is reported once, as filler.
     return [(k, w) for k, w in problems if not (k == "loose" and w.split(": `", 1)[-1].rstrip("`") in filler_lines)]
+
+
+def defined_helpers(diff: str) -> dict[str, list[str]]:
+    """The top-level functions (not tests) each test file's change adds."""
+    out: dict[str, list[str]] = {}
+    current = ""
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            current = line[6:] if line.startswith("+++ b/") else ""
+        elif current and TEST_FILE.search(current) and line.startswith("+"):
+            m = TOP_DEFINITION.match(line[1:])
+            name = m and (m.group(1) or m.group(3))
+            if name and not name.startswith("test"):
+                out.setdefault(current, []).append(name)
+    return out
 
 
 def unused_definitions(diff: str) -> list[tuple[str, str]]:
@@ -876,7 +908,8 @@ TEST_RUNNERS = {"pytest", "vitest", "jest", "mocha", "ava", "rspec", "phpunit", 
                 "playwright", "cypress"}
 # Runners that accept test files as arguments, so only Mistral's changed tests need to run.
 LOAD_ERROR = re.compile(r"ImportError|ModuleNotFoundError|cannot import name|SyntaxError|NameError|"
-                        r"Cannot find module|Failed to (?:load|resolve) (?:url|import)|error collecting|"
+                        r"Cannot find module|Failed to (?:load|resolve) (?:url|import)|"
+                        r"(?i:error collecting|errors? during collection)|"
                         r"has no attribute|is not exported|does not provide an export")
 # The test files each runner can run: pytest isn't asked about TypeScript tests, nor vitest about Python ones.
 JS_TESTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte")
@@ -1367,7 +1400,10 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         # Asking Mistral to finish costs a round; it's only worth it when the work looks unfinished:
         # files the task named are missing, checks fail, nothing changed, or there are no checks to tell.
         follow_up = None
-        if missing:
+        if kind == "revise" and run.unfinished:
+            # Without its list, nobody knows which of the reviewer's changes were made: always ask once.
+            follow_up = REVISE_CONTINUE
+        elif missing:
             follow_up = (f"These files from your task don't exist yet: {', '.join(missing)}. Create them as the "
                          "task describes, then end with the summary of every file you changed.")
         elif not write and looks_answered(run.final_text):
@@ -1430,7 +1466,8 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         else:
             verification = "passed"
     strength_line = ""
-    if (settings["test_strength"] and wt and verification in ("passed", "passed_except_preexisting")
+    # A revision changes what was already judged; its strength line would repeat the run's (or a step's).
+    if (settings["test_strength"] and wt and kind != "revise" and verification in ("passed", "passed_except_preexisting")
             and run.status in ("ok", "budget_exceeded", "tool_call_limit")):
         strength_line = test_strength(wt, run_dir, [c for c in verify if c["cmd"] in commands], baseline,
                                       settings, args.verify_timeout)
@@ -1509,7 +1546,12 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
             lines.append(f"test_cases: {cases} in the spec, {written} new test(s)")
     if rounds_at_note and len(rounds) > rounds_at_note and not run.unfinished:
         summary_note = ""  # a later round (fix, test quality) ended with a summary
-    if summary_note:
+    if kind == "revise" and run.unfinished:
+        items = revision_items(f"{spec or ''}\n{task}")
+        lines.append("revision_warning: Mistral ended without saying which of the "
+                     + (f"{items} " if items else "") + "changes it made, even after being asked once. Check each "
+                     "one against changes_in_this_revision, and --revise again with the ones still missing.")
+    elif summary_note:
         lines.append("note: " + summary_note)
     elif run.unfinished:
         lines.append("final_message_warning: " + run.unfinished)
@@ -1653,7 +1695,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         int((use["effective"] if use else run.effective) * settings["claude_relative_effort"])
     ledger.save_report(run_id, report)
     ledger.append({"event": "end", "id": run_id, "status": run.status, "verification": verification,
-                   "rounds": rounds, "fix_attempts_used": attempts, "test_quality_fix": sum(len(w) for w in quality_asked),
+                   "rounds": rounds, "continued": continued, "fix_attempts_used": attempts, "test_quality_fix": sum(len(w) for w in quality_asked),
                    "test_quality_rounds": len(quality_asked), "cost": use["cost"] if use else None,
                    "unfinished": bool(run.unfinished),
                    "model": ran_model, "tokens_in": use["tokens_in"] if use else None,

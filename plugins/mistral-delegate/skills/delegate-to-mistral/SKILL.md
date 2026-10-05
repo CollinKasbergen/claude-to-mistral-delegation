@@ -196,7 +196,8 @@ python3 <wrapper> --revise <plan id or run id> "- tests/test_service.py: the thr
 - One line per change: the file, what's wrong, what it should be. Precise beats short: Mistral does what the line says and nothing more.
 - For a plan, Mistral works in the plan's merged worktree, with the plan's shared context and every merged step's checks (plus the configured ones). For a run, it continues the run's own session and worktree with its checks and scope.
 - The report shows only what the revision changed (`changes_in_this_revision`), so your review stays short. Then adopt as usual (the whole plan: `--steps` would leave the revision out).
-- Revise again if something is still off; fix it yourself only if two revisions didn't manage it.
+- Mistral ends with one line per change saying how it made it or why it couldn't. If it ends without that list, it's asked once to go through the changes again; a `revision_warning` means it still didn't, so check each change against the revision's diff.
+- Revise again with whatever is still off; fix it yourself only if two revisions didn't manage it.
 
 - **final_message_warning.** Mistral's last step was a tool call, it left no final message, or its summary stops mid-sentence: the run was likely cut short. Treat the result as unfinished even if checks pass, and resume or redo it.
 - **checks_skipped / flaky_checks.** Configured checks limited to paths this run doesn't touch are skipped. A check that failed and then passed on an immediate rerun before Mistral started is flaky, not broken.
