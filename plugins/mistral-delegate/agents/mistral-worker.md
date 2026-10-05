@@ -26,7 +26,12 @@ Requirements / cases: <bulleted list; be exhaustive, Mistral covers what you lis
 Test setup (for tests): <existing test file to copy; how to mount/render; what to stub and how; how to read results>.
 Insertion point (when other runs edit the same file): <exact place: after which function/heading>.
 Out of scope: <what not to touch>.
+
+## Test cases
+- <setup> -> <call> -> <exact expected result: the whole object, list, response or error message>
 ```
+
+For any step that adds tests, write the test cases: one item per case, with real ids and values, including the edge cases. Mistral follows concrete cases; it ignores general rules like "assert exact values".
 
 Proofread the spec before running: Mistral copies names, paths and wording from it literally, mistakes included.
 

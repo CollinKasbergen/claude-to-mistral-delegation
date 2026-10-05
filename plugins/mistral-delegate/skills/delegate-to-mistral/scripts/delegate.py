@@ -55,6 +55,7 @@ from mdelegate import commands as cmdforms, config, gitops, guard, ledger, vibe 
 from mdelegate.checks import (EDITABLE_SOURCES, CheckResult, check_lines, measure_baseline, new_failures,  # noqa: E402
                               python_path_env, run_checks, stop_process_group)
 from mdelegate.gitops import DelegateError  # noqa: E402
+from mdelegate.plan import TEST_CASE_RULES  # noqa: E402
 
 KINDS = ("tests", "feature", "bugfix", "refactor", "migration", "boilerplate", "docs", "search", "other",
          "integration")
@@ -563,6 +564,25 @@ def new_tests(diff: str) -> list[tuple[str, str, list[str]]]:
     return found
 
 
+TEST_CASES_TITLE = re.compile(r"^(#{2,4})\s*test\s*cases\s*:?\s*$", re.I | re.M)
+
+
+def spec_test_cases(spec: str) -> int:
+    """How many test cases a spec's `Test cases` section lists (0 without one)."""
+    heading = TEST_CASES_TITLE.search(spec)
+    if not heading:
+        return 0
+    level = len(heading.group(1))
+    numbered = bullets = 0
+    for line in spec[heading.end():].splitlines():
+        if re.match(rf"^#{{1,{level}}}\s", line):
+            break
+        numbered += bool(re.match(r"^\d+[.)]\s+\S", line))
+        bullets += bool(re.match(r"^[-*+]\s+\S", line))
+    # A plan step's section numbers the cases and uses bullets for how to write them.
+    return numbered or bullets
+
+
 def assertion_hint(wt: dict) -> str:
     """New tests that assert loosely (membership, length, truthiness), check only None, or check nothing:
     patterns Mistral falls back to."""
@@ -823,6 +843,10 @@ def run_task(args: argparse.Namespace) -> int:
             spec = gitops.find_document(args.spec, gitops.toplevel(workdir), "spec").read_text(encoding="utf-8")
         except OSError as e:
             raise DelegateError(f"Can't read --spec file: {e}") from e
+    if spec and spec_test_cases(spec) and TEST_CASE_RULES not in spec:
+        # A hand-written spec's test cases get the same instructions as a plan step's.
+        spec = spec.rstrip() + "\n\n## How to write the test cases\n\n" + TEST_CASE_RULES.replace(
+            "each case below", "each case in the Test cases section") + "\n"
     task = (args.task or "").strip() or ("Implement the spec below." if spec else "")
     if not task:
         raise DelegateError("No task given. Pass it as an argument, '-' for stdin, or use --spec.")
@@ -1235,6 +1259,14 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append(strength_line)
     if wt and files_now and (hint := assertion_hint(wt)):
         lines.append(hint)
+    cases = spec_test_cases(spec or "")
+    if wt and files_now and cases:
+        written = len(new_tests(gitops.changes_diff(wt)))
+        if written < cases:
+            lines.append(f"test_cases_warning: the spec lists {cases} test case(s), but Mistral added {written} new "
+                         "test(s). Check that each case has its test (a parametrized test counts once).")
+        else:
+            lines.append(f"test_cases: {cases} in the spec, {written} new test(s)")
     if summary_note:
         lines.append("note: " + summary_note)
     elif run.unfinished:

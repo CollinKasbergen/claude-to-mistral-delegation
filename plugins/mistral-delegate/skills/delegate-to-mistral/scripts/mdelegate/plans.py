@@ -33,7 +33,7 @@ POLL = max(0.05, min(1.0, float(os.environ.get("MISTRAL_DELEGATE_WATCH_INTERVAL"
 STEP_NOTE_PREFIXES = ("out_of_scope_changes", "test_strength_warning", "final_message_warning", "missing_files",
                       "baseline_warning", "budget_warning", "note:", "denied_commands", "refused_tool_calls",
                       "assertion_hint", "test_strength:",
-                      "checks_skipped", "project_rules: none")
+                      "checks_skipped", "project_rules: none", "test_cases_warning")
 SUCCESS_VERIFICATIONS = ("passed", "passed_except_preexisting", "not_run")
 
 

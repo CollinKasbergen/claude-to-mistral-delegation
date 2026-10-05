@@ -14,6 +14,10 @@
 
     What to build in this step.
 
+    ### Test cases                            <- optional: the tests to write, one item each
+    - no teams: GET /api/teams -> 200, []
+    - a team the user isn't in: GET /api/teams/7 -> 404, {"error": "Team 7 not found"}
+
     ## step: ui - Teams page
     depends: api
     ...
@@ -22,6 +26,11 @@ A step's settings are the `key: value` lines right after its heading. scope,
 context and depends take comma-separated lists; verify and allow take one command
 per line and may repeat. Everything before the first step (after the plan
 settings) is shared context that every step gets.
+
+A step's `### Test cases` section lists the tests Mistral writes: one list item per
+case, with its setup, the call and the exact expected result. Mistral gets them as
+a numbered list with strict instructions; it follows a concrete case far better
+than a rule like "assert exact values".
 """
 
 from __future__ import annotations
@@ -32,6 +41,9 @@ from dataclasses import dataclass, field
 STEP_HEADING = re.compile(r"^##\s+step\s*:?\s*([A-Za-z0-9_-]+)\s*(?:[-–—:]\s*(.*?))?\s*$", re.I)
 TITLE = re.compile(r"^#\s+(.+?)\s*$")
 SETTING = re.compile(r"^([a-z_]+)\s*:\s*(.*?)\s*$")
+TEST_CASES_HEADING = re.compile(r"^#{3,4}\s*test\s*cases\s*:?\s*$", re.I)
+SUBHEADING = re.compile(r"^#{3,}\s")
+LIST_ITEM = re.compile(r"^\s{0,3}(?:[-*+]|\d+[.)])\s+(.*)$")
 LIST_KEYS = {"scope", "context", "depends"}
 COMMAND_KEYS = {"verify", "allow"}
 STEP_KEYS = LIST_KEYS | COMMAND_KEYS | {"kind"}
@@ -53,6 +65,7 @@ class Step:
     allow: list[str] = field(default_factory=list)
     depends: list[str] = field(default_factory=list)
     text: str = ""
+    test_cases: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         """One line describing the step, for the other steps and for reports."""
@@ -115,6 +128,26 @@ def _settings(lines: list[str], allowed: set[str], where: str) -> tuple[dict, li
     return values, lines[i:]
 
 
+def _test_cases(lines: list[str], where: str) -> tuple[list[str], list[str]]:
+    """The items of a `### Test cases` section, and the lines without that section."""
+    start = next((n for n, line in enumerate(lines) if TEST_CASES_HEADING.match(line.strip())), None)
+    if start is None:
+        return [], lines
+    end = next((n for n in range(start + 1, len(lines)) if SUBHEADING.match(lines[n])), len(lines))
+    cases: list[str] = []
+    for line in lines[start + 1:end]:
+        item = LIST_ITEM.match(line)
+        if item:
+            cases.append(item.group(1).strip())
+        elif line.strip() and cases:
+            cases[-1] += " " + line.strip()  # an item continued on the next line
+        elif line.strip():
+            raise PlanError(f"{where}: write each test case as a list item (- ...) under ### Test cases")
+    if not cases:
+        raise PlanError(f"{where}: ### Test cases has no cases; list them as - items, or remove the heading")
+    return cases, lines[:start] + lines[end:]
+
+
 def parse(text: str) -> Plan:
     lines = text.replace("\r\n", "\n").split("\n")
     i = 0
@@ -135,10 +168,11 @@ def parse(text: str) -> Plan:
         match = STEP_HEADING.match(lines[start])
         body = lines[start + 1:starts[n + 1] if n + 1 < len(starts) else len(lines)]
         values, rest = _settings(body, STEP_KEYS, f"step {match.group(1)}")
+        cases, rest = _test_cases(rest, f"step {match.group(1)}")
         step = Step(id=match.group(1), title=(match.group(2) or "").strip(), kind=(values.get("kind") or [""])[0],
                     scope=values.get("scope", []), context=values.get("context", []),
                     verify=values.get("verify", []), allow=values.get("allow", []),
-                    depends=values.get("depends", []), text="\n".join(rest).strip())
+                    depends=values.get("depends", []), text="\n".join(rest).strip(), test_cases=cases)
         plan.steps.append(step)
     _validate(plan)
     return plan
@@ -185,6 +219,8 @@ def step_spec(plan: Plan, step: Step) -> str:
     if plan.shared:
         parts.append("## Shared context (applies to every step)\n\n" + plan.shared)
     parts.append(f"## Your step: {step.id}" + (f" - {step.title}" if step.title else "") + "\n\n" + step.text)
+    if step.test_cases:
+        parts.append(test_cases_section(step.test_cases))
     if step.depends:
         parts.append("## Already done in the code you start from\n\n"
                      + "\n".join(f"- {d}: {plan.step(d).summary()}" for d in step.depends))
@@ -193,3 +229,22 @@ def step_spec(plan: Plan, step: Step) -> str:
         parts.append("## Other steps of this plan (for context only; don't implement them)\n\n"
                      + "\n".join(f"- {s.id}: {s.summary()}" for s in others))
     return "\n\n".join(parts) + "\n"
+
+
+TEST_CASE_RULES = (
+    "Write one test for each case below, named after it. For each one:\n"
+    "- Set up exactly what the case describes and make exactly the call it names.\n"
+    "- Assert the whole expected result as the case states it: the full object, list, response body or error "
+    "message, compared with `==` (or the test framework's equality). Not a field, a length, `in` or "
+    "`is not None` instead.\n"
+    "- Get the ids and objects you assert on from the setup, never from the result you are checking.\n"
+    "- Put setup shared by several tests in a fixture or helper; don't copy it into each test. Inside "
+    "`pytest.raises` (or the framework's equivalent), only the call that should fail.\n"
+    "- Add a test beyond these only for a branch of your code that no case covers.\n"
+    "Before you finish, go through the list and check that each case has its test and that the test asserts "
+    "the stated result.")
+
+
+def test_cases_section(cases: list[str]) -> str:
+    """The Test cases section of a step's spec: the cases, numbered, and how to turn them into tests."""
+    return "## Test cases\n\n" + TEST_CASE_RULES + "\n\n" + "\n".join(f"{n}. {case}" for n, case in enumerate(cases, 1))

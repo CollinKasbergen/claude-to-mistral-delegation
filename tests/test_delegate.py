@@ -914,6 +914,14 @@ class WriteModeTest(DelegateTestBase):
                       prompt)
         self.assertIn("check your code and tests against the project rules", prompt)
 
+    def test_a_specs_test_cases_get_the_instructions(self):
+        spec = self.tmpdir / "cases.md"
+        spec.write_text("Goal: add it.\n\n## Test cases\n- empty shelf -> []\n- one book -> [book]\n")
+        out = self.run_delegate("--mode", "write", "--spec", str(spec))
+        prompt = self.last()["prompt"]
+        self.assertIn("## How to write the test cases\n\nWrite one test for each case in the Test cases section", prompt)
+        self.assertIn("test_cases_warning: the spec lists 2 test case(s), but Mistral added 1 new test(s)", out.stdout)
+
     def test_agents_md_in_the_working_folder_is_used_and_reported(self):
         (self.repo / "AGENTS.md").write_text("Root rule.\n")
         (self.repo / "shelf").mkdir()
@@ -1321,6 +1329,45 @@ class PlanParserTest(unittest.TestCase):
         Build the page.
         """)
 
+    def test_test_cases_become_a_numbered_section(self):
+        from mdelegate import plan as plans
+        p = plans.parse(textwrap.dedent("""\
+            # Loans
+            ## step: service
+            Add borrow().
+
+            ### Test cases
+            - member with 3 open loans borrows b4 -> raises LoanLimitError("Member m1 already has 3 open loans")
+            - queue [expired r1, active r2]: next_in_queue("b1")
+              returns r2
+
+            ### Notes
+            Keep it small.
+            """))
+        step = p.step("service")
+        self.assertEqual(step.test_cases, [
+            'member with 3 open loans borrows b4 -> raises LoanLimitError("Member m1 already has 3 open loans")',
+            'queue [expired r1, active r2]: next_in_queue("b1") returns r2'])
+        self.assertNotIn("Test cases", step.text)
+        self.assertIn("### Notes\nKeep it small.", step.text)
+        spec = plans.step_spec(p, step)
+        self.assertIn('\n\n1. member with 3 open loans borrows b4', spec)
+        self.assertIn('\n2. queue [expired r1, active r2]: next_in_queue("b1") returns r2', spec)
+        self.assertIn("Assert the whole expected result", spec)
+        sys.path.insert(0, str(SCRIPT.parent))
+        import delegate
+        self.assertEqual(delegate.spec_test_cases(spec), 2)  # the numbered cases, not the how-to bullets
+        self.assertEqual(delegate.spec_test_cases("# Task\n## Test cases\n- a\n- b\n- c\n## Other\n- d"), 3)
+        self.assertEqual(delegate.spec_test_cases("no cases here"), 0)
+
+    def test_test_cases_must_be_list_items(self):
+        from mdelegate import plan as plans
+        for body, message in (("### Test cases\n\n", "has no cases"),
+                              ("### Test cases\nborrowing works\n", "as a list item")):
+            with self.assertRaises(plans.PlanError) as caught:
+                plans.parse(f"# P\n## step: a\nDo it.\n{body}")
+            self.assertIn(message, str(caught.exception))
+
     def test_parses_settings_shared_context_and_steps(self):
         from mdelegate import plan as plans
         p = plans.parse(self.PLAN)
@@ -1690,6 +1737,22 @@ class PlanRunTest(DelegateTestBase):
         head = out.stdout.split("steps:")[0]
         self.assertIn("review_first: a, b end without a closing summary and were merged on passing checks alone", head)
         self.assertIn("--result ", head)
+
+    def test_a_step_with_fewer_tests_than_cases_is_flagged(self):
+        plan = self.plan("""\
+            # Cases
+            ## step: a
+            FAKE_FILE a.txt A
+
+            ### Test cases
+            - a.txt holds A
+            - a.txt ends with a newline
+            ## step: b
+            FAKE_FILE b.txt B
+            """)
+        out = self.run_delegate("--plan", str(plan))
+        self.assertIn("a: test_cases_warning: the spec lists 2 test case(s), but Mistral added 1 new test(s)",
+                      out.stdout)
 
     def test_steps_wait_for_free_slots(self):
         (self.home).mkdir(parents=True, exist_ok=True)
