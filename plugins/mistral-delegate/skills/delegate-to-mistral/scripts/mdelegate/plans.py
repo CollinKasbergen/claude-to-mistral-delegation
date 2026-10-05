@@ -33,7 +33,7 @@ POLL = max(0.05, min(1.0, float(os.environ.get("MISTRAL_DELEGATE_WATCH_INTERVAL"
 STEP_NOTE_PREFIXES = ("out_of_scope_changes", "test_strength_warning", "final_message_warning", "missing_files",
                       "baseline_warning", "budget_warning", "note:", "denied_commands", "refused_tool_calls",
                       "assertion_hint", "test_strength:",
-                      "checks_skipped", "project_rules: none", "test_cases_warning")
+                      "project_rules: none", "test_cases_warning")
 SUCCESS_VERIFICATIONS = ("passed", "passed_except_preexisting", "not_run")
 
 
@@ -423,6 +423,8 @@ class PlanRun:
             used = record.get("fix_attempts_used")
             parts.append(f"checks {result['verification']}"
                          + (f" after {used} fix round(s)" if used else " first try" if result.get("run_id") else ""))
+        if record.get("test_quality_fix"):
+            parts.append(f"a test-quality round for {record['test_quality_fix']} weak spot(s)")
         if record.get("unfinished"):
             parts.append("no closing summary (read its diff)")
         if record.get("files_changed") is not None:

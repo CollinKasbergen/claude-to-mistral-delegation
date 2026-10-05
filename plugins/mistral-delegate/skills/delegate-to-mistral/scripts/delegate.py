@@ -499,6 +499,7 @@ ASSERTS = re.compile(r"\bassert|\bexpect\(|\.should\b|\braises\(|\bthrows\(|\.re
 # Assertions a function that returns nothing also passes.
 NONE_ONLY = re.compile(r"assert\s+(\S.*\s+is\s+(not\s+)?None|not\s+[\w.\[\]'\"()]+)\s*(,.*)?$|assertIs(Not)?None\(|assertFalse\(|"
                        r"\.(toBeNull|toBeUndefined|toBeFalsy)\(\)|\.not\.toBeDefined\(\)")
+ISINSTANCE_ASSERT = re.compile(r"^\s*(assert\s+isinstance\(|self\.assertIsInstance\()")
 # Test names about passing over items: those need more than "returns None" to show anything.
 SKIPPING_TEST = re.compile(r"skip|ignor|exclud|filter|bypass|pass(es)?_over", re.I)
 RAISES_BLOCK = re.compile(r"^(\s*)with\s+(pytest\.raises|self\.assertRaises\w*)\(.*:\s*(#.*)?$")
@@ -583,43 +584,103 @@ def spec_test_cases(spec: str) -> int:
     return numbered or bullets
 
 
-def assertion_hint(wt: dict) -> str:
-    """New tests that assert loosely (membership, length, truthiness), check only None, or check nothing:
-    patterns Mistral falls back to."""
-    diff = gitops.changes_diff(wt)
-    loose, current = [], ""
+FIELD_ASSERT = re.compile(r"^\s*assert\s+([A-Za-z_]\w*)(?:\.\w+|\[[^\]]+\])\s*==")
+WHOLE_ASSERT = re.compile(r"^\s*assert\s+([A-Za-z_]\w*)\s*==|==\s*([A-Za-z_]\w*)\s*$")
+# The expected item looked up in the output under test: `next(r for r in body["reservations"] if ...)`.
+FROM_RESULT = re.compile(r"\bnext\(.*\bfor\b.*\bin\b.*\bif\b")
+SETUP_BLOCK = 3  # lines repeated in several tests that count as copied setup
+
+# What each kind of problem asks Mistral to do, for the test-quality fix round.
+TEST_FIXES = {
+    "loose": "assert the exact value instead",
+    "empty": "add the assertion the test's case needs",
+    "none_only": "set up a valid item after the skipped one and assert that exactly it is returned",
+    "crowded": "move the setup above the pytest.raises block; keep only the call that should fail inside",
+    "fields": "compare the whole object instead: `assert x == Model(...)` with every field",
+    "from_result": "take the expected id or object from the setup (the value your setup call returned), "
+                   "not by searching the result",
+    "copied": "move the repeated setup into one helper function or fixture and call it from each test",
+}
+
+
+def test_problems(diff: str) -> list[tuple[str, str]]:
+    """Weak spots in the new tests: (kind, where and what), kind being a key of TEST_FIXES."""
+    problems: list[tuple[str, str]] = []
+    current = ""
     for line in diff.splitlines():
-        if line.startswith("+++ b/"):
-            current = line[6:]
-        elif current and TEST_FILE.search(current) and LOOSE_ASSERTION.search(line):
-            loose.append(f"{current}: {line[1:].strip()[:100]}")
-    empty, none_only, crowded = [], [], []
-    for path, name, body in new_tests(diff):
-        checks = [ln.strip() for ln in body if ASSERTS.search(ln) and not ln.strip().startswith(("#", "//"))]
+        if line.startswith("+++ "):
+            current = line[6:] if line.startswith("+++ b/") else ""
+        elif current and TEST_FILE.search(current) and line.startswith("+") and (
+                LOOSE_ASSERTION.search(line) or ISINSTANCE_ASSERT.search(line[1:])):
+            problems.append(("loose", f"{current}: `{line[1:].strip()[:100]}`"))
+    tests = new_tests(diff)
+    for path, name, body in tests:
+        where = f"{path}: {name}"
+        code = [ln for ln in body if ln.strip() and not ln.strip().startswith(("#", "//"))]
+        checks = [ln.strip() for ln in code if ASSERTS.search(ln)]
         if not checks:
-            empty.append(f"{path}: {name}")
+            problems.append(("empty", where))
         elif SKIPPING_TEST.search(name) and all(NONE_ONLY.search(c) for c in checks):
             # "Not found" is a fair None; a test about passing over items should show the item it reaches.
-            none_only.append(f"{path}: {name}")
+            problems.append(("none_only", where))
         if statements_in_raises(body) > 1:
-            crowded.append(f"{path}: {name}")
-    parts = []
-    if loose:
-        parts.append(f"{len(loose)} assertion(s) in the new tests check presence, size or truthiness, or compute "
-                     "the expected value with a condition, rather than asserting exact values, e.g. "
-                     + "; ".join(loose[:3]))
-    if empty:
-        parts.append(f"{len(empty)} new test(s) assert nothing: " + "; ".join(empty[:3]))
-    if none_only:
-        parts.append(f"{len(none_only)} new test(s) about skipping or filtering only check that nothing is "
-                     "returned, which code that skips everything also passes; they should show the valid item "
-                     "after the skipped one is reached: " + "; ".join(none_only[:3]))
-    if crowded:
-        parts.append(f"{len(crowded)} new test(s) put setup inside pytest.raises / assertRaises, so an error in "
-                     "the setup also passes; keep only the call that should raise inside: " + "; ".join(crowded[:3]))
-    if not parts:
+            problems.append(("crowded", where))
+        fields: dict[str, int] = {}
+        whole = set()
+        for ln in code:
+            if (m := FIELD_ASSERT.match(ln)):
+                fields[m.group(1)] = fields.get(m.group(1), 0) + 1
+            if (m := WHOLE_ASSERT.search(ln.strip())) and "assert" in ln:
+                whole.update(g for g in m.groups() if g)
+        piecemeal = [v for v, n in fields.items() if n >= 2 and v not in whole]
+        if piecemeal:
+            problems.append(("fields", f"{where} (checks {', '.join(piecemeal)} field by field)"))
+        if any(FROM_RESULT.search(ln) for ln in code):
+            problems.append(("from_result", where))
+    # Copied setup: the same run of non-assert lines in two or more new tests of a file.
+    seen: dict[tuple[str, tuple[str, ...]], list[str]] = {}
+    for path, name, body in tests:
+        lines = [ln.strip() for ln in body if ln.strip() and not ln.strip().startswith(("#", "//"))]
+        windows = {tuple(lines[i:i + SETUP_BLOCK]) for i in range(len(lines) - SETUP_BLOCK + 1)}
+        for window in windows:
+            if not any(ASSERTS.search(ln) for ln in window):
+                seen.setdefault((path, window), []).append(name)
+    reported: set[tuple[str, ...]] = set()
+    for (path, window), names in seen.items():
+        names = sorted(set(names))
+        if len(names) >= 2 and (path, *names) not in reported:
+            reported.add((path, *names))
+            problems.append(("copied", f"{path}: {', '.join(names)} repeat `{window[0][:80]}` and the lines after it"))
+    return problems
+
+
+def assertion_hint(wt: dict, problems: list[tuple[str, str]] | None = None) -> str:
+    """New tests that assert loosely, piecemeal or not at all, copy setup, or take expected values from
+    the result: patterns Mistral falls back to whatever the spec says."""
+    if problems is None:
+        problems = test_problems(gitops.changes_diff(wt))
+    if not problems:
         return ""
-    return "assertion_hint: " + ". ".join(parts) + ". Check them against the project's rules before adopting."
+    labels = {"loose": "check presence, size, type or truthiness instead of an exact value",
+              "empty": "assert nothing",
+              "none_only": "are about skipping or filtering but only check that nothing is returned",
+              "crowded": "put setup inside pytest.raises / assertRaises",
+              "fields": "check an object field by field instead of comparing it whole",
+              "from_result": "take the expected value from the result they check (next(... if ...))",
+              "copied": "copy the same setup instead of a helper"}
+    parts = []
+    for kind, label in labels.items():
+        found = [w for k, w in problems if k == kind]
+        if found:
+            parts.append(f"{len(found)} {label}: " + "; ".join(found[:3]) + (" …" if len(found) > 3 else ""))
+    return "assertion_hint: in the new tests, " + ". ".join(parts) + "."
+
+
+def test_quality_prompt(problems: list[tuple[str, str]]) -> str:
+    return ("Your checks pass, but some of your new tests don't test what they claim. Fix each one below, "
+            "change only the test files, and keep every test passing:\n\n"
+            + "\n".join(f"- {where}: {TEST_FIXES[kind]}." for kind, where in problems[:15])
+            + "\n\nThen end with a short list of the tests you changed.")
 
 
 CANCELLED = re.compile(r"<user_cancellation>|User cancelled the operation")
@@ -778,7 +839,6 @@ def test_strength(wt: dict, run_dir: str, checks: list[dict], baseline: dict, se
             if patch.strip():
                 gitops.git_checked(clean, "apply", "--whitespace=nowarn", "-", input=patch)
             cwd = clean / rel_dir
-            all_new = all(not (clean / f).exists() for f in code)
             if not cwd.is_dir():
                 return f"test_strength: not checked ({rel_dir} doesn't exist in the original code)"
             results = run_checks([run for _orig, run in commands], str(cwd), timeout)
@@ -802,12 +862,8 @@ def test_strength(wt: dict, run_dir: str, checks: list[dict], baseline: dict, se
         last = [ln.strip() for ln in out.splitlines() if ln.strip()][-1:] or ["no output"]
         shown.append(f"{run}: {last[0][:160]}")
     if all(LOAD_ERROR.search(out) and not REAL_FAILURE.search(out) for _run, out in failing):
-        # The tests can't even load without the new code: that says nothing about their assertions.
-        if all_new:
-            return ""  # expected for brand-new code, and nothing to act on; assertion_hint covers the tests
-        return ("test_strength: not conclusive: Mistral's tests fail on the original code only because they can't "
-                "load there (" + "; ".join(shown) + "), so this doesn't show they would catch a broken change. "
-                "Read the assertions.")
+        # The tests can't load without the new code (normal for a new feature): that shows nothing either way.
+        return ""
     return ("test_strength: Mistral's tests fail on the original code, as they should (" + "; ".join(shown) + ").")
 
 
@@ -1111,6 +1167,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     first_share = 0.5 if args.resume else 1.0
     vibe_call(prompt if args.resume else prompt + "\n\n" + vibe.run_marker(run_id), first_share)
     continued, summary_note, continue_reason, continue_said = 0, "", "", ""
+    quality_asked: list[tuple[str, str]] = []
 
     verification, results, failures, attempts = "not_run", {}, [], 0
     # Checks limited to paths that Mistral ended up changing outside the scope join in now.
@@ -1183,11 +1240,24 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
     if commands and checkable:
         # A run stopped at a cap still gets its fix round (by default): its first pass is spent,
         # and the failures are often small.
-        while failures and attempts < fix_attempts and run.session_id and (
-                run.status == "ok" or (settings["fix_after_cap"] and run.status in ("budget_exceeded", "tool_call_limit"))):
-            attempts += 1
-            vibe_call(vibe.fix_prompt(failures, scope), 0.5)
+        def fix_failures() -> None:
+            nonlocal attempts
+            while failures and attempts < fix_attempts and run.session_id and (
+                    run.status == "ok" or (settings["fix_after_cap"]
+                                           and run.status in ("budget_exceeded", "tool_call_limit"))):
+                attempts += 1
+                vibe_call(vibe.fix_prompt(failures, scope), 0.5)
+                check_round()
+
+        fix_failures()
+        # Not for an integration fix: it repairs the merged steps, whose tests were reviewed in their own runs.
+        if (write and wt and settings["test_quality_fix"] and kind != "integration" and not failures and run.status == "ok"
+                and run.session_id and (weak := test_problems(gitops.changes_diff(wt)))):
+            # Mistral ignores test-style rules up front, but fixes a weak test it is pointed at.
+            quality_asked = weak
+            vibe_call(test_quality_prompt(weak), 0.5)
             check_round()
+            fix_failures()
         if failures:
             verification = "failed"
         elif any(code != 0 for code, _out in results.values()):
@@ -1257,8 +1327,12 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         lines.append("flaky_checks (failed, then passed on a rerun before Mistral started): " + ", ".join(flaky))
     if strength_line:
         lines.append(strength_line)
-    if wt and files_now and (hint := assertion_hint(wt)):
-        lines.append(hint)
+    weak_left = test_problems(gitops.changes_diff(wt)) if wt and files_now else []
+    if quality_asked:
+        lines.append(f"test_quality_fix: Mistral was asked once to fix {len(quality_asked)} weak spot(s) in its "
+                     f"new tests; {len(weak_left)} remain" + (" (listed in assertion_hint)" if weak_left else ""))
+    if weak_left:
+        lines.append(assertion_hint(wt, weak_left))
     cases = spec_test_cases(spec or "")
     if wt and files_now and cases:
         written = len(new_tests(gitops.changes_diff(wt)))
@@ -1405,7 +1479,7 @@ def execute(args, settings, run_id, run_dir, wt, top, workdir, task, spec, caps,
         int((use["effective"] if use else run.effective) * settings["claude_relative_effort"])
     ledger.save_report(run_id, report)
     ledger.append({"event": "end", "id": run_id, "status": run.status, "verification": verification,
-                   "fix_attempts_used": attempts, "cost": use["cost"] if use else None,
+                   "fix_attempts_used": attempts, "test_quality_fix": len(quality_asked), "cost": use["cost"] if use else None,
                    "unfinished": bool(run.unfinished),
                    "model": ran_model, "tokens_in": use["tokens_in"] if use else None,
                    "tokens_out": use["tokens_out"] if use else None, "cached": use["cached"] if use else None,
@@ -1429,12 +1503,23 @@ def guard_line(events: list[dict], tool_calls: int, warning: str | None) -> str:
         return ("guard: no tool calls reached it" + (" (is your Vibe version older than hooks support?)"
                                                      if tool_calls else ""))
     denied = sum(e.get("action") == "deny" for e in events)
-    rewritten = sum(e.get("action") == "rewrite" for e in events)
-    example = next((e for e in events if e.get("action") == "rewrite" and e.get("new")), None)
-    return (f"guard: checked {len(events)} tool calls, refused {denied} (returned to Mistral as errors), "
-            f"corrected {rewritten} path(s)"
-            + (f" Mistral guessed wrong or wrote from outside the project (e.g. {example['target']} -> "
-               f"{example['new']}); the calls went ahead with the corrected path" if example else ""))
+    rewrites = [e for e in events if e.get("action") == "rewrite"]
+    # A path with a space that arrived unquoted only needed quotes; any other rewrite pointed a path
+    # at the file inside the project.
+    quoted = [e for e in rewrites if _unquoted(e.get("new") or "") == _unquoted(e.get("target") or "")]
+    moved = [e for e in rewrites if e not in quoted]
+    parts = [f"guard: checked {len(events)} tool calls, refused {denied} (returned to Mistral as errors)"]
+    if quoted:
+        parts.append(f"quoted {len(quoted)} path(s) containing spaces")
+    if moved:
+        example = next((e for e in moved if e.get("new")), None)
+        parts.append(f"pointed {len(moved)} path(s) at the file in the project"
+                     + (f" (e.g. {example['target']} -> {example['new']})" if example else ""))
+    return ", ".join(parts)
+
+
+def _unquoted(text: str) -> str:
+    return text.replace("'", "").replace('"', "").strip()
 
 
 def usage_line(use: dict | None, currency: str) -> str:

@@ -53,7 +53,7 @@ DEFAULT_WEIGHTS = {"input": 1.0, "cached": 0.1, "output": 5.0}
 KEYS = ("policy", "model", "verify", "allow_commands", "fix_attempts", "max_parallel", "deps_mode", "baseline",
         "scope", "vibe_args", "worktrees_dir", "model_prices", "continue_attempts", "token_weights",
         "monthly_credit", "currency", "credit_reset_day", "min_savings", "autofix", "fix_after_cap",
-        "claude_relative_effort", "test_strength", "test_commands")
+        "claude_relative_effort", "test_strength", "test_commands", "test_quality_fix")
 
 DEPS_MODES = ("hardlink", "copy", "symlink", "none")
 
@@ -175,6 +175,7 @@ def load(repo_root: str | None) -> dict:
         "claude_relative_effort": 0.5,
         # Run Mistral's new tests against the original code: they should fail there.
         "test_strength": True,
+        "test_quality_fix": True,
         # Extra commands to treat as test runners for test_strength (pytest, vitest, jest, ... are known).
         "test_commands": [],
         "read": {},
@@ -255,7 +256,8 @@ def load(repo_root: str | None) -> dict:
                 settings["warnings"].append(f"ignored token_weights.{key}: use a number")
     settings["token_weights"] = weights
     settings["autofix"] = _as_checks(settings["autofix"], settings["warnings"])
-    for key, default in (("fix_after_cap", True), ("test_strength", True), ("baseline", True)):
+    for key, default in (("fix_after_cap", True), ("test_strength", True), ("baseline", True),
+                         ("test_quality_fix", True)):
         _as_bool(settings, key, default)
     _as_number(settings, "monthly_credit", float, None, low=0)
     settings["monthly_credit"] = settings["monthly_credit"] or None
